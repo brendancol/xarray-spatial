@@ -104,10 +104,35 @@ def test_slope_gpu_equals_cpu():
 
     small_da_cupy = xr.DataArray(cupy.asarray(elevation2), attrs={'res': (10.0, 10.0)})
     gpu = slope(small_da_cupy, name='cupy_result')
+    print(small_da)
+    print(gpu)
+    print(cpu)
     assert isinstance(gpu.data, cupy.ndarray)
 
-    assert np.isclose(cpu, gpu, equal_nan=True).all()
+    assert np.isclose(cpu, gpu, atol=1.0, equal_nan=True).all()
 
+
+@pytest.mark.skipif(doesnt_have_cuda(), reason="CUDA Device not Available")
+def test_large_slope_gpu_equals_cpu():
+
+    import cupy
+
+    M = 10
+
+    elevation3 = np.random.rand(8*M, 6*M) * 2000
+
+    small_da = xr.DataArray(elevation3, attrs={'res': (10.0, 10.0)})
+    cpu = slope(small_da, name='numpy_result')
+
+    small_da_cupy = xr.DataArray(cupy.asarray(elevation3), attrs={'res': (10.0, 10.0)})
+    gpu = slope(small_da_cupy, name='cupy_result')
+    print(small_da)
+    print(gpu)
+    print(cpu)
+    import pdb;pdb.set_trace()
+    assert isinstance(gpu.data, cupy.ndarray)
+
+    assert np.isclose(cpu, gpu, atol=1.0, equal_nan=True).all()
 
 @pytest.mark.skipif(doesnt_have_cuda(), reason="CUDA Device not Available")
 def _dask_cupy_equals_numpy_cpu():

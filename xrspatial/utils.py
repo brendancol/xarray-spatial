@@ -59,7 +59,7 @@ def cuda_args(shape):
     threads_per_block = int(ceil(max_threads / 2.0) ** (1.0 / len(shape)))
     tpb = (threads_per_block,) * len(shape)
     bpg = tuple(int(ceil(d / threads_per_block)) for d in shape)
-    return bpg, tpb
+    return bpg, tpb 
 
 
 def is_cupy_backed(agg: xr.DataArray):

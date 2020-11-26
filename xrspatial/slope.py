@@ -14,6 +14,7 @@ import dask.array as da
 
 import numba as nb
 from numba import cuda
+from numba import types
 
 import numpy as np
 import xarray as xr
@@ -68,39 +69,106 @@ def _run_dask_numpy(data:da.Array,
     return out
 
 
-@cuda.jit(device=True)
-def _gpu(arr, cellsize_x, cellsize_y):
-    a = arr[2, 0]
-    b = arr[2, 1]
-    c = arr[2, 2]
-    d = arr[1, 0]
-    f = arr[1, 2]
-    g = arr[0, 0]
-    h = arr[0, 1]
-    i = arr[0, 2]
-
-    two = nb.int32(2.)  # reducing size to int8 causes wrong results
-
-    dz_dx = ((c + two * f + i) - (a + two * d + g)) / (nb.float32(8.) * cellsize_x[0])
-    dz_dy = ((g + two * h + i) - (a + two * b + c)) / (nb.float32(8.) * cellsize_y[0])
-    p = (dz_dx * dz_dx + dz_dy * dz_dy) ** nb.float32(.5)
-    return atan(p) * nb.float32(57.29578)
 
 
-@cuda.jit
-def _run_gpu(arr, cellsize_x_arr, cellsize_y_arr, out):
-    i, j = cuda.grid(2)
-    di = 1
-    dj = 1
-    if (i-di >= 1 and i+di < out.shape[0] - 1 and 
-        j-dj >= 1 and j+dj < out.shape[1] - 1):
-        out[i, j] = _gpu(arr[i-di:i+di+1, j-dj:j+dj+1],
-                         cellsize_x_arr,
-                         cellsize_y_arr)
+def _create_kernel(block_size, ):
 
+    TILE_W = 16
+    TILE_H = 16
+    RADIUS = 1
+    DIAMETER = R * 2 + 1
+    SIZE = D * D
+    BLOCK_W = TILE_W + (2 * R)
+    BLOCK_H = TILE_H + (2 * R)
+
+
+    @cuda.jit(device=True)
+    def _gpu(arr, cellsize_x, cellsize_y):
+        a = arr[2, 0]
+        b = arr[2, 1]
+        c = arr[2, 2]
+        d = arr[1, 0]
+        f = arr[1, 2]
+        g = arr[0, 0]
+        h = arr[0, 1]
+        i = arr[0, 2]
+
+        two = nb.int32(2.)  # reducing size to int8 causes wrong results
+
+        dz_dx = ((c + two * f + i) - (a + two * d + g)) / (nb.float32(8.) * cellsize_x[0])
+        dz_dy = ((g + two * h + i) - (a + two * b + c)) / (nb.float32(8.) * cellsize_y[0])
+        p = (dz_dx * dz_dx + dz_dy * dz_dy) ** nb.float32(.5)
+        return atan(p) * nb.float32(57.29578)
+
+    @cuda.jit
+    def _run_gpu(arr, cellsize_x_arr, cellsize_y_arr, out):
+
+        shared = cuda.shared.array(shape=block_size, dtype=types.float32)
+
+        tx = cuda.threadIdx.x
+        ty = cuda.threadIdx.y
+        bx = cuda.blockIdx.x
+        by = cuda.blockIdx.y
+        bw = cuda.blockDim.x
+
+        x1, y1 = cuda.grid(2)
+        x = x1 - 1
+        y = y1 - 1
+
+        if x == 0 or y == 0 or x >= out.shape[1] - 1 or y >= out.shape[0] - 1:
+            return
+        
+        nx = cuda.gridDim.x * bw
+        ny = cuda.gridDim.y * bh
+
+        tmp = -1
+        di = 1
+        dj = 1
+
+        if (tx == bw or ty == bh or tx == 1 or ty == 1):
+            if (x-di >= 1 and x+di < out.shape[1] - 1
+                and y-dj >= 1 and y+dj < out.shape[0] - 1):
+                tmp = _gpu(arr[y-dj:y+dj+1, x-di:x+di+1],
+                            cellsize_x_arr,
+                            cellsize_y_arr)
+        else:
+
+            if x < nx and y < ny:
+                shared[ty, tx] = arr[y, x]
+            else:
+                return
+
+            cuda.syncthreads()
+
+            di = 1
+            dj = 1
+
+            if (tx == bw or ty == bh or tx == 1 or ty == 1):
+                if (x-di >= 1 and x+di < out.shape[1] - 1
+                    and y-dj >= 1 and y+dj < out.shape[0] - 1):
+                    tmp = _gpu(arr[y-dj:y+dj+1, x-di:x+di+1],
+                                cellsize_x_arr,
+                                cellsize_y_arr)
+
+            elif (tx-di >= 1 and tx+di <= shared.shape[1] - 1
+                and ty-dj >= 1 and ty+dj <= shared.shape[0] - 1
+                and x-di >=1 and x+di < out.shape[1] - 1
+                and y-dj >=1 and y+dj < out.shape[0] - 1):
+                tmp = _gpu(shared[ty-dj:ty+dj+1, tx-di:tx+di+1],
+                            cellsize_x_arr,
+                            cellsize_y_arr)
+            else:
+                tmp = -10.
+            cuda.syncthreads()
+
+        if x < nx and y < ny and tmp > -1:
+            out[y, x] = tmp
+
+    return _run_gpu
+    
 
 def _run_cupy(data: cupy.ndarray,
-              cellsize_x: Union[int, float],
+              cellsize_x:Union[int, float],
               cellsize_y: Union[int, float]) -> cupy.ndarray:
 
     cellsize_x_arr = cupy.array([float(cellsize_x)], dtype='f4')
@@ -114,13 +182,16 @@ def _run_cupy(data: cupy.ndarray,
     slope_data = np.pad(data, pad_width=pad_width, mode="reflect")
 
     griddim, blockdim = cuda_args(slope_data.shape)
+
     slope_agg = cupy.empty(slope_data.shape, dtype='f4')
     slope_agg[:] = cupy.nan
 
-    _run_gpu[griddim, blockdim](slope_data,
-                                cellsize_x_arr,
-                                cellsize_y_arr,
-                                slope_agg)
+    _kernel = _create_kernel((blockdim[0], blockdim[1]))
+
+    _kernel[griddim, blockdim](slope_data,
+                               cellsize_x_arr,
+                               cellsize_y_arr,
+                               slope_agg)
     out = slope_agg[pad_rows:-pad_rows, pad_cols:-pad_cols]
     return out
 
