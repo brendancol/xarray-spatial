@@ -71,12 +71,6 @@
 </table>
 
 -------
-
-
-[![History of OS GIS Timeline](img/featured-badge-gh.svg)](https://makepath.com/history-of-open-source-gis/)
-
-
--------
 ![title](img/composite_map.gif)
 -------
 :round_pushpin: Fast, Accurate Python library for Raster Operations
