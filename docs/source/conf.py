@@ -95,7 +95,7 @@ html_favicon = '_static/img/favicon.ico'
 #
 html_theme_options = {
     "external_links": [],
-    "github_url": "https://github.com/makepath/xarray-spatial",
+    "github_url": "https://github.com/xarray-contrib/xarray-spatial",
     "navbar_end": ["navbar-icon-links"],
 }
 
