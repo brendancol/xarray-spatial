@@ -1159,7 +1159,7 @@ def test_direction_degenerate_shapes(backend, shape_name):
         pytest.skip("Requires CUDA and CuPy")
     raster = _backend_raster(data, backend)
     result = direction(raster, x='lon', y='lat')
-    general_output_checks(raster, result, expected)
+    general_output_checks(raster, result, expected, verify_dtype=True)
 
 
 # --- Cat 1/4: non-default metrics on allocation / direction ----------------
@@ -1200,7 +1200,7 @@ def test_direction_metric_backends(backend, metric, _metric_raster_data):
 
     raster = _backend_raster(_metric_raster_data, backend)
     result = direction(raster, x='lon', y='lat', distance_metric=metric)
-    general_output_checks(raster, result, expected)
+    general_output_checks(raster, result, expected, verify_dtype=True)
 
 
 # --- Cat 5: attrs preservation with realistic res / crs --------------------
