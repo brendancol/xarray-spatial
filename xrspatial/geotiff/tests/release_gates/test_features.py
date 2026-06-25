@@ -1,0 +1,3823 @@
+"""Tests for new GeoTIFF features and the release-contract feature surface.
+
+This module folds the legacy feature and supported-feature tests into
+the release-gate suite:
+
+* End-to-end coverage for multi-band, integer nodata, packbits, zstd,
+  dask, BigTIFF, palette / sub-byte bit depths, planar config, and
+  other writer/reader features. Most cases are not strict release-gate
+  pins but exercise the same public surface the release-gate contract
+  covers, so they sit alongside the gates rather than at the top level.
+* Structural invariants on the ``SUPPORTED_FEATURES`` mapping (every
+  entry has a tier label; the tier set is closed; keys follow
+  ``<group>.<name>``; the dict literal has no duplicate keys; the
+  documented promotions and demotions stay pinned).
+* Tier-aware codec gate on the writer (Tier 3
+  ``allow_experimental_codecs``; Tier 4 ``allow_internal_only_jpeg``);
+  ``to_geotiff`` and ``_write_geotiff_gpu`` signature pins.
+* Typed-error refusals at the VRT parser and the eager writer for
+  unsupported feature combinations (warped VRTs, derived raster bands,
+  kernel-filtered sources, mixed per-source nodata, rotated transforms,
+  etc.).
+
+Section banners below mark the file boundaries. The ``SUPPORTED_FEATURES``
+test sections are tagged with their issue numbers in the headings so the
+audit trail to the original PRs stays intact.
+
+Note on release-gate scope
+--------------------------
+``@pytest.mark.release_gate`` markers in this file are localised to the
+sections that pin the release contract (the ``SUPPORTED_FEATURES`` tier
+gates and the ``VRT stable_only`` opt-in). The bulk of this file
+exercises the same public surface that the release-gate sister file
+``test_stable_features.py`` covers but is general feature regression,
+not contract pins; ``pytest -m release_gate`` picks the right subset.
+"""
+from __future__ import annotations
+
+import ast
+import inspect
+import os
+import uuid
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pytest
+import xarray as xr
+
+from xrspatial.geotiff import (SUPPORTED_FEATURES, GeoTIFFAmbiguousMetadataError,
+                               GeoTIFFFallbackWarning, RotatedTransformError,
+                               UnsupportedGeoTIFFFeatureError, VRTStableSourcesOnlyError,
+                               _read_geotiff_dask, _read_vrt, _write_geotiff_gpu, open_geotiff,
+                               to_geotiff)
+from xrspatial.geotiff._attrs import _VALID_COMPRESSIONS
+from xrspatial.geotiff._compression import (packbits_compress, packbits_decompress, zstd_compress,
+                                            zstd_decompress)
+from xrspatial.geotiff._errors import VRTUnsupportedError
+from xrspatial.geotiff._header import parse_header
+from xrspatial.geotiff._reader import read_to_array
+from xrspatial.geotiff._vrt import parse_vrt, write_vrt
+from xrspatial.geotiff._writer import write
+
+# -----------------------------------------------------------------------
+# Multi-band write and read
+# -----------------------------------------------------------------------
+
+
+class TestMultiBand:
+
+    def test_rgb_uint8_round_trip(self, tmp_path):
+        """Write and read back RGB uint8 image."""
+        arr = np.zeros((8, 8, 3), dtype=np.uint8)
+        arr[:, :, 0] = 200  # red
+        arr[:, :, 1] = 100  # green
+        arr[:, :, 2] = 50   # blue
+        path = str(tmp_path / 'rgb.tif')
+        write(arr, path, compression='none', tiled=False)
+
+        result, geo = read_to_array(path)
+        assert result.shape == (8, 8, 3)
+        np.testing.assert_array_equal(result, arr)
+
+    def test_rgb_deflate_tiled(self, tmp_path):
+        rng = np.random.RandomState(42)
+        arr = rng.randint(0, 256, (16, 16, 3), dtype=np.uint8)
+        path = str(tmp_path / 'rgb_deflate.tif')
+        write(arr, path, compression='deflate', tiled=True, tile_size=8)
+
+        result, geo = read_to_array(path)
+        np.testing.assert_array_equal(result, arr)
+
+    def test_rgba_uint8(self, tmp_path):
+        arr = np.ones((4, 4, 4), dtype=np.uint8) * 128
+        path = str(tmp_path / 'rgba.tif')
+        write(arr, path, compression='none', tiled=False)
+
+        result, geo = read_to_array(path)
+        assert result.shape == (4, 4, 4)
+        np.testing.assert_array_equal(result, arr)
+
+    def test_multiband_float32(self, tmp_path):
+        arr = np.random.RandomState(99).rand(8, 8, 5).astype(np.float32)
+        path = str(tmp_path / 'multi.tif')
+        write(arr, path, compression='deflate', tiled=False)
+
+        result, geo = read_to_array(path)
+        assert result.shape == (8, 8, 5)
+        np.testing.assert_array_equal(result, arr)
+
+    def test_single_band_selection(self, tmp_path):
+        """band= parameter should extract one band."""
+        arr = np.zeros((4, 4, 3), dtype=np.uint8)
+        arr[:, :, 1] = 42
+        path = str(tmp_path / 'rgb_sel.tif')
+        write(arr, path, compression='none', tiled=False)
+
+        result, _ = read_to_array(path, band=1)
+        assert result.shape == (4, 4)
+        np.testing.assert_array_equal(result, 42)
+
+    def test_rgb_to_geotiff_api(self, tmp_path):
+        """to_geotiff accepts 3D arrays."""
+        arr = np.arange(48, dtype=np.uint8).reshape(4, 4, 3)
+        path = str(tmp_path / 'rgb_api.tif')
+        to_geotiff(arr, path, compression='none')
+
+        result = open_geotiff(path)
+        assert 'band' in result.dims
+        assert result.shape == (4, 4, 3)
+        np.testing.assert_array_equal(result.values, arr)
+
+    def test_rgb_cog(self, tmp_path):
+        """Multi-band COG with overviews."""
+        arr = np.random.RandomState(7).randint(
+            0, 256, (32, 32, 3), dtype=np.uint8)
+        path = str(tmp_path / 'rgb_cog.tif')
+        write(arr, path, compression='deflate', tiled=True, tile_size=16,
+              cog=True, overview_levels=[2])
+
+        result, _ = read_to_array(path)
+        np.testing.assert_array_equal(result, arr)
+
+
+# -----------------------------------------------------------------------
+# Integer nodata masking
+# -----------------------------------------------------------------------
+
+class TestIntegerNodata:
+
+    def test_uint8_nodata_masked(self, tmp_path):
+        arr = np.array([[0, 1, 2], [3, 255, 5]], dtype=np.uint8)
+        path = str(tmp_path / 'uint8_nodata.tif')
+        write(arr, path, compression='none', tiled=False, nodata=255)
+
+        da = open_geotiff(path, masked=True)
+        assert np.isnan(da.values[1, 1])
+        assert da.values[0, 1] == 1.0
+        assert da.dtype == np.float64  # promoted from uint8
+
+    def test_uint16_nodata_masked(self, tmp_path):
+        arr = np.array([[100, 0], [200, 0]], dtype=np.uint16)
+        path = str(tmp_path / 'uint16_nodata.tif')
+        write(arr, path, compression='none', tiled=False, nodata=0)
+
+        da = open_geotiff(path, masked=True)
+        assert np.isnan(da.values[0, 1])
+        assert np.isnan(da.values[1, 1])
+        assert da.values[0, 0] == 100.0
+
+    def test_int16_nodata_negative(self, tmp_path):
+        arr = np.array([[-9999, 10], [20, -9999]], dtype=np.int16)
+        path = str(tmp_path / 'int16_nodata.tif')
+        write(arr, path, compression='none', tiled=False, nodata=-9999)
+
+        da = open_geotiff(path, masked=True)
+        assert np.isnan(da.values[0, 0])
+        assert np.isnan(da.values[1, 1])
+        assert da.values[0, 1] == 10.0
+
+    def test_integer_no_nodata_stays_integer(self, tmp_path):
+        """Without nodata, integer arrays should not be promoted."""
+        arr = np.arange(16, dtype=np.uint16).reshape(4, 4)
+        path = str(tmp_path / 'no_nodata.tif')
+        write(arr, path, compression='none', tiled=False)
+
+        da = open_geotiff(path)
+        assert da.dtype == np.uint16
+
+
+# -----------------------------------------------------------------------
+# PackBits compression
+# -----------------------------------------------------------------------
+
+class TestPackBits:
+
+    def test_packbits_round_trip(self):
+        data = b'\x00' * 100 + b'\xff' * 50 + bytes(range(200))
+        compressed = packbits_compress(data)
+        decompressed = packbits_decompress(compressed)
+        assert decompressed == data
+
+    def test_packbits_single_byte(self):
+        data = b'\x42'
+        assert packbits_decompress(packbits_compress(data)) == data
+
+    def test_packbits_empty(self):
+        assert packbits_decompress(packbits_compress(b'')) == b''
+
+    def test_packbits_all_same(self):
+        data = b'\xAA' * 500
+        compressed = packbits_compress(data)
+        assert len(compressed) < len(data)
+        assert packbits_decompress(compressed) == data
+
+    def test_write_read_packbits(self, tmp_path):
+        arr = np.arange(64, dtype=np.float32).reshape(8, 8)
+        path = str(tmp_path / 'packbits.tif')
+        write(arr, path, compression='packbits', tiled=False)
+
+        result, _ = read_to_array(path)
+        np.testing.assert_array_equal(result, arr)
+
+    def test_packbits_tiled(self, tmp_path):
+        arr = np.random.RandomState(42).rand(16, 16).astype(np.float32)
+        path = str(tmp_path / 'packbits_tiled.tif')
+        write(arr, path, compression='packbits', tiled=True, tile_size=8)
+
+        result, _ = read_to_array(path)
+        np.testing.assert_array_equal(result, arr)
+
+
+# -----------------------------------------------------------------------
+# ZSTD compression
+# -----------------------------------------------------------------------
+
+class TestZstd:
+
+    def test_zstd_round_trip_bytes(self):
+        data = b'hello zstd! ' * 1000
+        compressed = zstd_compress(data)
+        assert len(compressed) < len(data)
+        assert zstd_decompress(compressed) == data
+
+    def test_zstd_empty(self):
+        compressed = zstd_compress(b'')
+        assert zstd_decompress(compressed) == b''
+
+    def test_zstd_random(self):
+        rng = np.random.RandomState(42)
+        data = bytes(rng.randint(0, 256, size=5000, dtype=np.uint8))
+        assert zstd_decompress(zstd_compress(data)) == data
+
+    def test_write_read_zstd_stripped(self, tmp_path):
+        arr = np.arange(64, dtype=np.float32).reshape(8, 8)
+        path = str(tmp_path / 'zstd_strip.tif')
+        write(arr, path, compression='zstd', tiled=False)
+
+        result, _ = read_to_array(path)
+        np.testing.assert_array_equal(result, arr)
+
+    def test_write_read_zstd_tiled(self, tmp_path):
+        arr = np.random.RandomState(99).rand(16, 16).astype(np.float32)
+        path = str(tmp_path / 'zstd_tiled.tif')
+        write(arr, path, compression='zstd', tiled=True, tile_size=8)
+
+        result, _ = read_to_array(path)
+        np.testing.assert_array_equal(result, arr)
+
+    def test_zstd_uint16(self, tmp_path):
+        arr = np.arange(100, dtype=np.uint16).reshape(10, 10)
+        path = str(tmp_path / 'zstd_u16.tif')
+        write(arr, path, compression='zstd', tiled=False)
+
+        result, _ = read_to_array(path)
+        np.testing.assert_array_equal(result, arr)
+
+    def test_zstd_with_predictor(self, tmp_path):
+        arr = np.arange(64, dtype=np.float32).reshape(8, 8)
+        path = str(tmp_path / 'zstd_pred.tif')
+        write(arr, path, compression='zstd', tiled=False, predictor=True)
+
+        result, _ = read_to_array(path)
+        np.testing.assert_array_equal(result, arr)
+
+    def test_zstd_multiband(self, tmp_path):
+        arr = np.random.RandomState(7).randint(0, 256, (8, 8, 3), dtype=np.uint8)
+        path = str(tmp_path / 'zstd_rgb.tif')
+        write(arr, path, compression='zstd', tiled=False)
+
+        result, _ = read_to_array(path)
+        np.testing.assert_array_equal(result, arr)
+
+    def test_zstd_public_api(self, tmp_path):
+        arr = np.ones((4, 4), dtype=np.float32)
+        path = str(tmp_path / 'zstd_api.tif')
+        to_geotiff(arr, path, compression='zstd')
+
+        result = open_geotiff(path)
+        np.testing.assert_array_equal(result.values, arr)
+
+
+# -----------------------------------------------------------------------
+# GeoKey metadata extraction
+# -----------------------------------------------------------------------
+
+class TestGeoKeys:
+
+    def test_geographic_crs_attrs(self, tmp_path):
+        """Geographic CRS files expose ``crs`` / ``crs_wkt``.
+
+        The reader does not surface the secondary GeoKey-derived attrs
+        (``geog_citation``, ``angular_units``, etc.); ``crs`` and
+        ``crs_wkt`` are the canonical surface.
+        """
+        from xrspatial.geotiff._geotags import GeoTransform
+
+        arr = np.ones((4, 4), dtype=np.float32)
+        gt = GeoTransform(-120.0, 45.0, 0.001, -0.001)
+        path = str(tmp_path / 'geog.tif')
+        write(arr, path, compression='none', tiled=False,
+              geo_transform=gt, crs_epsg=4326)
+
+        da = open_geotiff(path)
+        assert da.attrs['crs'] == 4326
+        assert 'geog_citation' not in da.attrs
+
+    def test_projected_crs_attrs(self, tmp_path):
+        """Projected CRS files expose ``crs`` / ``crs_wkt``."""
+        from xrspatial.geotiff._geotags import GeoTransform
+
+        arr = np.ones((4, 4), dtype=np.float32)
+        gt = GeoTransform(500000.0, 4500000.0, 30.0, -30.0)
+        path = str(tmp_path / 'proj.tif')
+        write(arr, path, compression='none', tiled=False,
+              geo_transform=gt, crs_epsg=32610)
+
+        da = open_geotiff(path)
+        assert da.attrs['crs'] == 32610
+        assert 'linear_units' not in da.attrs
+
+    def test_geoinfo_fields_from_real_file(self):
+        """Verify ``crs`` is populated from a real geographic file."""
+        import os
+        path = '../rtxpy/examples/render_demo_terrain.tif'
+        if not os.path.exists(path):
+            pytest.skip("Real test files not available")
+
+        da = open_geotiff(path)
+        assert da.attrs['crs'] == 4269
+        # The reader does not surface ``geog_citation``, ``angular_units``,
+        # ``semi_major_axis``, or ``inv_flattening``. Callers derive these
+        # via pyproj from ``crs`` / ``crs_wkt``.
+        for removed in ('geog_citation', 'angular_units',
+                        'semi_major_axis', 'inv_flattening'):
+            assert removed not in da.attrs
+
+    def test_geoinfo_fields_from_projected_file(self):
+        """Verify ``crs`` is populated from a real UTM file."""
+        import os
+        path = '../rtxpy/examples/USGS_one_meter_x65y454_NY_LongIsland_Z18_2014.tif'
+        if not os.path.exists(path):
+            pytest.skip("Real test files not available")
+
+        da = open_geotiff(path)
+        assert da.attrs['crs'] == 26918
+        # The reader does not surface the secondary GeoKey-derived attrs.
+        for removed in ('crs_name', 'geog_citation', 'linear_units'):
+            assert removed not in da.attrs
+
+    def test_no_crs_no_geokey_attrs(self, tmp_path):
+        """Files without CRS don't get geokey attrs.
+
+        The reader does not surface the secondary GeoKey-derived attrs at
+        all, so this invariant holds unconditionally rather than just for
+        the no-CRS case.
+        """
+        arr = np.ones((4, 4), dtype=np.float32)
+        path = str(tmp_path / 'bare.tif')
+        write(arr, path, compression='none', tiled=False)
+
+        da = open_geotiff(path)
+        assert 'crs_name' not in da.attrs
+        assert 'geog_citation' not in da.attrs
+        assert 'angular_units' not in da.attrs
+        assert 'linear_units' not in da.attrs
+
+    def test_angular_unit_lookup(self):
+        """Unit code -> name lookup works for known codes."""
+        from xrspatial.geotiff._geotags import ANGULAR_UNITS, LINEAR_UNITS
+        assert ANGULAR_UNITS[9102] == 'degree'
+        assert ANGULAR_UNITS[9101] == 'radian'
+        assert LINEAR_UNITS[9001] == 'metre'
+        assert LINEAR_UNITS[9002] == 'foot'
+        assert LINEAR_UNITS[9003] == 'us_survey_foot'
+
+    def test_crs_wkt_from_epsg(self, tmp_path):
+        """crs_wkt is resolved from EPSG via pyproj."""
+        from xrspatial.geotiff._geotags import GeoTransform
+        arr = np.ones((4, 4), dtype=np.float32)
+        gt = GeoTransform(-120.0, 45.0, 0.001, -0.001)
+        path = str(tmp_path / 'wkt.tif')
+        write(arr, path, compression='none', tiled=False,
+              geo_transform=gt, crs_epsg=4326)
+
+        da = open_geotiff(path)
+        assert 'crs_wkt' in da.attrs
+        wkt = da.attrs['crs_wkt']
+        assert 'WGS 84' in wkt or '4326' in wkt
+
+    def test_write_with_wkt_string(self, tmp_path):
+        """crs= accepts a WKT string and resolves to EPSG."""
+        arr = np.ones((4, 4), dtype=np.float32)
+        wkt = ('GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",'
+               'ELLIPSOID["WGS 84",6378137,298.257223563]],'
+               'CS[ellipsoidal,2],'
+               'AXIS["geodetic latitude (Lat)",north],'
+               'AXIS["geodetic longitude (Lon)",east],'
+               'UNIT["degree",0.0174532925199433],'
+               'ID["EPSG",4326]]')
+        path = str(tmp_path / 'wkt_in.tif')
+        to_geotiff(arr, path, crs=wkt, compression='none')
+
+        da = open_geotiff(path)
+        assert da.attrs['crs'] == 4326
+
+    def test_write_with_proj_string(self, tmp_path):
+        """crs= accepts a PROJ string."""
+        arr = np.ones((4, 4), dtype=np.float32)
+        path = str(tmp_path / 'proj_in.tif')
+        to_geotiff(arr, path, crs='+proj=utm +zone=18 +datum=NAD83',
+                   compression='none')
+
+        da = open_geotiff(path)
+        # pyproj should resolve this to EPSG:26918
+        assert da.attrs.get('crs') is not None
+
+    def test_crs_wkt_attr_round_trip(self, tmp_path):
+        """DataArray with crs_wkt attr (no int crs) round-trips."""
+        wkt = ('GEOGCRS["WGS 84",DATUM["World Geodetic System 1984",'
+               'ELLIPSOID["WGS 84",6378137,298.257223563]],'
+               'CS[ellipsoidal,2],'
+               'AXIS["geodetic latitude (Lat)",north],'
+               'AXIS["geodetic longitude (Lon)",east],'
+               'UNIT["degree",0.0174532925199433],'
+               'ID["EPSG",4326]]')
+        y = np.linspace(45.0, 44.0, 4)
+        x = np.linspace(-120.0, -119.0, 4)
+        da = xr.DataArray(np.ones((4, 4), dtype=np.float32),
+                          dims=['y', 'x'], coords={'y': y, 'x': x},
+                          attrs={'crs_wkt': wkt})
+        path = str(tmp_path / 'wkt_rt.tif')
+        to_geotiff(da, path, compression='none')
+
+        result = open_geotiff(path)
+        assert result.attrs['crs'] == 4326
+        assert 'crs_wkt' in result.attrs
+
+    def test_no_crs_no_wkt(self, tmp_path):
+        """File without CRS has no crs_wkt attr."""
+        arr = np.ones((4, 4), dtype=np.float32)
+        path = str(tmp_path / 'no_wkt.tif')
+        write(arr, path, compression='none', tiled=False)
+
+        da = open_geotiff(path)
+        assert 'crs_wkt' not in da.attrs
+
+
+# -----------------------------------------------------------------------
+# Resolution / DPI tags
+# -----------------------------------------------------------------------
+
+# -----------------------------------------------------------------------
+# GDAL metadata (tag 42112)
+# -----------------------------------------------------------------------
+
+# -----------------------------------------------------------------------
+# Arbitrary tag preservation
+# -----------------------------------------------------------------------
+
+# -----------------------------------------------------------------------
+# Big-endian pixel data
+# -----------------------------------------------------------------------
+
+# -----------------------------------------------------------------------
+# Cloud storage (fsspec) support
+# -----------------------------------------------------------------------
+
+# -----------------------------------------------------------------------
+# VRT (Virtual Raster Table) support
+# -----------------------------------------------------------------------
+
+# -----------------------------------------------------------------------
+# Fixes: band-first, MinIsWhite, ExtraSamples, float16, VRT write, etc.
+# -----------------------------------------------------------------------
+
+class TestFixesBatch:
+
+    def test_band_first_dataarray(self, tmp_path):
+        """DataArray with (band, y, x) dims is transposed before write."""
+        arr = np.zeros((3, 8, 8), dtype=np.uint8)
+        arr[0] = 200  # red
+        arr[1] = 100  # green
+        arr[2] = 50   # blue
+
+        da = xr.DataArray(arr, dims=['band', 'y', 'x'])
+        path = str(tmp_path / 'band_first.tif')
+        to_geotiff(da, path, compression='none')
+
+        result = open_geotiff(path)
+        assert result.shape == (8, 8, 3)
+        assert result.values[0, 0, 0] == 200  # red channel
+        assert result.values[0, 0, 1] == 100  # green channel
+
+    def test_band_last_dataarray_unchanged(self, tmp_path):
+        """DataArray with (y, x, band) dims is not transposed."""
+        arr = np.zeros((8, 8, 3), dtype=np.uint8)
+        arr[:, :, 0] = 200
+        da = xr.DataArray(arr, dims=['y', 'x', 'band'])
+        path = str(tmp_path / 'band_last.tif')
+        to_geotiff(da, path, compression='none')
+
+        result = open_geotiff(path)
+        assert result.shape == (8, 8, 3)
+        assert result.values[0, 0, 0] == 200
+
+    def test_min_is_white_inversion(self, tmp_path):
+        """MinIsWhite (photometric=0) inverts grayscale values on read."""
+        import struct
+
+        # Build a minimal TIFF with photometric=0
+        # The conftest doesn't support photometric param, so build manually
+        bo = '<'
+        width, height = 4, 4
+        pixels = np.array([[0, 50, 100, 200]], dtype=np.uint8).repeat(4, axis=0)
+
+        tag_list = []
+
+        def add_short(tag, val):
+            tag_list.append((tag, 3, 1, struct.pack(f'{bo}H', val)))
+
+        def add_long(tag, val):
+            tag_list.append((tag, 4, 1, struct.pack(f'{bo}I', val)))
+
+        add_short(256, width)
+        add_short(257, height)
+        add_short(258, 8)
+        add_short(259, 1)
+        add_short(262, 0)   # MinIsWhite
+        add_short(277, 1)
+        add_short(278, height)
+        add_long(273, 0)
+        add_long(279, len(pixels.tobytes()))
+        add_short(339, 1)
+
+        tag_list.sort(key=lambda t: t[0])
+        num_entries = len(tag_list)
+        ifd_start = 8
+        ifd_size = 2 + 12 * num_entries + 4
+        overflow_start = ifd_start + ifd_size
+        pixel_start = overflow_start
+        # Patch strip offset
+        for i, (tag, typ, count, raw) in enumerate(tag_list):
+            if tag == 273:
+                tag_list[i] = (tag, typ, count, struct.pack(f'{bo}I', pixel_start))
+
+        out = bytearray()
+        out.extend(b'II')
+        out.extend(struct.pack(f'{bo}H', 42))
+        out.extend(struct.pack(f'{bo}I', ifd_start))
+        out.extend(struct.pack(f'{bo}H', num_entries))
+        for tag, typ, count, raw in tag_list:
+            out.extend(struct.pack(f'{bo}HHI', tag, typ, count))
+            out.extend(raw.ljust(4, b'\x00'))
+        out.extend(struct.pack(f'{bo}I', 0))
+        out.extend(pixels.tobytes())
+
+        path = str(tmp_path / 'miniswhite.tif')
+        with open(path, 'wb') as f:
+            f.write(bytes(out))
+
+        from xrspatial.geotiff._reader import read_to_array
+        result, _ = read_to_array(path)
+        # MinIsWhite: 0 -> 255, 50 -> 205, 100 -> 155, 200 -> 55
+        assert result[0, 0] == 255
+        assert result[0, 1] == 205
+        assert result[0, 2] == 155
+        assert result[0, 3] == 55
+
+    def test_extra_samples_rgba(self, tmp_path):
+        """RGBA write includes ExtraSamples tag with the alpha marker.
+
+        RGBA is opt-in via ``photometric='rgba'``; treating any 4-band
+        array as RGB+alpha was wrong for multispectral data, so the
+        default is MinIsBlack.
+        """
+        from xrspatial.geotiff._header import TAG_EXTRA_SAMPLES, parse_all_ifds, parse_header
+        arr = np.ones((4, 4, 4), dtype=np.uint8) * 128
+        path = str(tmp_path / 'rgba.tif')
+        write(arr, path, compression='none', tiled=False, photometric='rgba')
+
+        with open(path, 'rb') as f:
+            data = f.read()
+        header = parse_header(data)
+        ifds = parse_all_ifds(data, header)
+        ifd = ifds[0]
+        extra = ifd.entries.get(TAG_EXTRA_SAMPLES)
+        assert extra is not None
+        # Value 2 = unassociated alpha
+        assert extra.value == 2 or (isinstance(extra.value, tuple) and extra.value[0] == 2)
+
+    def test_float16_auto_promotion(self, tmp_path):
+        """Float16 arrays are auto-promoted to float32."""
+        arr = np.ones((4, 4), dtype=np.float16) * 3.14
+        path = str(tmp_path / 'f16.tif')
+        to_geotiff(arr, path, compression='none')
+
+        result = open_geotiff(path)
+        assert result.dtype == np.float32
+        np.testing.assert_array_almost_equal(result.values, 3.14, decimal=2)
+
+    def test_vrt_write_and_read_back(self, tmp_path):
+        """_build_vrt generates a valid VRT that reads back correctly."""
+        from xrspatial.geotiff import _build_vrt
+        from xrspatial.geotiff._geotags import GeoTransform
+
+        # Write two tiles with known geo transforms
+        left = np.arange(16, dtype=np.float32).reshape(4, 4)
+        right = np.arange(16, 32, dtype=np.float32).reshape(4, 4)
+
+        gt_left = GeoTransform(origin_x=0.0, origin_y=4.0,
+                               pixel_width=1.0, pixel_height=-1.0)
+        gt_right = GeoTransform(origin_x=4.0, origin_y=4.0,
+                                pixel_width=1.0, pixel_height=-1.0)
+
+        lpath = str(tmp_path / 'left.tif')
+        rpath = str(tmp_path / 'right.tif')
+        write(left, lpath, geo_transform=gt_left, compression='none', tiled=False)
+        write(right, rpath, geo_transform=gt_right, compression='none', tiled=False)
+
+        vrt_path = str(tmp_path / 'mosaic.vrt')
+        _build_vrt(vrt_path, [lpath, rpath])
+
+        da = open_geotiff(vrt_path)
+        assert da.shape == (4, 8)
+        np.testing.assert_array_equal(da.values[:, :4], left)
+        np.testing.assert_array_equal(da.values[:, 4:], right)
+
+    def test_dask_vrt(self, tmp_path):
+        """_read_geotiff_dask handles VRT files."""
+        from xrspatial.geotiff import _read_geotiff_dask
+
+        arr = np.arange(16, dtype=np.float32).reshape(4, 4)
+        tile_path = str(tmp_path / 'tile.tif')
+        write(arr, tile_path, compression='none', tiled=False)
+
+        vrt_xml = (
+            '<VRTDataset rasterXSize="4" rasterYSize="4">\n'
+            '  <VRTRasterBand dataType="Float32" band="1">\n'
+            '    <SimpleSource>\n'
+            f'      <SourceFilename relativeToVRT="1">{os.path.basename(tile_path)}</SourceFilename>\n'  # noqa: E501
+            '      <SourceBand>1</SourceBand>\n'
+            '      <SrcRect xOff="0" yOff="0" xSize="4" ySize="4"/>\n'
+            '      <DstRect xOff="0" yOff="0" xSize="4" ySize="4"/>\n'
+            '    </SimpleSource>\n'
+            '  </VRTRasterBand>\n'
+            '</VRTDataset>\n'
+        )
+        vrt_path = str(tmp_path / 'dask.vrt')
+        with open(vrt_path, 'w') as f:
+            f.write(vrt_xml)
+
+        import dask.array as da
+        result = _read_geotiff_dask(vrt_path, chunks=2)
+        assert isinstance(result.data, da.Array)
+        computed = result.compute()
+        np.testing.assert_array_equal(computed.values, arr)
+
+
+class TestVRT:
+
+    def _write_tile(self, tmp_path, name, data):
+        """Write a GeoTIFF tile and return its path."""
+        from xrspatial.geotiff._writer import write
+        path = str(tmp_path / name)
+        write(data, path, compression='none', tiled=False)
+        return path
+
+    def _make_mosaic_vrt(self, tmp_path, tile_paths, tile_shapes,
+                         tile_offsets, width, height, dtype='Float32'):
+        """Build a VRT XML that mosaics multiple tiles."""
+        lines = [
+            f'<VRTDataset rasterXSize="{width}" rasterYSize="{height}">',
+            '  <GeoTransform>0.0, 1.0, 0.0, 0.0, 0.0, -1.0</GeoTransform>',
+            f'  <VRTRasterBand dataType="{dtype}" band="1">',
+        ]
+        for path, (th, tw), (yo, xo) in zip(tile_paths, tile_shapes, tile_offsets):
+            lines.append('    <SimpleSource>')
+            lines.append(f'      <SourceFilename relativeToVRT="1">{os.path.basename(path)}</SourceFilename>')  # noqa: E501
+            lines.append('      <SourceBand>1</SourceBand>')
+            lines.append(f'      <SrcRect xOff="0" yOff="0" xSize="{tw}" ySize="{th}"/>')
+            lines.append(f'      <DstRect xOff="{xo}" yOff="{yo}" xSize="{tw}" ySize="{th}"/>')
+            lines.append('    </SimpleSource>')
+        lines.append('  </VRTRasterBand>')
+        lines.append('</VRTDataset>')
+
+        vrt_path = str(tmp_path / 'mosaic.vrt')
+        with open(vrt_path, 'w') as f:
+            f.write('\n'.join(lines))
+        return vrt_path
+
+    def test_single_tile_vrt(self, tmp_path):
+        """VRT with one source tile reads correctly."""
+        arr = np.arange(16, dtype=np.float32).reshape(4, 4)
+        tile_path = self._write_tile(tmp_path, 'tile.tif', arr)
+
+        vrt_path = self._make_mosaic_vrt(
+            tmp_path,
+            [tile_path], [(4, 4)], [(0, 0)],
+            width=4, height=4,
+        )
+
+        da = open_geotiff(vrt_path)
+        np.testing.assert_array_equal(da.values, arr)
+
+    def test_2x1_mosaic(self, tmp_path):
+        """VRT that tiles two images side-by-side."""
+        left = np.arange(16, dtype=np.float32).reshape(4, 4)
+        right = np.arange(16, 32, dtype=np.float32).reshape(4, 4)
+        lpath = self._write_tile(tmp_path, 'left.tif', left)
+        rpath = self._write_tile(tmp_path, 'right.tif', right)
+
+        vrt_path = self._make_mosaic_vrt(
+            tmp_path,
+            [lpath, rpath], [(4, 4), (4, 4)], [(0, 0), (0, 4)],
+            width=8, height=4,
+        )
+
+        da = open_geotiff(vrt_path)
+        assert da.shape == (4, 8)
+        np.testing.assert_array_equal(da.values[:, :4], left)
+        np.testing.assert_array_equal(da.values[:, 4:], right)
+
+    def test_2x2_mosaic(self, tmp_path):
+        """VRT that tiles four images in a 2x2 grid."""
+        tiles = []
+        paths = []
+        offsets = []
+        for r in range(2):
+            for c in range(2):
+                base = (r * 2 + c) * 16
+                arr = np.arange(base, base + 16, dtype=np.float32).reshape(4, 4)
+                name = f'tile_{r}_{c}.tif'
+                paths.append(self._write_tile(tmp_path, name, arr))
+                tiles.append(arr)
+                offsets.append((r * 4, c * 4))
+
+        vrt_path = self._make_mosaic_vrt(
+            tmp_path,
+            paths, [(4, 4)] * 4, offsets,
+            width=8, height=8,
+        )
+
+        da = open_geotiff(vrt_path)
+        assert da.shape == (8, 8)
+        # Check each quadrant
+        np.testing.assert_array_equal(da.values[0:4, 0:4], tiles[0])
+        np.testing.assert_array_equal(da.values[0:4, 4:8], tiles[1])
+        np.testing.assert_array_equal(da.values[4:8, 0:4], tiles[2])
+        np.testing.assert_array_equal(da.values[4:8, 4:8], tiles[3])
+
+    def test_windowed_vrt_read(self, tmp_path):
+        """Windowed read of a VRT mosaic."""
+        left = np.arange(16, dtype=np.float32).reshape(4, 4)
+        right = np.arange(16, 32, dtype=np.float32).reshape(4, 4)
+        lpath = self._write_tile(tmp_path, 'left.tif', left)
+        rpath = self._write_tile(tmp_path, 'right.tif', right)
+
+        vrt_path = self._make_mosaic_vrt(
+            tmp_path,
+            [lpath, rpath], [(4, 4), (4, 4)], [(0, 0), (0, 4)],
+            width=8, height=4,
+        )
+
+        # Window spanning both tiles
+        da = open_geotiff(vrt_path, window=(1, 2, 3, 6))
+        assert da.shape == (2, 4)
+        expected = np.hstack([left, right])[1:3, 2:6]
+        np.testing.assert_array_equal(da.values, expected)
+
+    def test_vrt_with_crs(self, tmp_path):
+        """VRT with SRS tag populates CRS in attrs."""
+        arr = np.ones((4, 4), dtype=np.float32)
+        tile_path = self._write_tile(tmp_path, 'tile.tif', arr)
+
+        vrt_xml = (
+            '<VRTDataset rasterXSize="4" rasterYSize="4">\n'
+            '  <SRS>EPSG:4326</SRS>\n'
+            '  <GeoTransform>-120.0, 0.001, 0.0, 45.0, 0.0, -0.001</GeoTransform>\n'
+            '  <VRTRasterBand dataType="Float32" band="1">\n'
+            '    <SimpleSource>\n'
+            f'      <SourceFilename relativeToVRT="1">{os.path.basename(tile_path)}</SourceFilename>\n'  # noqa: E501
+            '      <SourceBand>1</SourceBand>\n'
+            '      <SrcRect xOff="0" yOff="0" xSize="4" ySize="4"/>\n'
+            '      <DstRect xOff="0" yOff="0" xSize="4" ySize="4"/>\n'
+            '    </SimpleSource>\n'
+            '  </VRTRasterBand>\n'
+            '</VRTDataset>\n'
+        )
+        vrt_path = str(tmp_path / 'crs.vrt')
+        with open(vrt_path, 'w') as f:
+            f.write(vrt_xml)
+
+        da = open_geotiff(vrt_path)
+        assert da.attrs.get('crs_wkt') == 'EPSG:4326'
+        assert len(da.coords['x']) == 4
+        assert len(da.coords['y']) == 4
+
+    def test_vrt_nodata(self, tmp_path):
+        """VRT NoDataValue is stored in attrs."""
+        arr = np.array([[1, 2], [3, -9999]], dtype=np.float32)
+        tile_path = self._write_tile(tmp_path, 'tile.tif', arr)
+
+        vrt_xml = (
+            '<VRTDataset rasterXSize="2" rasterYSize="2">\n'
+            '  <VRTRasterBand dataType="Float32" band="1">\n'
+            '    <NoDataValue>-9999</NoDataValue>\n'
+            '    <SimpleSource>\n'
+            f'      <SourceFilename relativeToVRT="1">{os.path.basename(tile_path)}</SourceFilename>\n'  # noqa: E501
+            '      <SourceBand>1</SourceBand>\n'
+            '      <SrcRect xOff="0" yOff="0" xSize="2" ySize="2"/>\n'
+            '      <DstRect xOff="0" yOff="0" xSize="2" ySize="2"/>\n'
+            '    </SimpleSource>\n'
+            '  </VRTRasterBand>\n'
+            '</VRTDataset>\n'
+        )
+        vrt_path = str(tmp_path / 'nodata.vrt')
+        with open(vrt_path, 'w') as f:
+            f.write(vrt_xml)
+
+        da = open_geotiff(vrt_path)
+        assert da.attrs.get('nodata') == -9999.0
+
+    def test_read_vrt_function(self, tmp_path):
+        """read_vrt() works directly."""
+        from xrspatial.geotiff import _read_vrt
+        arr = np.arange(16, dtype=np.float32).reshape(4, 4)
+        tile_path = self._write_tile(tmp_path, 'tile.tif', arr)
+
+        vrt_path = self._make_mosaic_vrt(
+            tmp_path,
+            [tile_path], [(4, 4)], [(0, 0)],
+            width=4, height=4,
+        )
+
+        da = _read_vrt(vrt_path)
+        assert da.name == 'mosaic'
+        np.testing.assert_array_equal(da.values, arr)
+
+    def test_vrt_parser(self, tmp_path):
+        """VRT XML parser extracts all fields correctly."""
+        from xrspatial.geotiff._vrt import parse_vrt
+
+        # Use a path under tmp_path so the source-containment check
+        # accepts the source.  The test exercises field-extraction, not
+        # the on-disk readability of the source file.
+        src_path = str(tmp_path / 'tile.tif')
+        xml = (
+            '<VRTDataset rasterXSize="100" rasterYSize="200">\n'
+            '  <SRS>EPSG:32610</SRS>\n'
+            '  <GeoTransform>500000, 30, 0, 4500000, 0, -30</GeoTransform>\n'
+            '  <VRTRasterBand dataType="UInt16" band="1">\n'
+            '    <NoDataValue>0</NoDataValue>\n'
+            '    <SimpleSource>\n'
+            f'      <SourceFilename relativeToVRT="0">{src_path}</SourceFilename>\n'
+            '      <SourceBand>1</SourceBand>\n'
+            '      <SrcRect xOff="10" yOff="20" xSize="80" ySize="160"/>\n'
+            '      <DstRect xOff="0" yOff="0" xSize="80" ySize="160"/>\n'
+            '    </SimpleSource>\n'
+            '  </VRTRasterBand>\n'
+            '</VRTDataset>\n'
+        )
+        vrt = parse_vrt(xml, str(tmp_path))
+        assert vrt.width == 100
+        assert vrt.height == 200
+        assert vrt.crs_wkt == 'EPSG:32610'
+        assert vrt.geo_transform == (500000.0, 30.0, 0.0, 4500000.0, 0.0, -30.0)
+        assert len(vrt.bands) == 1
+        assert vrt.bands[0].dtype == np.uint16
+        assert vrt.bands[0].nodata == 0.0
+        assert len(vrt.bands[0].sources) == 1
+        src = vrt.bands[0].sources[0]
+        assert src.filename == os.path.realpath(src_path)
+        assert src.src_rect.x_off == 10
+
+    def test_vrt_float64_fractional_nodata_masked(self, tmp_path):
+        """VRT read masks float64 fractional nodata exactly.
+
+        Regression for the ``np.float32(src_nodata)`` hard-cast in
+        ``_vrt.read_vrt``.  A float64 source with a fractional
+        sentinel that is not exactly representable in float32
+        (e.g. -9999.1) used to miss the mask because
+        ``np.float32(-9999.1) != np.float64(-9999.1)`` in the ``==``
+        comparison.  The fix casts the sentinel to the source
+        array's own dtype.
+
+        -9999.1 is chosen over -9999.25 because the latter is
+        exactly representable in float32 and would not exercise
+        the bug.
+        """
+        sentinel = np.float64(-9999.1)
+        # Sanity check the premise of the regression: the float32
+        # cast must not round-trip back to the float64 value.
+        assert np.float32(sentinel) != sentinel
+
+        arr = np.array(
+            [[1.0, 2.0],
+             [sentinel, 4.0]],
+            dtype=np.float64,
+        )
+        tile_path = self._write_tile(tmp_path, 'f64_nodata_1247.tif', arr)
+
+        vrt_xml = (
+            '<VRTDataset rasterXSize="2" rasterYSize="2">\n'
+            '  <VRTRasterBand dataType="Float64" band="1">\n'
+            '    <NoDataValue>-9999.1</NoDataValue>\n'
+            '    <SimpleSource>\n'
+            f'      <SourceFilename relativeToVRT="1">{os.path.basename(tile_path)}</SourceFilename>\n'  # noqa: E501
+            '      <SourceBand>1</SourceBand>\n'
+            '      <SrcRect xOff="0" yOff="0" xSize="2" ySize="2"/>\n'
+            '      <DstRect xOff="0" yOff="0" xSize="2" ySize="2"/>\n'
+            '    </SimpleSource>\n'
+            '  </VRTRasterBand>\n'
+            '</VRTDataset>\n'
+        )
+        vrt_path = str(tmp_path / 'f64_nodata_1247.vrt')
+        with open(vrt_path, 'w') as f:
+            f.write(vrt_xml)
+
+        da = open_geotiff(vrt_path, masked=True)
+        vals = da.values
+
+        # The sentinel pixel must be NaN.
+        assert np.isnan(vals[1, 0]), (
+            f"float64 fractional nodata not masked: got {vals[1, 0]!r}")
+        # Other pixels untouched.
+        assert vals[0, 0] == 1.0
+        assert vals[0, 1] == 2.0
+        assert vals[1, 1] == 4.0
+
+    def test_vrt_pixel_is_point_no_half_pixel_shift(self, tmp_path):
+        """VRT with AREA_OR_POINT=Point does not apply a half-pixel shift.
+
+        Before the fix, ``_read_vrt`` always added ``(c + 0.5) * res``
+        to the GeoTransform origin, even when the VRT advertised
+        Point registration.  That shifted coords by half a cell in
+        world space on any Point-tagged VRT.
+
+        The expected GDAL convention: when ``AREA_OR_POINT=Point``
+        the GeoTransform origin is already the *center* of pixel
+        (0, 0), so coords[0] must equal origin exactly.
+        """
+        arr = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        tile_path = self._write_tile(tmp_path, 'point_1247.tif', arr)
+
+        origin_x, origin_y = 100.0, 50.0
+        pixel_w, pixel_h = 10.0, -10.0
+        vrt_xml = (
+            f'<VRTDataset rasterXSize="2" rasterYSize="2">\n'
+            f'  <Metadata>\n'
+            f'    <MDI key="AREA_OR_POINT">Point</MDI>\n'
+            f'  </Metadata>\n'
+            f'  <GeoTransform>{origin_x}, {pixel_w}, 0.0, '
+            f'{origin_y}, 0.0, {pixel_h}</GeoTransform>\n'
+            f'  <VRTRasterBand dataType="Float32" band="1">\n'
+            f'    <SimpleSource>\n'
+            f'      <SourceFilename relativeToVRT="1">{os.path.basename(tile_path)}</SourceFilename>\n'  # noqa: E501
+            f'      <SourceBand>1</SourceBand>\n'
+            f'      <SrcRect xOff="0" yOff="0" xSize="2" ySize="2"/>\n'
+            f'      <DstRect xOff="0" yOff="0" xSize="2" ySize="2"/>\n'
+            f'    </SimpleSource>\n'
+            f'  </VRTRasterBand>\n'
+            f'</VRTDataset>\n'
+        )
+        vrt_path = str(tmp_path / 'point_1247.vrt')
+        with open(vrt_path, 'w') as f:
+            f.write(vrt_xml)
+
+        da = open_geotiff(vrt_path)
+
+        # Point registration: coords[0] == origin, no 0.5*pixel shift.
+        assert float(da.coords['x'].values[0]) == pytest.approx(origin_x)
+        assert float(da.coords['y'].values[0]) == pytest.approx(origin_y)
+        # Adjacent cell is one full pixel away.
+        assert float(da.coords['x'].values[1]) == pytest.approx(
+            origin_x + pixel_w)
+        assert float(da.coords['y'].values[1]) == pytest.approx(
+            origin_y + pixel_h)
+        # Raster type is surfaced in attrs.
+        assert da.attrs.get('raster_type') == 'point'
+
+    def test_vrt_pixel_is_area_still_shifts(self, tmp_path):
+        """Default VRT (no AREA_OR_POINT metadata) keeps the half-pixel shift.
+
+        This is the backwards-compat guard for the Point fix: Area
+        registration must continue to add ``0.5 * pixel`` to the
+        origin.
+        """
+        arr = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
+        tile_path = self._write_tile(tmp_path, 'area_1247.tif', arr)
+
+        origin_x, origin_y = 100.0, 50.0
+        pixel_w, pixel_h = 10.0, -10.0
+        vrt_xml = (
+            f'<VRTDataset rasterXSize="2" rasterYSize="2">\n'
+            f'  <GeoTransform>{origin_x}, {pixel_w}, 0.0, '
+            f'{origin_y}, 0.0, {pixel_h}</GeoTransform>\n'
+            f'  <VRTRasterBand dataType="Float32" band="1">\n'
+            f'    <SimpleSource>\n'
+            f'      <SourceFilename relativeToVRT="1">{os.path.basename(tile_path)}</SourceFilename>\n'  # noqa: E501
+            f'      <SourceBand>1</SourceBand>\n'
+            f'      <SrcRect xOff="0" yOff="0" xSize="2" ySize="2"/>\n'
+            f'      <DstRect xOff="0" yOff="0" xSize="2" ySize="2"/>\n'
+            f'    </SimpleSource>\n'
+            f'  </VRTRasterBand>\n'
+            f'</VRTDataset>\n'
+        )
+        vrt_path = str(tmp_path / 'area_1247.vrt')
+        with open(vrt_path, 'w') as f:
+            f.write(vrt_xml)
+
+        da = open_geotiff(vrt_path)
+
+        # Area registration: coords[0] == origin + 0.5 * pixel.
+        assert float(da.coords['x'].values[0]) == pytest.approx(
+            origin_x + 0.5 * pixel_w)
+        assert float(da.coords['y'].values[0]) == pytest.approx(
+            origin_y + 0.5 * pixel_h)
+        # No raster_type attr when Area (default).
+        assert da.attrs.get('raster_type') != 'point'
+
+
+class TestCloudStorage:
+
+    def test_cloud_scheme_detection(self):
+        """Cloud URI schemes are detected correctly."""
+        from xrspatial.geotiff._reader import _is_fsspec_uri
+        assert _is_fsspec_uri('s3://bucket/key.tif')
+        assert _is_fsspec_uri('gs://bucket/key.tif')
+        assert _is_fsspec_uri('az://container/blob.tif')
+        assert _is_fsspec_uri('abfs://container/blob.tif')
+        assert _is_fsspec_uri('memory:///test.tif')
+        assert not _is_fsspec_uri('/local/path.tif')
+        assert not _is_fsspec_uri('http://example.com/file.tif')
+        assert not _is_fsspec_uri('relative/path.tif')
+
+    def test_memory_filesystem_read_write(self, tmp_path):
+        """Round-trip through fsspec's in-memory filesystem."""
+        import fsspec
+
+        arr = np.arange(16, dtype=np.float32).reshape(4, 4)
+
+        # Write to memory filesystem via fsspec
+        from xrspatial.geotiff._writer import write
+
+        # First write locally, then copy to memory fs
+        local_path = str(tmp_path / 'test.tif')
+        write(arr, local_path, compression='none', tiled=False)
+
+        with open(local_path, 'rb') as f:
+            tiff_bytes = f.read()
+
+        # Put into fsspec memory filesystem
+        fs = fsspec.filesystem('memory')
+        fs.pipe('/test.tif', tiff_bytes)
+
+        # Read via _CloudSource
+        from xrspatial.geotiff._reader import _CloudSource
+        src = _CloudSource('memory:///test.tif')
+        data = src.read_all()
+        assert len(data) == len(tiff_bytes)
+        assert data == tiff_bytes
+
+        # Range read
+        chunk = src.read_range(0, 8)
+        assert chunk == tiff_bytes[:8]
+
+        # Clean up
+        fs.rm('/test.tif')
+
+    def test_memory_filesystem_full_roundtrip(self, tmp_path):
+        """to_geotiff + open_geotiff through memory:// filesystem."""
+        import fsspec
+
+        arr = np.arange(16, dtype=np.float32).reshape(4, 4)
+
+        # Write locally first, then copy to memory fs
+        local_path = str(tmp_path / 'local.tif')
+        to_geotiff(arr, local_path, compression='deflate')
+        with open(local_path, 'rb') as f:
+            tiff_bytes = f.read()
+
+        fs = fsspec.filesystem('memory')
+        fs.pipe('/roundtrip.tif', tiff_bytes)
+
+        # Read from memory filesystem
+        from xrspatial.geotiff._reader import read_to_array
+        result, geo = read_to_array('memory:///roundtrip.tif')
+        np.testing.assert_array_equal(result, arr)
+
+        fs.rm('/roundtrip.tif')
+
+    def test_dask_path_fsspec_uri_1749(self, tmp_path):
+        """_read_geotiff_dask supports fsspec URIs.
+
+        The eager path already routed through _CloudSource via
+        _read_to_array. The dask path's _read_geo_info used plain
+        open(), which failed on memory://, s3://, etc.
+        """
+        pytest.importorskip('fsspec')
+        import fsspec
+
+        arr = np.arange(64, dtype=np.float32).reshape(8, 8)
+
+        local_path = str(tmp_path / 'src.tif')
+        to_geotiff(arr, local_path, compression='none')
+        with open(local_path, 'rb') as f:
+            tiff_bytes = f.read()
+
+        fs = fsspec.filesystem('memory')
+        fs.pipe('/dask_1749_full.tif', tiff_bytes)
+
+        try:
+            eager = open_geotiff('memory:///dask_1749_full.tif')
+            lazy = open_geotiff('memory:///dask_1749_full.tif', chunks=4)
+
+            # Lazy path is dask-backed
+            import dask.array as da
+            assert isinstance(lazy.data, da.Array)
+
+            np.testing.assert_array_equal(lazy.values, eager.values)
+            np.testing.assert_array_equal(lazy.values, arr)
+        finally:
+            fs.rm('/dask_1749_full.tif')
+
+    def test_dask_path_fsspec_uri_no_full_download_1749(self, tmp_path,
+                                                        monkeypatch):
+        """Dask graph build for fsspec URIs must not pull the whole file.
+
+        ``_read_geo_info`` previously called ``_CloudSource.read_all`` to
+        parse metadata. For a large COG on S3 that downloads the whole
+        object just to learn its shape/transform. The fix routes fsspec
+        sources through ``_parse_cog_http_meta``, which only uses
+        ``read_range``. Guard against regression by failing the test if
+        ``read_all`` runs during ``open_geotiff(..., chunks=...)``.
+        """
+        pytest.importorskip('fsspec')
+        import fsspec
+
+        arr = np.arange(64, dtype=np.float32).reshape(8, 8)
+
+        local_path = str(tmp_path / 'src.tif')
+        to_geotiff(arr, local_path, compression='none')
+        with open(local_path, 'rb') as f:
+            tiff_bytes = f.read()
+
+        fs = fsspec.filesystem('memory')
+        fs.pipe('/dask_1749_nofull.tif', tiff_bytes)
+
+        from xrspatial.geotiff import _reader as _reader_mod
+
+        def _no_read_all(self):
+            raise AssertionError(
+                "_CloudSource.read_all called during dask graph build")
+
+        monkeypatch.setattr(
+            _reader_mod._CloudSource, 'read_all', _no_read_all)
+
+        try:
+            lazy = open_geotiff('memory:///dask_1749_nofull.tif', chunks=4)
+            # Materialise to confirm the chunk tasks also avoid read_all.
+            np.testing.assert_array_equal(lazy.values, arr)
+        finally:
+            fs.rm('/dask_1749_nofull.tif')
+
+    def test_writer_cloud_scheme_detection(self):
+        """Writer detects cloud schemes."""
+        from xrspatial.geotiff._writer import _is_fsspec_uri
+        assert _is_fsspec_uri('s3://bucket/key.tif')
+        assert _is_fsspec_uri('gs://bucket/key.tif')
+        assert _is_fsspec_uri('az://container/blob.tif')
+        assert not _is_fsspec_uri('/local/path.tif')
+
+    def test_write_to_memory_filesystem(self, tmp_path):
+        """_write_bytes can write to fsspec memory filesystem."""
+        import fsspec
+
+        from xrspatial.geotiff._writer import write
+
+        arr = np.arange(16, dtype=np.float32).reshape(4, 4)
+        local_path = str(tmp_path / 'src.tif')
+        write(arr, local_path, compression='none', tiled=False)
+        with open(local_path, 'rb') as f:
+            tiff_bytes = f.read()
+
+        # Write via _write_bytes to memory filesystem
+        from xrspatial.geotiff._writer import _write_bytes
+        _write_bytes(tiff_bytes, 'memory:///written.tif')
+
+        fs = fsspec.filesystem('memory')
+        assert fs.exists('/written.tif')
+        assert fs.cat('/written.tif') == tiff_bytes
+
+        fs.rm('/written.tif')
+
+
+class TestBigEndian:
+
+    def test_float32_big_endian(self, tmp_path):
+        """Read a big-endian float32 TIFF."""
+        from ..conftest import make_minimal_tiff
+        expected = np.arange(16, dtype=np.float32).reshape(4, 4)
+        tiff_data = make_minimal_tiff(4, 4, np.dtype('float32'),
+                                      pixel_data=expected, big_endian=True)
+        path = str(tmp_path / 'be_f32.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path)
+        assert result.dtype == np.float32
+        np.testing.assert_array_equal(result, expected)
+
+    def test_uint16_big_endian(self, tmp_path):
+        """Read a big-endian uint16 TIFF."""
+        from ..conftest import make_minimal_tiff
+        expected = np.arange(20, dtype=np.uint16).reshape(4, 5) * 1000
+        tiff_data = make_minimal_tiff(5, 4, np.dtype('uint16'),
+                                      pixel_data=expected, big_endian=True)
+        path = str(tmp_path / 'be_u16.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path)
+        assert result.dtype == np.uint16
+        np.testing.assert_array_equal(result, expected)
+
+    def test_int32_big_endian(self, tmp_path):
+        """Read a big-endian int32 TIFF."""
+        from ..conftest import make_minimal_tiff
+        expected = np.arange(16, dtype=np.int32).reshape(4, 4) - 8
+        tiff_data = make_minimal_tiff(4, 4, np.dtype('int32'),
+                                      pixel_data=expected, big_endian=True)
+        path = str(tmp_path / 'be_i32.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path)
+        assert result.dtype == np.int32
+        np.testing.assert_array_equal(result, expected)
+
+    def test_float64_big_endian(self, tmp_path):
+        """Read a big-endian float64 TIFF."""
+        from ..conftest import make_minimal_tiff
+        expected = np.linspace(-1.0, 1.0, 16, dtype=np.float64).reshape(4, 4)
+        tiff_data = make_minimal_tiff(4, 4, np.dtype('float64'),
+                                      pixel_data=expected, big_endian=True)
+        path = str(tmp_path / 'be_f64.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path)
+        assert result.dtype == np.float64
+        np.testing.assert_array_almost_equal(result, expected)
+
+    def test_uint8_big_endian_no_swap_needed(self, tmp_path):
+        """uint8 big-endian needs no byte swap (single byte per sample)."""
+        from ..conftest import make_minimal_tiff
+        expected = np.arange(16, dtype=np.uint8).reshape(4, 4)
+        tiff_data = make_minimal_tiff(4, 4, np.dtype('uint8'),
+                                      pixel_data=expected, big_endian=True)
+        path = str(tmp_path / 'be_u8.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_big_endian_windowed(self, tmp_path):
+        """Windowed read of a big-endian TIFF."""
+        from ..conftest import make_minimal_tiff
+        expected = np.arange(64, dtype=np.float32).reshape(8, 8)
+        tiff_data = make_minimal_tiff(8, 8, np.dtype('float32'),
+                                      pixel_data=expected, big_endian=True)
+        path = str(tmp_path / 'be_window.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path, window=(2, 3, 6, 7))
+        np.testing.assert_array_equal(result, expected[2:6, 3:7])
+
+    def test_big_endian_via_public_api(self, tmp_path):
+        """open_geotiff handles big-endian files."""
+        from ..conftest import make_minimal_tiff
+        expected = np.arange(16, dtype=np.float32).reshape(4, 4)
+        tiff_data = make_minimal_tiff(
+            4, 4, np.dtype('float32'), pixel_data=expected,
+            big_endian=True,
+            geo_transform=(-120.0, 45.0, 0.001, -0.001), epsg=4326)
+        path = str(tmp_path / 'be_api.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        da = open_geotiff(path)
+        assert da.attrs['crs'] == 4326
+        np.testing.assert_array_equal(da.values, expected)
+
+
+class TestExtraTags:
+
+    def _make_tiff_with_extra_tags(self, tmp_path):
+        """Build a TIFF with Software (305) and DateTime (306) tags."""
+        import struct
+        bo = '<'
+        width, height = 4, 4
+        pixels = np.arange(16, dtype=np.float32).reshape(4, 4)
+        pixel_bytes = pixels.tobytes()
+
+        tag_list = []
+
+        def add_short(tag, val):
+            tag_list.append((tag, 3, 1, struct.pack(f'{bo}H', val)))
+
+        def add_long(tag, val):
+            tag_list.append((tag, 4, 1, struct.pack(f'{bo}I', val)))
+
+        def add_ascii(tag, text):
+            raw = text.encode('ascii') + b'\x00'
+            tag_list.append((tag, 2, len(raw), raw))
+
+        add_short(256, width)
+        add_short(257, height)
+        add_short(258, 32)
+        add_short(259, 1)
+        add_short(262, 1)
+        add_short(277, 1)
+        add_short(278, height)
+        add_long(273, 0)  # placeholder
+        add_long(279, len(pixel_bytes))
+        add_short(339, 3)  # float
+        add_ascii(305, 'TestSoftware v1.0')
+        add_ascii(306, '2025:01:15 12:00:00')
+
+        tag_list.sort(key=lambda t: t[0])
+        num_entries = len(tag_list)
+        ifd_start = 8
+        ifd_size = 2 + 12 * num_entries + 4
+        overflow_start = ifd_start + ifd_size
+
+        overflow_buf = bytearray()
+        tag_offsets = {}
+        for tag, typ, count, raw in tag_list:
+            if len(raw) > 4:
+                tag_offsets[tag] = len(overflow_buf)
+                overflow_buf.extend(raw)
+                if len(overflow_buf) % 2:
+                    overflow_buf.append(0)
+            else:
+                tag_offsets[tag] = None
+
+        pixel_data_start = overflow_start + len(overflow_buf)
+
+        patched = []
+        for tag, typ, count, raw in tag_list:
+            if tag == 273:
+                patched.append((tag, typ, count, struct.pack(f'{bo}I', pixel_data_start)))
+            else:
+                patched.append((tag, typ, count, raw))
+        tag_list = patched
+
+        overflow_buf = bytearray()
+        tag_offsets = {}
+        for tag, typ, count, raw in tag_list:
+            if len(raw) > 4:
+                tag_offsets[tag] = len(overflow_buf)
+                overflow_buf.extend(raw)
+                if len(overflow_buf) % 2:
+                    overflow_buf.append(0)
+            else:
+                tag_offsets[tag] = None
+
+        out = bytearray()
+        out.extend(b'II')
+        out.extend(struct.pack(f'{bo}H', 42))
+        out.extend(struct.pack(f'{bo}I', ifd_start))
+        out.extend(struct.pack(f'{bo}H', num_entries))
+        for tag, typ, count, raw in tag_list:
+            out.extend(struct.pack(f'{bo}HHI', tag, typ, count))
+            if len(raw) <= 4:
+                out.extend(raw.ljust(4, b'\x00'))
+            else:
+                ptr = overflow_start + tag_offsets[tag]
+                out.extend(struct.pack(f'{bo}I', ptr))
+        out.extend(struct.pack(f'{bo}I', 0))
+        out.extend(overflow_buf)
+        out.extend(pixel_bytes)
+
+        path = str(tmp_path / 'extra_tags.tif')
+        with open(path, 'wb') as f:
+            f.write(bytes(out))
+        return path, pixels
+
+    def test_extra_tags_read(self, tmp_path):
+        """Extra tags are collected in attrs['extra_tags']."""
+        path, _ = self._make_tiff_with_extra_tags(tmp_path)
+        da = open_geotiff(path)
+
+        extra = da.attrs.get('extra_tags')
+        assert extra is not None
+        tag_ids = {t[0] for t in extra}
+        assert 305 in tag_ids  # Software
+        assert 306 in tag_ids  # DateTime
+
+    def test_extra_tags_round_trip(self, tmp_path):
+        """Extra tags survive read -> write -> read."""
+        path, pixels = self._make_tiff_with_extra_tags(tmp_path)
+        da = open_geotiff(path)
+
+        out_path = str(tmp_path / 'roundtrip.tif')
+        to_geotiff(da, out_path, compression='none')
+
+        da2 = open_geotiff(out_path)
+
+        # Pixels should match
+        np.testing.assert_array_equal(da2.values, pixels)
+
+        # Extra tags should survive
+        extra2 = da2.attrs.get('extra_tags')
+        assert extra2 is not None
+        tag_map = {t[0]: t[3] for t in extra2}
+        assert 305 in tag_map
+        assert 'TestSoftware v1.0' in str(tag_map[305])
+        assert 306 in tag_map
+        assert '2025:01:15' in str(tag_map[306])
+
+    def test_no_extra_tags(self, tmp_path):
+        """Files with only managed tags have no extra_tags attr."""
+        arr = np.ones((4, 4), dtype=np.float32)
+        path = str(tmp_path / 'no_extra.tif')
+        write(arr, path, compression='none', tiled=False)
+
+        da = open_geotiff(path)
+        assert 'extra_tags' not in da.attrs
+
+
+class TestGDALMetadata:
+
+    def test_parse_gdal_metadata_xml(self):
+        """XML parsing extracts dataset and per-band items."""
+        from xrspatial.geotiff._geotags import _parse_gdal_metadata
+        xml = (
+            '<GDALMetadata>\n'
+            '  <Item name="DataType">Generic</Item>\n'
+            '  <Item name="STATISTICS_MAX" sample="0">100.5</Item>\n'
+            '  <Item name="STATISTICS_MIN" sample="0">-5.2</Item>\n'
+            '  <Item name="BAND_NAME" sample="1">green</Item>\n'
+            '</GDALMetadata>\n'
+        )
+        meta = _parse_gdal_metadata(xml)
+        assert meta['DataType'] == 'Generic'
+        assert meta[('STATISTICS_MAX', 0)] == '100.5'
+        assert meta[('STATISTICS_MIN', 0)] == '-5.2'
+        assert meta[('BAND_NAME', 1)] == 'green'
+
+    def test_build_gdal_metadata_xml(self):
+        """Dict serializes back to valid XML."""
+        from xrspatial.geotiff._geotags import _build_gdal_metadata_xml, _parse_gdal_metadata
+        meta = {
+            'DataType': 'Generic',
+            ('STATS_MAX', 0): '42.0',
+            ('STATS_MIN', 0): '-1.0',
+        }
+        xml = _build_gdal_metadata_xml(meta)
+        assert '<GDALMetadata>' in xml
+        assert '<Item name="DataType">Generic</Item>' in xml
+        assert 'sample="0"' in xml
+        # Round-trip through parser
+        reparsed = _parse_gdal_metadata(xml)
+        assert reparsed == meta
+
+    def test_round_trip_via_file(self, tmp_path):
+        """GDAL metadata survives write -> read."""
+        meta = {
+            'DataType': 'Elevation',
+            ('STATISTICS_MAXIMUM', 0): '2500.0',
+            ('STATISTICS_MINIMUM', 0): '100.0',
+            ('STATISTICS_MEAN', 0): '1200.5',
+        }
+        from xrspatial.geotiff._geotags import _build_gdal_metadata_xml
+        xml = _build_gdal_metadata_xml(meta)
+
+        arr = np.ones((4, 4), dtype=np.float32)
+        path = str(tmp_path / 'gdal_meta.tif')
+        write(arr, path, compression='none', tiled=False,
+              gdal_metadata_xml=xml)
+
+        da = open_geotiff(path)
+        assert 'gdal_metadata' in da.attrs
+        assert 'gdal_metadata_xml' in da.attrs
+        result_meta = da.attrs['gdal_metadata']
+        assert result_meta['DataType'] == 'Elevation'
+        assert result_meta[('STATISTICS_MAXIMUM', 0)] == '2500.0'
+        assert result_meta[('STATISTICS_MEAN', 0)] == '1200.5'
+
+    def test_dataarray_attrs_round_trip(self, tmp_path):
+        """GDAL metadata from DataArray attrs is preserved."""
+        meta = {'Source': 'test', ('BAND', 0): 'dem'}
+        da = xr.DataArray(
+            np.ones((4, 4), dtype=np.float32),
+            dims=['y', 'x'],
+            attrs={'gdal_metadata': meta},
+        )
+        path = str(tmp_path / 'da_meta.tif')
+        # gdal_metadata dict is an experimental rich-tag write (#3320).
+        to_geotiff(da, path, compression='none', allow_experimental_codecs=True)
+
+        result = open_geotiff(path)
+        assert result.attrs['gdal_metadata']['Source'] == 'test'
+        assert result.attrs['gdal_metadata'][('BAND', 0)] == 'dem'
+
+    def test_no_metadata_no_attrs(self, tmp_path):
+        """Files without GDAL metadata don't get the attrs."""
+        arr = np.ones((4, 4), dtype=np.float32)
+        path = str(tmp_path / 'no_meta.tif')
+        write(arr, path, compression='none', tiled=False)
+
+        da = open_geotiff(path)
+        assert 'gdal_metadata' not in da.attrs
+        assert 'gdal_metadata_xml' not in da.attrs
+
+    def test_real_file_metadata(self):
+        """Real USGS file has GDAL metadata with statistics."""
+        import os
+        path = '../rtxpy/examples/USGS_one_meter_x65y454_NY_LongIsland_Z18_2014.tif'
+        if not os.path.exists(path):
+            pytest.skip("Real test files not available")
+
+        da = open_geotiff(path)
+        meta = da.attrs.get('gdal_metadata')
+        assert meta is not None
+        assert 'DataType' in meta
+        assert ('STATISTICS_MAXIMUM', 0) in meta
+
+    def test_real_file_round_trip(self):
+        """GDAL metadata survives real-file round-trip."""
+        import os
+        import tempfile
+        path = '../rtxpy/examples/USGS_one_meter_x65y454_NY_LongIsland_Z18_2014.tif'
+        if not os.path.exists(path):
+            pytest.skip("Real test files not available")
+
+        da = open_geotiff(path)
+        orig_meta = da.attrs['gdal_metadata']
+
+        out = os.path.join(tempfile.mkdtemp(), 'rt.tif')
+        to_geotiff(da, out, compression='deflate', tiled=False)
+
+        da2 = open_geotiff(out)
+        for k, v in orig_meta.items():
+            assert da2.attrs['gdal_metadata'].get(k) == v, f"Mismatch on {k}"
+
+
+class TestResolution:
+
+    def test_write_read_dpi(self, tmp_path):
+        """Resolution tags round-trip through write and read."""
+        arr = np.ones((4, 4), dtype=np.float32)
+        path = str(tmp_path / 'dpi.tif')
+        write(arr, path, compression='none', tiled=False,
+              x_resolution=300.0, y_resolution=300.0, resolution_unit=2)
+
+        da = open_geotiff(path)
+        assert da.attrs['x_resolution'] == pytest.approx(300.0, rel=0.01)
+        assert da.attrs['y_resolution'] == pytest.approx(300.0, rel=0.01)
+        assert da.attrs['resolution_unit'] == 'inch'
+
+    def test_write_read_cm(self, tmp_path):
+        """Centimeter resolution unit."""
+        arr = np.ones((4, 4), dtype=np.float32)
+        path = str(tmp_path / 'dpi_cm.tif')
+        write(arr, path, compression='none', tiled=False,
+              x_resolution=118.0, y_resolution=118.0, resolution_unit=3)
+
+        da = open_geotiff(path)
+        assert da.attrs['x_resolution'] == pytest.approx(118.0, rel=0.01)
+        assert da.attrs['resolution_unit'] == 'centimeter'
+
+    def test_no_resolution_no_attrs(self, tmp_path):
+        """Files without resolution tags don't get resolution attrs."""
+        arr = np.ones((4, 4), dtype=np.float32)
+        path = str(tmp_path / 'no_dpi.tif')
+        write(arr, path, compression='none', tiled=False)
+
+        da = open_geotiff(path)
+        assert 'x_resolution' not in da.attrs
+        assert 'y_resolution' not in da.attrs
+        assert 'resolution_unit' not in da.attrs
+
+    def test_dataarray_attrs_round_trip(self, tmp_path):
+        """Resolution attrs on DataArray are preserved through write/read."""
+        da = xr.DataArray(
+            np.ones((4, 4), dtype=np.float32),
+            dims=['y', 'x'],
+            attrs={'x_resolution': 72.0, 'y_resolution': 72.0,
+                   'resolution_unit': 'inch'},
+        )
+        path = str(tmp_path / 'da_dpi.tif')
+        to_geotiff(da, path, compression='none')
+
+        result = open_geotiff(path)
+        assert result.attrs['x_resolution'] == pytest.approx(72.0, rel=0.01)
+        assert result.attrs['y_resolution'] == pytest.approx(72.0, rel=0.01)
+        assert result.attrs['resolution_unit'] == 'inch'
+
+    def test_unit_none(self, tmp_path):
+        """ResolutionUnit=1 (no unit) round-trips as 'none'."""
+        arr = np.ones((4, 4), dtype=np.float32)
+        path = str(tmp_path / 'no_unit.tif')
+        write(arr, path, compression='none', tiled=False,
+              x_resolution=1.0, y_resolution=1.0, resolution_unit=1)
+
+        da = open_geotiff(path)
+        assert da.attrs['resolution_unit'] == 'none'
+
+
+# -----------------------------------------------------------------------
+# Overview resampling methods
+# -----------------------------------------------------------------------
+
+class TestOverviewResampling:
+
+    def test_mean_default(self, tmp_path):
+        """Default mean resampling produces correct 2x2 block averages."""
+        from xrspatial.geotiff._writer import _make_overview
+        arr = np.array([[1, 3, 5, 7],
+                        [2, 4, 6, 8],
+                        [10, 20, 30, 40],
+                        [10, 20, 30, 40]], dtype=np.float32)
+        ov = _make_overview(arr, 'mean')
+        assert ov.shape == (2, 2)
+        # (1+3+2+4)/4 = 2.5
+        assert ov[0, 0] == pytest.approx(2.5)
+
+    def test_nearest(self, tmp_path):
+        """Nearest resampling picks top-left pixel of each 2x2 block."""
+        from xrspatial.geotiff._writer import _make_overview
+        arr = np.array([[10, 20, 30, 40],
+                        [50, 60, 70, 80],
+                        [90, 100, 110, 120],
+                        [130, 140, 150, 160]], dtype=np.uint8)
+        ov = _make_overview(arr, 'nearest')
+        assert ov.shape == (2, 2)
+        assert ov[0, 0] == 10
+        assert ov[0, 1] == 30
+        assert ov[1, 0] == 90
+        assert ov[1, 1] == 110
+
+    def test_min(self, tmp_path):
+        from xrspatial.geotiff._writer import _make_overview
+        arr = np.array([[10, 1, 5, 3],
+                        [20, 2, 6, 4],
+                        [30, 3, 7, 5],
+                        [40, 4, 8, 6]], dtype=np.float32)
+        ov = _make_overview(arr, 'min')
+        assert ov[0, 0] == pytest.approx(1.0)
+        assert ov[0, 1] == pytest.approx(3.0)
+
+    def test_max(self, tmp_path):
+        from xrspatial.geotiff._writer import _make_overview
+        arr = np.array([[10, 1, 5, 3],
+                        [20, 2, 6, 4],
+                        [30, 3, 7, 5],
+                        [40, 4, 8, 6]], dtype=np.float32)
+        ov = _make_overview(arr, 'max')
+        assert ov[0, 0] == pytest.approx(20.0)
+        assert ov[1, 1] == pytest.approx(8.0)
+
+    def test_median(self, tmp_path):
+        from xrspatial.geotiff._writer import _make_overview
+        arr = np.array([[1, 2, 10, 20],
+                        [3, 100, 30, 40],
+                        [0, 0, 0, 0],
+                        [0, 0, 0, 0]], dtype=np.float32)
+        ov = _make_overview(arr, 'median')
+        assert ov.shape == (2, 2)
+        # median of [1, 2, 3, 100] = 2.5
+        assert ov[0, 0] == pytest.approx(2.5)
+
+    def test_mode(self, tmp_path):
+        """Mode picks the most common value in each 2x2 block."""
+        from xrspatial.geotiff._writer import _make_overview
+        arr = np.array([[1, 1, 2, 3],
+                        [1, 2, 2, 2],
+                        [5, 5, 5, 6],
+                        [5, 7, 6, 6]], dtype=np.uint8)
+        ov = _make_overview(arr, 'mode')
+        assert ov[0, 0] == 1   # 1 appears 3 times
+        assert ov[0, 1] == 2   # 2 appears 3 times
+        assert ov[1, 0] == 5   # 5 appears 3 times
+        assert ov[1, 1] == 6   # 6 appears 3 times
+
+    def test_mean_with_nan(self, tmp_path):
+        """Mean resampling ignores NaN values."""
+        from xrspatial.geotiff._writer import _make_overview
+        arr = np.array([[np.nan, 2, 4, 6],
+                        [1, 3, np.nan, 8],
+                        [10, 20, 30, 40],
+                        [10, 20, 30, 40]], dtype=np.float32)
+        ov = _make_overview(arr, 'mean')
+        # nanmean([nan, 2, 1, 3]) = 2.0
+        assert ov[0, 0] == pytest.approx(2.0)
+
+    def test_multiband(self, tmp_path):
+        """Resampling works on 3D (multi-band) arrays."""
+        from xrspatial.geotiff._writer import _make_overview
+        arr = np.zeros((4, 4, 3), dtype=np.uint8)
+        arr[:, :, 0] = 100
+        arr[:, :, 1] = 200
+        arr[:, :, 2] = 50
+        ov = _make_overview(arr, 'mean')
+        assert ov.shape == (2, 2, 3)
+        assert ov[0, 0, 0] == 100
+        assert ov[0, 0, 1] == 200
+        assert ov[0, 0, 2] == 50
+
+    def test_cog_round_trip_nearest(self, tmp_path):
+        """COG with nearest resampling writes and reads back."""
+        arr = np.arange(256, dtype=np.float32).reshape(16, 16)
+        path = str(tmp_path / 'cog_nearest.tif')
+        write(arr, path, compression='deflate', tiled=True, tile_size=8,
+              cog=True, overview_levels=[2], overview_resampling='nearest')
+
+        result, _ = read_to_array(path)
+        np.testing.assert_array_equal(result, arr)
+
+    def test_cog_round_trip_mode(self, tmp_path):
+        """COG with mode resampling for classified data."""
+        arr = np.array([[0, 0, 1, 1, 2, 2, 3, 3],
+                        [0, 0, 1, 1, 2, 2, 3, 3],
+                        [4, 4, 5, 5, 6, 6, 7, 7],
+                        [4, 4, 5, 5, 6, 6, 7, 7],
+                        [0, 0, 1, 1, 2, 2, 3, 3],
+                        [0, 0, 1, 1, 2, 2, 3, 3],
+                        [4, 4, 5, 5, 6, 6, 7, 7],
+                        [4, 4, 5, 5, 6, 6, 7, 7]], dtype=np.uint8)
+        path = str(tmp_path / 'cog_mode.tif')
+        write(arr, path, compression='deflate', tiled=True, tile_size=4,
+              cog=True, overview_levels=[2], overview_resampling='mode')
+
+        # Full res should be exact
+        result, _ = read_to_array(path)
+        np.testing.assert_array_equal(result, arr)
+
+        # Overview should have mode-reduced values
+        ov, _ = read_to_array(path, overview_level=1)
+        assert ov.shape == (4, 4)
+        assert ov[0, 0] == 0
+        assert ov[0, 1] == 1
+
+    def test_to_geotiff_api(self, tmp_path):
+        """overview_resampling kwarg works through the public API."""
+        arr = np.arange(64, dtype=np.float32).reshape(8, 8)
+        path = str(tmp_path / 'api_nearest.tif')
+        to_geotiff(arr, path, compression='deflate',
+                   cog=True, overview_resampling='nearest')
+
+        result = open_geotiff(path)
+        np.testing.assert_array_equal(result.values, arr)
+
+    def test_invalid_method(self):
+        from xrspatial.geotiff._writer import _make_overview
+        arr = np.ones((4, 4), dtype=np.float32)
+        with pytest.raises(ValueError, match="Unknown overview resampling"):
+            _make_overview(arr, 'bicubic_spline')
+
+
+# -----------------------------------------------------------------------
+# BigTIFF write
+# -----------------------------------------------------------------------
+
+class TestBigTIFF:
+
+    def test_bigtiff_header_written(self, tmp_path):
+        """Force BigTIFF via internal threshold by mocking; test header parsing."""
+        # We can't easily create a >4GB file in tests, but we can verify
+        # the BigTIFF path works by writing a small file with bigtiff=True
+        # through the internal API.
+        from xrspatial.geotiff._compression import COMPRESSION_NONE
+        from xrspatial.geotiff._writer import _assemble_tiff, _write_stripped
+
+        arr = np.arange(16, dtype=np.float32).reshape(4, 4)
+        rel_off, bc, chunks = _write_stripped(arr, COMPRESSION_NONE, False)
+        parts = [(arr, 4, 4, rel_off, bc, chunks)]
+
+        file_bytes = _assemble_tiff(
+            4, 4, arr.dtype, COMPRESSION_NONE, False, False, 256,
+            parts, None, None, None, is_cog=False, raster_type=1)
+
+        # Standard TIFF: magic 42
+        header = parse_header(file_bytes)
+        assert not header.is_bigtiff
+
+    def test_bigtiff_read_write_round_trip(self, tmp_path):
+        from xrspatial.geotiff._compression import COMPRESSION_NONE
+        from xrspatial.geotiff._dtypes import LONG, SHORT, numpy_to_tiff_dtype
+        from xrspatial.geotiff._header import (TAG_BITS_PER_SAMPLE, TAG_COMPRESSION,
+                                               TAG_IMAGE_LENGTH, TAG_IMAGE_WIDTH, TAG_PHOTOMETRIC,
+                                               TAG_ROWS_PER_STRIP, TAG_SAMPLE_FORMAT,
+                                               TAG_SAMPLES_PER_PIXEL, TAG_STRIP_BYTE_COUNTS,
+                                               TAG_STRIP_OFFSETS)
+        from xrspatial.geotiff._writer import _assemble_standard_layout, _write_stripped
+
+        arr = np.arange(64, dtype=np.float32).reshape(8, 8)
+        rel_off, bc, chunks = _write_stripped(arr, COMPRESSION_NONE, False)
+        bits_per_sample, sample_format = numpy_to_tiff_dtype(arr.dtype)
+
+        tags = [
+            (TAG_IMAGE_WIDTH, LONG, 1, 8),
+            (TAG_IMAGE_LENGTH, LONG, 1, 8),
+            (TAG_BITS_PER_SAMPLE, SHORT, 1, bits_per_sample),
+            (TAG_COMPRESSION, SHORT, 1, 1),
+            (TAG_PHOTOMETRIC, SHORT, 1, 1),
+            (TAG_SAMPLES_PER_PIXEL, SHORT, 1, 1),
+            (TAG_SAMPLE_FORMAT, SHORT, 1, sample_format),
+            (TAG_ROWS_PER_STRIP, SHORT, 1, 8),
+            (TAG_STRIP_OFFSETS, LONG, len(rel_off), rel_off),
+            (TAG_STRIP_BYTE_COUNTS, LONG, len(bc), bc),
+        ]
+
+        parts = [(arr, 8, 8, rel_off, bc, chunks)]
+        file_bytes = _assemble_standard_layout(
+            16, [tags], parts, bigtiff=True)
+
+        path = str(tmp_path / 'bigtiff.tif')
+        with open(path, 'wb') as f:
+            f.write(file_bytes)
+
+        header = parse_header(file_bytes)
+        assert header.is_bigtiff
+
+        result, _ = read_to_array(path)
+        np.testing.assert_array_equal(result, arr)
+
+    def test_force_bigtiff_via_public_api(self, tmp_path):
+        """bigtiff=True on to_geotiff forces BigTIFF even for small files."""
+        arr = np.arange(16, dtype=np.float32).reshape(4, 4)
+        path = str(tmp_path / 'forced_bigtiff.tif')
+        to_geotiff(arr, path, compression='none', bigtiff=True)
+
+        with open(path, 'rb') as f:
+            header = parse_header(f.read(16))
+        assert header.is_bigtiff
+
+        result = open_geotiff(path)
+        np.testing.assert_array_equal(result.values, arr)
+
+    def test_small_file_stays_classic(self, tmp_path):
+        """Small files default to classic TIFF (bigtiff=None auto-detects)."""
+        arr = np.arange(16, dtype=np.float32).reshape(4, 4)
+        path = str(tmp_path / 'classic.tif')
+        to_geotiff(arr, path, compression='none')
+
+        with open(path, 'rb') as f:
+            header = parse_header(f.read(16))
+        assert not header.is_bigtiff
+
+    def test_force_bigtiff_false_stays_classic(self, tmp_path):
+        """bigtiff=False forces classic TIFF."""
+        arr = np.arange(16, dtype=np.float32).reshape(4, 4)
+        path = str(tmp_path / 'forced_classic.tif')
+        to_geotiff(arr, path, compression='none', bigtiff=False)
+
+        with open(path, 'rb') as f:
+            header = parse_header(f.read(16))
+        assert not header.is_bigtiff
+
+    def _assert_offset_tags_are_long8(self, path):
+        """Parse *path*'s first IFD and assert offset tags use LONG8."""
+        from xrspatial.geotiff._dtypes import LONG8
+        from xrspatial.geotiff._header import (TAG_STRIP_BYTE_COUNTS, TAG_STRIP_OFFSETS,
+                                               TAG_TILE_BYTE_COUNTS, TAG_TILE_OFFSETS,
+                                               parse_all_ifds)
+
+        with open(path, 'rb') as f:
+            buf = f.read()
+        header = parse_header(buf)
+        assert header.is_bigtiff, (
+            "Test precondition: file must be BigTIFF.")
+        ifds = parse_all_ifds(buf, header)
+        assert len(ifds) >= 1
+        entries = ifds[0].entries
+
+        offset_tags = (TAG_STRIP_OFFSETS, TAG_STRIP_BYTE_COUNTS,
+                       TAG_TILE_OFFSETS, TAG_TILE_BYTE_COUNTS)
+        present = [t for t in offset_tags if t in entries]
+        assert present, (
+            "File had no strip/tile offset tags; "
+            "cannot verify the LONG8 promotion.")
+        for tag_id in present:
+            entry = entries[tag_id]
+            assert entry.type_id == LONG8, (
+                f"Tag {tag_id} in BigTIFF output was typed "
+                f"{entry.type_id}, expected LONG8 (16).  A 32-bit "
+                "offset would truncate on files larger than 4 GB.")
+
+    def test_bigtiff_eager_tile_offsets_are_long8_1247(self, tmp_path):
+        """Eager writer emits LONG8 TileOffsets in BigTIFF output.
+
+        Regression guard: eager ``_assemble_tiff`` once hard-coded LONG
+        for TileOffsets / TileByteCounts regardless of the BigTIFF
+        decision, so anything past 4 GB would silently truncate (or,
+        with ``struct.pack``, fail at pack time).
+
+        Asserting on a small-but-forced BigTIFF is enough: the fix
+        is width-of-the-offset-field, not value-range.
+        """
+        arr = np.arange(64, dtype=np.float32).reshape(8, 8)
+        path = str(tmp_path / 'bigtiff_long8_eager_1247.tif')
+        to_geotiff(arr, path, compression='none',
+                   tiled=True, tile_size=16, bigtiff=True)
+        self._assert_offset_tags_are_long8(path)
+        # Data must still round-trip.
+        np.testing.assert_array_equal(open_geotiff(path).values, arr)
+
+    def test_bigtiff_eager_strip_offsets_are_long8_1247(self, tmp_path):
+        """Eager writer emits LONG8 StripOffsets for stripped BigTIFF."""
+        arr = np.arange(64, dtype=np.float32).reshape(8, 8)
+        path = str(tmp_path / 'bigtiff_long8_eager_strip_1247.tif')
+        to_geotiff(arr, path, compression='none',
+                   tiled=False, bigtiff=True)
+        self._assert_offset_tags_are_long8(path)
+        np.testing.assert_array_equal(open_geotiff(path).values, arr)
+
+    def test_bigtiff_streaming_tile_offsets_are_long8_1247(self, tmp_path):
+        """Streaming writer emits LONG8 TileOffsets in BigTIFF output.
+
+        ``_writer.write_streaming`` once needed LONG8 offsets but emitted
+        LONG.  Uses a small dask array so the test doesn't actually need
+        to produce a >4 GB file.
+        """
+        import dask.array as da
+        import xarray as xr
+
+        arr = np.arange(256, dtype=np.float32).reshape(16, 16)
+        dask_da = xr.DataArray(
+            da.from_array(arr, chunks=8),
+            dims=['y', 'x'],
+        )
+        path = str(tmp_path / 'bigtiff_long8_stream_1247.tif')
+        to_geotiff(dask_da, path, compression='none',
+                   tiled=True, tile_size=16, bigtiff=True)
+        self._assert_offset_tags_are_long8(path)
+        np.testing.assert_array_equal(open_geotiff(path).values, arr)
+
+
+# -----------------------------------------------------------------------
+# Sub-byte bit depths (1-bit, 4-bit, 12-bit)
+# -----------------------------------------------------------------------
+
+def _make_sub_byte_tiff(width, height, bps, pixel_values):
+    """Build a minimal TIFF with sub-byte BitsPerSample.
+
+    pixel_values: 2D array of unpacked integer values.
+    Data is packed MSB-first into bytes according to bps.
+    """
+    import struct
+    bo = '<'
+
+    # Pack pixel values into bytes
+    flat = pixel_values.ravel()
+    if bps == 1:
+        packed = np.packbits(flat.astype(np.uint8))
+    elif bps == 4:
+        n = len(flat)
+        packed_len = (n + 1) // 2
+        packed = np.zeros(packed_len, dtype=np.uint8)
+        for i in range(n):
+            if i % 2 == 0:
+                packed[i // 2] |= (flat[i] & 0x0F) << 4
+            else:
+                packed[i // 2] |= flat[i] & 0x0F
+        packed = packed
+    elif bps == 12:
+        n = len(flat)
+        n_pairs = n // 2
+        remainder = n % 2
+        packed_len = n_pairs * 3 + (2 if remainder else 0)
+        packed = np.zeros(packed_len, dtype=np.uint8)
+        for i in range(n_pairs):
+            v0 = int(flat[i * 2])
+            v1 = int(flat[i * 2 + 1])
+            off = i * 3
+            packed[off] = (v0 >> 4) & 0xFF
+            packed[off + 1] = ((v0 & 0x0F) << 4) | ((v1 >> 8) & 0x0F)
+            packed[off + 2] = v1 & 0xFF
+        if remainder:
+            v = int(flat[-1])
+            off = n_pairs * 3
+            packed[off] = (v >> 4) & 0xFF
+            packed[off + 1] = (v & 0x0F) << 4
+    else:
+        raise ValueError(f"Unsupported bps: {bps}")
+
+    pixel_bytes = packed.tobytes()
+
+    # Build tags
+    tag_list = []
+
+    def add_short(tag, val):
+        tag_list.append((tag, 3, 1, struct.pack(f'{bo}H', val)))
+
+    def add_long(tag, val):
+        tag_list.append((tag, 4, 1, struct.pack(f'{bo}I', val)))
+
+    add_short(256, width)
+    add_short(257, height)
+    add_short(258, bps)
+    add_short(259, 1)   # no compression
+    add_short(262, 1)  # BlackIsZero (works for all bit depths)
+    add_short(277, 1)
+    add_short(278, height)
+    add_long(273, 0)    # strip offset placeholder
+    add_long(279, len(pixel_bytes))
+    if bps <= 8:
+        add_short(339, 1)  # UINT
+    else:
+        add_short(339, 1)
+
+    tag_list.sort(key=lambda t: t[0])
+    num_entries = len(tag_list)
+    ifd_start = 8
+    ifd_size = 2 + 12 * num_entries + 4
+    overflow_buf = bytearray()
+    tag_offsets = {}
+    overflow_start = ifd_start + ifd_size
+
+    for tag, typ, count, raw in tag_list:
+        if len(raw) > 4:
+            tag_offsets[tag] = len(overflow_buf)
+            overflow_buf.extend(raw)
+            if len(overflow_buf) % 2:
+                overflow_buf.append(0)
+        else:
+            tag_offsets[tag] = None
+
+    pixel_data_start = overflow_start + len(overflow_buf)
+
+    # Patch strip offset
+    patched = []
+    for tag, typ, count, raw in tag_list:
+        if tag == 273:
+            patched.append((tag, typ, count, struct.pack(f'{bo}I', pixel_data_start)))
+        else:
+            patched.append((tag, typ, count, raw))
+    tag_list = patched
+
+    # Rebuild overflow after patching
+    overflow_buf = bytearray()
+    tag_offsets = {}
+    for tag, typ, count, raw in tag_list:
+        if len(raw) > 4:
+            tag_offsets[tag] = len(overflow_buf)
+            overflow_buf.extend(raw)
+            if len(overflow_buf) % 2:
+                overflow_buf.append(0)
+        else:
+            tag_offsets[tag] = None
+
+    out = bytearray()
+    out.extend(b'II')
+    out.extend(struct.pack(f'{bo}H', 42))
+    out.extend(struct.pack(f'{bo}I', ifd_start))
+    out.extend(struct.pack(f'{bo}H', num_entries))
+
+    for tag, typ, count, raw in tag_list:
+        out.extend(struct.pack(f'{bo}HHI', tag, typ, count))
+        if len(raw) <= 4:
+            out.extend(raw.ljust(4, b'\x00'))
+        else:
+            ptr = overflow_start + tag_offsets[tag]
+            out.extend(struct.pack(f'{bo}I', ptr))
+
+    out.extend(struct.pack(f'{bo}I', 0))
+    out.extend(overflow_buf)
+    out.extend(pixel_bytes)
+
+    return bytes(out), pixel_values
+
+
+class TestSubByteBitDepths:
+
+    def test_1bit_bilevel(self, tmp_path):
+        """Read a 1-bit bilevel TIFF."""
+        pixels = np.array([[1, 0, 1, 0, 1, 0, 1, 0],
+                           [0, 1, 0, 1, 0, 1, 0, 1],
+                           [1, 1, 0, 0, 1, 1, 0, 0],
+                           [0, 0, 1, 1, 0, 0, 1, 1]], dtype=np.uint8)
+        tiff_data, expected = _make_sub_byte_tiff(8, 4, 1, pixels)
+        path = str(tmp_path / '1bit.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path)
+        assert result.dtype == np.uint8
+        assert result.shape == (4, 8)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_1bit_non_byte_aligned_width(self, tmp_path):
+        """1-bit image whose width is not a multiple of 8."""
+        pixels = np.array([[1, 0, 1],
+                           [0, 1, 0]], dtype=np.uint8)
+        tiff_data, expected = _make_sub_byte_tiff(3, 2, 1, pixels)
+        path = str(tmp_path / '1bit_3wide.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path)
+        assert result.shape == (2, 3)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_4bit_nibble(self, tmp_path):
+        """Read a 4-bit TIFF."""
+        pixels = np.array([[0, 1, 2, 3],
+                           [4, 5, 6, 7],
+                           [8, 9, 10, 11],
+                           [12, 13, 14, 15]], dtype=np.uint8)
+        tiff_data, expected = _make_sub_byte_tiff(4, 4, 4, pixels)
+        path = str(tmp_path / '4bit.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path)
+        assert result.dtype == np.uint8
+        assert result.shape == (4, 4)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_4bit_odd_width(self, tmp_path):
+        """4-bit image with odd width (partial byte at row end)."""
+        pixels = np.array([[1, 2, 3],
+                           [4, 5, 6]], dtype=np.uint8)
+        tiff_data, expected = _make_sub_byte_tiff(3, 2, 4, pixels)
+        path = str(tmp_path / '4bit_odd.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path)
+        assert result.shape == (2, 3)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_12bit(self, tmp_path):
+        """Read a 12-bit TIFF."""
+        pixels = np.array([[0, 100, 2048, 4095],
+                           [1000, 2000, 3000, 4000]], dtype=np.uint16)
+        tiff_data, expected = _make_sub_byte_tiff(4, 2, 12, pixels)
+        path = str(tmp_path / '12bit.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path)
+        assert result.dtype == np.uint16
+        assert result.shape == (2, 4)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_unpack_bits_codec_directly(self):
+        """Test unpack_bits on known packed data."""
+        from xrspatial.geotiff._compression import unpack_bits
+
+        # 1-bit: byte 0xA5 = 10100101 -> [1,0,1,0,0,1,0,1]
+        data = np.array([0xA5], dtype=np.uint8)
+        result = unpack_bits(data, 1, 8)
+        np.testing.assert_array_equal(result, [1, 0, 1, 0, 0, 1, 0, 1])
+
+        # 4-bit: byte 0x3C = 0011_1100 -> [3, 12]
+        data = np.array([0x3C], dtype=np.uint8)
+        result = unpack_bits(data, 4, 2)
+        np.testing.assert_array_equal(result, [3, 12])
+
+
+# -----------------------------------------------------------------------
+# Planar configuration (separate planes)
+# -----------------------------------------------------------------------
+
+def _make_planar_tiff(width, height, bands, dtype=np.uint8, tiled=False,
+                      tile_size=4):
+    """Build a minimal planar-config TIFF (PlanarConfiguration=2) by hand.
+
+    Each band's pixel data is stored as a separate set of strips (or tiles).
+    Band values: band 0 gets pixel values 10+pixel_idx, band 1 gets 20+,
+    band 2 gets 30+, etc.
+    """
+    import struct
+    bo = '<'
+
+    dtype = np.dtype(dtype)
+    bps = dtype.itemsize * 8
+    if dtype.kind == 'f':
+        sf = 3
+    elif dtype.kind == 'i':
+        sf = 2
+    else:
+        sf = 1
+
+    # Build per-band pixel arrays
+    band_arrays = []
+    for b in range(bands):
+        base = (b + 1) * 10
+        arr = np.arange(width * height, dtype=dtype).reshape(height, width) + dtype.type(base)
+        band_arrays.append(arr)
+
+    if tiled:
+        import math
+        tw = th = tile_size
+        tiles_across = math.ceil(width / tw)
+        tiles_down = math.ceil(height / th)
+
+        # Build tile data: all tiles for band 0, then band 1, etc.
+        tile_blobs = []
+        for b in range(bands):
+            for tr in range(tiles_down):
+                for tc in range(tiles_across):
+                    tile = np.zeros((th, tw), dtype=dtype)
+                    r0, c0 = tr * th, tc * tw
+                    r1 = min(r0 + th, height)
+                    c1 = min(c0 + tw, width)
+                    tile[:r1 - r0, :c1 - c0] = band_arrays[b][r0:r1, c0:c1]
+                    tile_blobs.append(tile.tobytes())
+
+        pixel_bytes = b''.join(tile_blobs)
+        tile_byte_counts = [len(t) for t in tile_blobs]
+        num_offsets = len(tile_blobs)
+    else:
+        # Strips: 1 strip per band (whole image), one set per band
+        strip_blobs = []
+        for b in range(bands):
+            strip_blobs.append(band_arrays[b].tobytes())
+        pixel_bytes = b''.join(strip_blobs)
+        strip_byte_counts = [len(s) for s in strip_blobs]
+        num_offsets = bands
+
+    # Build tags
+    tag_list = []
+
+    def add_short(tag, val):
+        tag_list.append((tag, 3, 1, struct.pack(f'{bo}H', val)))
+
+    def add_shorts(tag, vals):
+        tag_list.append((tag, 3, len(vals), struct.pack(f'{bo}{len(vals)}H', *vals)))
+
+    def add_long(tag, val):
+        tag_list.append((tag, 4, 1, struct.pack(f'{bo}I', val)))
+
+    def add_longs(tag, vals):
+        tag_list.append((tag, 4, len(vals), struct.pack(f'{bo}{len(vals)}I', *vals)))
+
+    add_short(256, width)
+    add_short(257, height)
+    add_shorts(258, [bps] * bands)
+    add_short(259, 1)   # no compression
+    add_short(262, 2 if bands >= 3 else 1)  # RGB or BlackIsZero
+    add_short(277, bands)
+    add_short(284, 2)   # PlanarConfiguration = Separate
+    add_shorts(339, [sf] * bands)
+
+    if tiled:
+        add_short(322, tile_size)
+        add_short(323, tile_size)
+        add_longs(324, [0] * num_offsets)  # placeholder
+        add_longs(325, tile_byte_counts)
+    else:
+        add_short(278, height)  # RowsPerStrip = full image
+        add_longs(273, [0] * num_offsets)  # placeholder
+        add_longs(279, strip_byte_counts)
+
+    tag_list.sort(key=lambda t: t[0])
+
+    # Layout
+    num_entries = len(tag_list)
+    ifd_start = 8
+    ifd_size = 2 + 12 * num_entries + 4
+
+    # Collect overflow
+    overflow_buf = bytearray()
+    tag_offsets = {}
+    overflow_start = ifd_start + ifd_size
+
+    for tag, typ, count, raw in tag_list:
+        if len(raw) > 4:
+            tag_offsets[tag] = len(overflow_buf)
+            overflow_buf.extend(raw)
+            if len(overflow_buf) % 2:
+                overflow_buf.append(0)
+        else:
+            tag_offsets[tag] = None
+
+    pixel_data_start = overflow_start + len(overflow_buf)
+
+    # Patch offsets
+    offset_tag = 324 if tiled else 273
+    patched = []
+    for tag, typ, count, raw in tag_list:
+        if tag == offset_tag:
+            if tiled:
+                offs = []
+                pos = 0
+                for blob in tile_blobs:
+                    offs.append(pixel_data_start + pos)
+                    pos += len(blob)
+                new_raw = struct.pack(f'{bo}{num_offsets}I', *offs)
+            else:
+                offs = []
+                pos = 0
+                for blob in strip_blobs:
+                    offs.append(pixel_data_start + pos)
+                    pos += len(blob)
+                new_raw = struct.pack(f'{bo}{num_offsets}I', *offs)
+            patched.append((tag, typ, count, new_raw))
+        else:
+            patched.append((tag, typ, count, raw))
+    tag_list = patched
+
+    # Rebuild overflow
+    overflow_buf = bytearray()
+    tag_offsets = {}
+    for tag, typ, count, raw in tag_list:
+        if len(raw) > 4:
+            tag_offsets[tag] = len(overflow_buf)
+            overflow_buf.extend(raw)
+            if len(overflow_buf) % 2:
+                overflow_buf.append(0)
+        else:
+            tag_offsets[tag] = None
+
+    # Serialize
+    out = bytearray()
+    out.extend(b'II')
+    out.extend(struct.pack(f'{bo}H', 42))
+    out.extend(struct.pack(f'{bo}I', ifd_start))
+    out.extend(struct.pack(f'{bo}H', num_entries))
+
+    for tag, typ, count, raw in tag_list:
+        out.extend(struct.pack(f'{bo}HHI', tag, typ, count))
+        if len(raw) <= 4:
+            out.extend(raw.ljust(4, b'\x00'))
+        else:
+            ptr = overflow_start + tag_offsets[tag]
+            out.extend(struct.pack(f'{bo}I', ptr))
+
+    out.extend(struct.pack(f'{bo}I', 0))  # next IFD
+    out.extend(overflow_buf)
+    out.extend(pixel_bytes)
+
+    # Build expected output for verification
+    expected = np.stack(band_arrays, axis=2)
+    return bytes(out), expected
+
+
+# -----------------------------------------------------------------------
+# Palette / indexed color (ColorMap tag 320)
+# -----------------------------------------------------------------------
+
+def _make_palette_tiff(width, height, bps, pixel_values, palette_rgb):
+    """Build a palette-color TIFF (Photometric=3 + ColorMap tag).
+
+    palette_rgb: list of (R, G, B) tuples, uint16 values (0-65535).
+    """
+    import struct
+    bo = '<'
+    n_colors = len(palette_rgb)
+    assert n_colors == (1 << bps), f"Palette must have {1 << bps} entries for {bps}-bit"
+
+    # Pack pixel data
+    flat = pixel_values.ravel().astype(np.uint8)
+    if bps == 8:
+        pixel_bytes = flat.tobytes()
+    elif bps == 4:
+        n = len(flat)
+        packed_len = (n + 1) // 2
+        packed = np.zeros(packed_len, dtype=np.uint8)
+        for i in range(n):
+            if i % 2 == 0:
+                packed[i // 2] |= (flat[i] & 0x0F) << 4
+            else:
+                packed[i // 2] |= flat[i] & 0x0F
+        pixel_bytes = packed.tobytes()
+    else:
+        pixel_bytes = flat.tobytes()
+
+    # Build ColorMap: [R0..R_{n-1}, G0..G_{n-1}, B0..B_{n-1}]
+    r_vals = [c[0] for c in palette_rgb]
+    g_vals = [c[1] for c in palette_rgb]
+    b_vals = [c[2] for c in palette_rgb]
+    cmap_values = r_vals + g_vals + b_vals
+
+    tag_list = []
+
+    def add_short(tag, val):
+        tag_list.append((tag, 3, 1, struct.pack(f'{bo}H', val)))
+
+    def add_long(tag, val):
+        tag_list.append((tag, 4, 1, struct.pack(f'{bo}I', val)))
+
+    def add_shorts(tag, vals):
+        tag_list.append((tag, 3, len(vals), struct.pack(f'{bo}{len(vals)}H', *vals)))
+
+    add_short(256, width)
+    add_short(257, height)
+    add_short(258, bps)
+    add_short(259, 1)     # no compression
+    add_short(262, 3)     # Photometric = Palette
+    add_short(277, 1)     # SamplesPerPixel = 1
+    add_short(278, height)
+    add_long(273, 0)      # StripOffsets placeholder
+    add_long(279, len(pixel_bytes))
+    add_shorts(320, cmap_values)  # ColorMap
+    add_short(339, 1)     # SampleFormat = UINT
+
+    tag_list.sort(key=lambda t: t[0])
+    num_entries = len(tag_list)
+    ifd_start = 8
+    ifd_size = 2 + 12 * num_entries + 4
+    overflow_start = ifd_start + ifd_size
+
+    overflow_buf = bytearray()
+    tag_offsets = {}
+    for tag, typ, count, raw in tag_list:
+        if len(raw) > 4:
+            tag_offsets[tag] = len(overflow_buf)
+            overflow_buf.extend(raw)
+            if len(overflow_buf) % 2:
+                overflow_buf.append(0)
+        else:
+            tag_offsets[tag] = None
+
+    pixel_data_start = overflow_start + len(overflow_buf)
+
+    patched = []
+    for tag, typ, count, raw in tag_list:
+        if tag == 273:
+            patched.append((tag, typ, count, struct.pack(f'{bo}I', pixel_data_start)))
+        else:
+            patched.append((tag, typ, count, raw))
+    tag_list = patched
+
+    overflow_buf = bytearray()
+    tag_offsets = {}
+    for tag, typ, count, raw in tag_list:
+        if len(raw) > 4:
+            tag_offsets[tag] = len(overflow_buf)
+            overflow_buf.extend(raw)
+            if len(overflow_buf) % 2:
+                overflow_buf.append(0)
+        else:
+            tag_offsets[tag] = None
+
+    out = bytearray()
+    out.extend(b'II')
+    out.extend(struct.pack(f'{bo}H', 42))
+    out.extend(struct.pack(f'{bo}I', ifd_start))
+    out.extend(struct.pack(f'{bo}H', num_entries))
+
+    for tag, typ, count, raw in tag_list:
+        out.extend(struct.pack(f'{bo}HHI', tag, typ, count))
+        if len(raw) <= 4:
+            out.extend(raw.ljust(4, b'\x00'))
+        else:
+            ptr = overflow_start + tag_offsets[tag]
+            out.extend(struct.pack(f'{bo}I', ptr))
+
+    out.extend(struct.pack(f'{bo}I', 0))
+    out.extend(overflow_buf)
+    out.extend(pixel_bytes)
+
+    return bytes(out)
+
+
+class TestPalette:
+
+    def test_palette_8bit_read(self, tmp_path):
+        """Read an 8-bit palette TIFF and verify pixel indices."""
+        # 4-color palette: red, green, blue, white
+        palette = [
+            (65535, 0, 0),       # 0 = red
+            (0, 65535, 0),       # 1 = green
+            (0, 0, 65535),       # 2 = blue
+            (65535, 65535, 65535),  # 3 = white
+        ] + [(0, 0, 0)] * 252   # pad to 256 entries for 8-bit
+
+        pixels = np.array([[0, 1, 2, 3],
+                           [3, 2, 1, 0]], dtype=np.uint8)
+
+        tiff_data = _make_palette_tiff(4, 2, 8, pixels, palette)
+        path = str(tmp_path / 'palette8.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        da = open_geotiff(path)
+        # Should return raw index values
+        assert da.dtype == np.uint8
+        np.testing.assert_array_equal(da.values, pixels)
+
+        # The reader does not surface ``attrs['cmap']`` or
+        # ``attrs['colormap_rgba']``. The canonical ``attrs['colormap']``
+        # (raw uint16 RGB triples from TIFF tag 320) carries the
+        # palette information; callers reconstruct an RGBA palette or a
+        # matplotlib colormap from it.
+        assert 'cmap' not in da.attrs
+        assert 'colormap_rgba' not in da.attrs
+        assert 'colormap' in da.attrs
+
+        # Verify the palette colors via the canonical raw uint16 triples
+        # at TIFF tag 320.
+        raw = da.attrs['colormap']
+        assert len(raw) == 3 * 256
+        # Red entry at index 0: R=65535, G=0, B=0
+        assert raw[0] == 65535
+        assert raw[256] == 0
+        assert raw[512] == 0
+        # Green entry at index 1
+        assert raw[1] == 0
+        assert raw[257] == 65535
+        assert raw[513] == 0
+        # Blue entry at index 2
+        assert raw[2] == 0
+        assert raw[258] == 0
+        assert raw[514] == 65535
+
+    def test_palette_4bit(self, tmp_path):
+        """Read a 4-bit palette TIFF."""
+        palette = [(i * 4369, i * 4369, i * 4369) for i in range(16)]
+        pixels = np.array([[0, 5, 10, 15],
+                           [1, 6, 11, 3]], dtype=np.uint8)
+
+        tiff_data = _make_palette_tiff(4, 2, 4, pixels, palette)
+        path = str(tmp_path / 'palette4.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        da = open_geotiff(path)
+        assert da.dtype == np.uint8
+        np.testing.assert_array_equal(da.values, pixels)
+        # ``attrs['cmap']`` is not surfaced by the reader.
+        assert 'cmap' not in da.attrs
+        # Raw uint16 RGB triples at tag 320: 3 * 16 entries.
+        assert len(da.attrs['colormap']) == 3 * 16
+
+    def test_palette_cmap_works_with_plot(self, tmp_path):
+        """The ``.xrs.plot()`` accessor uses the embedded palette even
+        though ``attrs['cmap']`` is no longer surfaced."""
+        import matplotlib
+        matplotlib.use('Agg')
+        from matplotlib.colors import ListedColormap
+
+        import xrspatial.accessor  # register .xrs accessor  # noqa: F401
+        from xrspatial.accessor import _listed_colormap_from_attrs
+
+        palette = [
+            (65535, 0, 0),
+            (0, 65535, 0),
+            (0, 0, 65535),
+            (65535, 65535, 0),
+        ] + [(0, 0, 0)] * 252
+
+        pixels = np.array([[0, 1], [2, 3]], dtype=np.uint8)
+        tiff_data = _make_palette_tiff(2, 2, 8, pixels, palette)
+        path = str(tmp_path / 'palette_plot.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        da = open_geotiff(path)
+        # ``attrs['cmap']`` is gone; build the ListedColormap from the
+        # canonical raw colormap via the accessor helper.
+        cmap = _listed_colormap_from_attrs(da.attrs)
+        assert isinstance(cmap, ListedColormap)
+
+        # Verify color mapping at known indices
+        assert cmap(0)[:3] == pytest.approx((1.0, 0.0, 0.0), abs=0.01)
+        assert cmap(1 / 255)[:3] == pytest.approx((0.0, 1.0, 0.0), abs=0.01)
+
+    def test_xrs_plot_with_palette(self, tmp_path):
+        """da.xrs.plot() uses the embedded colormap."""
+        import matplotlib
+        matplotlib.use('Agg')
+        import xrspatial.accessor  # register .xrs accessor  # noqa: F401
+
+        palette = [
+            (65535, 0, 0),
+            (0, 65535, 0),
+            (0, 0, 65535),
+            (65535, 65535, 65535),
+        ] + [(0, 0, 0)] * 252
+
+        pixels = np.array([[0, 1, 2, 3],
+                           [3, 2, 1, 0]], dtype=np.uint8)
+        tiff_data = _make_palette_tiff(4, 2, 8, pixels, palette)
+        path = str(tmp_path / 'plot_palette.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        da = open_geotiff(path)
+        artist = da.xrs.plot()
+        assert artist is not None
+        import matplotlib.pyplot as plt
+        plt.close('all')
+
+    def test_xrs_plot_no_palette(self, tmp_path):
+        """da.xrs.plot() falls through to normal plot for non-palette data."""
+        import matplotlib
+        matplotlib.use('Agg')
+        import xrspatial.accessor  # noqa: F401
+
+        arr = np.random.RandomState(42).rand(4, 4).astype(np.float32)
+        path = str(tmp_path / 'no_palette.tif')
+        write(arr, path, compression='none', tiled=False)
+
+        da = open_geotiff(path)
+        artist = da.xrs.plot()
+        assert artist is not None
+        import matplotlib.pyplot as plt
+        plt.close('all')
+
+    def test_plot_geotiff_deprecated(self, tmp_path):
+        """plot_geotiff still works but emits a DeprecationWarning."""
+        import matplotlib
+        matplotlib.use('Agg')
+        import xrspatial.accessor  # noqa: F401
+        from xrspatial.geotiff import plot_geotiff
+
+        palette = [(65535, 0, 0), (0, 65535, 0)] + [(0, 0, 0)] * 254
+        pixels = np.array([[0, 1], [1, 0]], dtype=np.uint8)
+        tiff_data = _make_palette_tiff(2, 2, 8, pixels, palette)
+        path = str(tmp_path / 'deprecated.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        da = open_geotiff(path)
+        with pytest.warns(DeprecationWarning, match='plot_geotiff is deprecated'):
+            artist = plot_geotiff(da)
+        assert artist is not None
+        import matplotlib.pyplot as plt
+        plt.close('all')
+
+    def test_non_palette_no_cmap(self, tmp_path):
+        """Non-palette TIFFs should not have any colormap attr.
+
+        The reader surfaces neither ``cmap`` nor ``colormap_rgba``;
+        ``colormap`` is the canonical raw uint16 RGB triple list and is
+        absent on a non-palette TIFF.
+        """
+        arr = np.ones((4, 4), dtype=np.float32)
+        path = str(tmp_path / 'no_palette.tif')
+        write(arr, path, compression='none', tiled=False)
+
+        da = open_geotiff(path)
+        assert 'cmap' not in da.attrs
+        assert 'colormap_rgba' not in da.attrs
+        assert 'colormap' not in da.attrs
+
+
+class TestPlanarConfig:
+
+    def test_planar_strips_rgb(self, tmp_path):
+        """Read a 3-band planar-stripped TIFF."""
+        tiff_data, expected = _make_planar_tiff(4, 6, 3, np.uint8)
+        path = str(tmp_path / 'planar_strip.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path)
+        assert result.shape == (6, 4, 3)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_planar_strips_2band(self, tmp_path):
+        """Read a 2-band planar-stripped TIFF."""
+        tiff_data, expected = _make_planar_tiff(5, 4, 2, np.uint16)
+        path = str(tmp_path / 'planar_2band.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path)
+        assert result.shape == (4, 5, 2)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_planar_tiles_rgb(self, tmp_path):
+        """Read a 3-band planar-tiled TIFF."""
+        tiff_data, expected = _make_planar_tiff(
+            8, 8, 3, np.uint8, tiled=True, tile_size=4)
+        path = str(tmp_path / 'planar_tiled.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path)
+        assert result.shape == (8, 8, 3)
+        np.testing.assert_array_equal(result, expected)
+
+    def test_planar_windowed(self, tmp_path):
+        """Windowed read of a planar-stripped TIFF."""
+        tiff_data, expected = _make_planar_tiff(8, 8, 3, np.uint8)
+        path = str(tmp_path / 'planar_window.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path, window=(2, 1, 6, 5))
+        np.testing.assert_array_equal(result, expected[2:6, 1:5, :])
+
+    def test_planar_band_selection(self, tmp_path):
+        """Selecting a single band from a planar TIFF."""
+        tiff_data, expected = _make_planar_tiff(4, 4, 3, np.uint8)
+        path = str(tmp_path / 'planar_band.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        result, _ = read_to_array(path, band=1)
+        assert result.shape == (4, 4)
+        np.testing.assert_array_equal(result, expected[:, :, 1])
+
+    def test_planar_via_public_api(self, tmp_path):
+        """open_geotiff on a planar file returns correct DataArray."""
+        from xrspatial.geotiff import open_geotiff
+        tiff_data, expected = _make_planar_tiff(4, 4, 3, np.uint8)
+        path = str(tmp_path / 'planar_api.tif')
+        with open(path, 'wb') as f:
+            f.write(tiff_data)
+
+        da = open_geotiff(path)
+        assert 'band' in da.dims
+        assert da.shape == (4, 4, 3)
+        np.testing.assert_array_equal(da.values, expected)
+
+
+# -----------------------------------------------------------------------
+# Dask lazy reads
+# -----------------------------------------------------------------------
+
+class TestDaskReads:
+
+    def test_dask_basic(self, tmp_path):
+        """_read_geotiff_dask returns a dask-backed DataArray."""
+        import dask.array as da
+
+        from xrspatial.geotiff import _read_geotiff_dask
+
+        arr = np.arange(256, dtype=np.float32).reshape(16, 16)
+        path = str(tmp_path / 'dask_test.tif')
+        write(arr, path, compression='none', tiled=False)
+
+        result = _read_geotiff_dask(path, chunks=8)
+        assert isinstance(result.data, da.Array)
+        assert result.shape == (16, 16)
+
+        # Compute and compare
+        computed = result.compute()
+        np.testing.assert_array_equal(computed.values, arr)
+
+    def test_dask_coords(self, tmp_path):
+        """Dask read preserves coordinates and CRS."""
+        from xrspatial.geotiff import _read_geotiff_dask
+        from xrspatial.geotiff._geotags import GeoTransform
+
+        arr = np.ones((8, 8), dtype=np.float32)
+        gt = GeoTransform(-120.0, 45.0, 0.001, -0.001)
+        path = str(tmp_path / 'dask_geo.tif')
+        write(arr, path, geo_transform=gt, crs_epsg=4326,
+              compression='none', tiled=False)
+
+        result = _read_geotiff_dask(path, chunks=4)
+        assert result.attrs['crs'] == 4326
+        assert len(result.coords['y']) == 8
+        assert len(result.coords['x']) == 8
+
+    def test_dask_nodata(self, tmp_path):
+        """Nodata masking applied per-chunk."""
+        from xrspatial.geotiff import _read_geotiff_dask
+
+        arr = np.array([[1.0, -9999.0], [-9999.0, 2.0],
+                        [3.0, 4.0], [5.0, -9999.0]], dtype=np.float32)
+        path = str(tmp_path / 'dask_nodata.tif')
+        write(arr, path, compression='none', tiled=False, nodata=-9999.0)
+
+        result = _read_geotiff_dask(path, chunks=2, mask_nodata=True)
+        computed = result.compute()
+        assert np.isnan(computed.values[0, 1])
+        assert np.isnan(computed.values[1, 0])
+        assert computed.values[0, 0] == 1.0
+
+    def test_dask_chunk_tuple(self, tmp_path):
+        """Chunks as (row, col) tuple."""
+        from xrspatial.geotiff import _read_geotiff_dask
+
+        arr = np.arange(200, dtype=np.float32).reshape(10, 20)
+        path = str(tmp_path / 'dask_tuple.tif')
+        write(arr, path, compression='deflate', tiled=False)
+
+        result = _read_geotiff_dask(path, chunks=(5, 10))
+        computed = result.compute()
+        np.testing.assert_array_equal(computed.values, arr)
+
+
+class TestPublicAPI:
+    """`__all__` reflects every supported public function and `from
+    xrspatial.geotiff import *` does not silently drop production names."""
+
+    def test_all_lists_supported_functions(self):
+        import xrspatial.geotiff as g
+
+        # Frozen list of names that callers / tests treat as part of the
+        # public API. If any of these gets removed or renamed, that is a
+        # breaking change and should go through a deprecation cycle.
+        expected = {
+            # Ambiguous-metadata error hierarchy. Re-exported so callers
+            # can ``except`` the family or a specific case without
+            # importing from the private ``_errors`` module.
+            'ConflictingCRSError',
+            'ConflictingNodataError',
+            # Read-side fail-closed on a zero or non-finite ModelPixelScale
+            # / ModelTransformation diagonal (issue #3331), replacing the
+            # legacy silent build of a constant or all-NaN coordinate axis.
+            'DegeneratePixelSizeError',
+            # Issue #2483: read-side fail-closed on TIFF directories that
+            # repeat a tag, replacing the legacy silent last-wins parse.
+            'DuplicateIFDTagError',
+            'GeoTIFFAmbiguousMetadataError',
+            # Read-side fail-closed on contradictory ModelType /
+            # ProjectedCSType / GeographicType GeoKey combinations.
+            'InconsistentGeoKeysError',
+            'InvalidCRSCodeError',
+            # Read-side fail-closed on non-finite / fractional
+            # GDAL_NODATA against an integer source dtype, replacing the
+            # legacy silent no-op.
+            'InvalidIntegerNodataError',
+            # Read-side fail-closed on a present-but-unparseable SCALE /
+            # OFFSET under mask_and_scale, replacing the legacy silent
+            # fall-back to the 1.0 / 0.0 default (issue #2987).
+            'MalformedScaleOffsetError',
+            'MixedBandMetadataError',
+            # Writer rejects compound EPSG codes that cannot be
+            # represented in a single GeographicType / ProjectedCSType
+            # GeoKey, surfacing the corruption instead of silently writing
+            # a compound EPSG into a horizontal-CRS slot.
+            'NonRepresentableEPSGCRSError',
+            'NonUniformCoordsError',
+            'RotatedTransformError',
+            'UnknownCRSModelTypeError',
+            'UnparseableCRSError',
+            # Typed error raised at the read or write entry point when the
+            # caller asks for a feature the GeoTIFF module does not
+            # implement (warped / pansharpened / derived VRT subclasses,
+            # unknown VRT band children, rotated source transforms on a
+            # VRT mosaic).
+            'UnsupportedGeoTIFFFeatureError',
+            # Typed rejection when a caller opens a VRT under
+            # ``stable_only=True``. The VRT reader itself is advanced-tier
+            # so the request cannot be served without naming the
+            # broader-tier opt-in.
+            'VRTStableSourcesOnlyError',
+            # Sibling of VRTStableSourcesOnlyError for the non-VRT read
+            # paths: a caller opening an HTTP / fsspec source under
+            # ``stable_only=True`` is rejected because those readers are
+            # advanced-tier.
+            'RemoteStableSourcesOnlyError',
+            # Typed rejection when the parsed VRT declares a feature the
+            # read pipeline does not honour (CRS / dtype / band / nodata /
+            # transform / pixel-size / window / resampling mismatch).
+            # Exported in issue #3265 so callers can catch it without
+            # importing from the private ``_errors`` module.
+            'VRTUnsupportedError',
+            'GeoTIFFFallbackWarning',
+            'UnsafeURLError',
+            # Safety-cap rejections on public read paths (issue #3265):
+            # ``max_cloud_bytes`` breaches and ``max_pixels`` breaches.
+            # Both are ``ValueError`` subclasses, exported so callers can
+            # catch the specific cap without private-module imports.
+            'CloudSizeLimitError',
+            'PixelSafetyLimitError',
+            # Canonical georef_status constants. Exposed so downstream
+            # code can branch on the five reader states via constants
+            # rather than string literals.
+            'GEOREF_STATUS_CRS_ONLY',
+            'GEOREF_STATUS_FULL',
+            'GEOREF_STATUS_NONE',
+            'GEOREF_STATUS_ROTATED_DROPPED',
+            'GEOREF_STATUS_TRANSFORM_ONLY',
+            'GEOREF_STATUS_VALUES',
+            # Tiered feature inventory exposed alongside the writer's
+            # ``allow_experimental_codecs`` opt-in.
+            'SUPPORTED_FEATURES',
+            # Read/write surface consolidated on the two dispatchers
+            # (open_geotiff / to_geotiff). The backend functions
+            # (_read_geotiff_gpu, _read_geotiff_dask, _read_vrt,
+            # _write_geotiff_gpu) and the VRT-index emitter (_build_vrt)
+            # are private; the dispatchers route to them from their kwargs
+            # and the ``.vrt`` output path (issue #2974).
+            'open_geotiff',
+            'to_geotiff',
+        }
+        assert set(g.__all__) == expected
+
+    def test_star_import_brings_in_all_public_names(self):
+        # ``from ... import *`` honours ``__all__``; verify every entry is
+        # importable that way (catches typos in __all__).
+        ns: dict = {}
+        exec('from xrspatial.geotiff import *', ns)
+        import xrspatial.geotiff as g
+        for name in g.__all__:
+            assert name in ns, f"{name} listed in __all__ but not exported"
+
+    def test_plot_geotiff_not_in_all_but_still_importable(self):
+        # plot_geotiff is intentionally omitted from __all__ (deprecated)
+        # but stays importable so existing user code keeps working.
+        import xrspatial.geotiff as g
+        assert 'plot_geotiff' not in g.__all__
+        assert hasattr(g, 'plot_geotiff')
+
+
+# ===========================================================================
+# SUPPORTED_FEATURES structural invariants (#2348)
+# Source: test_supported_features_shape_2348.py
+# ===========================================================================
+
+
+_VALID_TIERS = frozenset({'stable', 'advanced', 'experimental', 'internal_only'})
+
+
+def test_supported_features_is_non_empty_dict():
+    """Catches an accidental refactor that swaps the dict for a
+    different container or empties it."""
+    assert isinstance(SUPPORTED_FEATURES, dict)
+    assert len(SUPPORTED_FEATURES) > 0
+
+
+def test_every_entry_has_a_tier():
+    """Every value is a non-empty string. Catches ``None`` /
+    placeholder values that would otherwise silently disable the
+    docs / notebook renderer for that row."""
+    for name, tier in SUPPORTED_FEATURES.items():
+        assert isinstance(tier, str), (name, type(tier).__name__)
+        assert tier, name
+
+
+def test_tier_set_is_closed():
+    """Every tier value is one of the four documented labels. The
+    set is closed; introducing a new tier requires updating the
+    docs, the notebook, and this test together."""
+    seen = set(SUPPORTED_FEATURES.values())
+    extras = seen - _VALID_TIERS
+    assert not extras, (
+        f"SUPPORTED_FEATURES carries unrecognised tier labels {sorted(extras)!r}; "
+        f"valid labels are {sorted(_VALID_TIERS)!r}. Adding a new tier requires "
+        f"updating xrspatial.geotiff.__init__ docs, the user-guide notebook table, "
+        f"and this test in the same commit."
+    )
+
+
+def test_every_tier_label_is_used():
+    """Every documented tier label appears on at least one entry.
+    Catches accidental drift where a tier is documented in the
+    package docstring but no feature references it (which makes the
+    label dead code)."""
+    seen = set(SUPPORTED_FEATURES.values())
+    missing = _VALID_TIERS - seen
+    assert not missing, (
+        f"the following tier labels are documented but unused: {sorted(missing)!r}. "
+        f"Either remove the label from the docs / notebook or add an entry that uses it."
+    )
+
+
+def test_keys_follow_group_dot_name_shape():
+    """Every key is ``"<group>.<name>"`` with a non-empty group and
+    name. The renderer in the user-guide notebook splits on ``.``
+    once to group rows; an entry without a dot would land in an
+    "(unknown)" bucket."""
+    for key in SUPPORTED_FEATURES:
+        assert isinstance(key, str), type(key).__name__
+        head, _, tail = key.partition('.')
+        assert head and tail, key
+        assert key.count('.') >= 1, key
+
+
+def test_keys_are_unique_in_source():
+    """Dict literals silently dedupe duplicate keys ('a': 'x', 'a':
+    'y' -> {'a': 'y'}). Parse the source and assert no key appears
+    twice so a future copy/paste typo fails CI instead of silently
+    overwriting the earlier tier."""
+    src = Path(__file__).resolve().parents[2] / '_attrs.py'
+    tree = ast.parse(src.read_text())
+
+    found_keys: list[str] | None = None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        targets = node.targets
+        if (len(targets) == 1
+                and isinstance(targets[0], ast.Name)
+                and targets[0].id == 'SUPPORTED_FEATURES'
+                and isinstance(node.value, ast.Dict)):
+            found_keys = []
+            for k in node.value.keys:
+                # Dict-literal keys are ast.Constant on 3.8+.
+                if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                    found_keys.append(k.value)
+            break
+
+    assert found_keys is not None, (
+        "could not locate the ``SUPPORTED_FEATURES = {...}`` literal in "
+        "xrspatial/geotiff/_attrs.py; this test parses the source so a "
+        "duplicate key cannot be hidden by Python's dict-literal dedup."
+    )
+    duplicates = [k for k in found_keys if found_keys.count(k) > 1]
+    assert not duplicates, (
+        f"duplicate keys in the SUPPORTED_FEATURES literal: "
+        f"{sorted(set(duplicates))!r}. Python silently dedupes these so the "
+        f"later tier wins; remove the duplicates or rename them."
+    )
+
+
+@pytest.mark.parametrize("key,tier", [
+    ('reader.windowed', 'stable'),
+    ('reader.dask', 'stable'),
+    ('reader.allow_rotated', 'experimental'),
+    ('reader.allow_unparseable_crs', 'experimental'),
+])
+def test_epic_2340_wave_1_reconciliation(key, tier):
+    """The pinned promotions and demotions land in the expected tiers.
+
+    Pinned so a future revert that bumps these back to ``advanced`` or
+    drops them entirely fails this test before it reaches the docs /
+    release notes.
+    """
+    assert key in SUPPORTED_FEATURES, (
+        f"{key!r} dropped from SUPPORTED_FEATURES; epic #2340 introduced "
+        f"this entry at tier {tier!r}. Restore it or update the test if "
+        f"the reconciliation has been revised."
+    )
+    assert SUPPORTED_FEATURES[key] == tier, (
+        f"{key!r} expected tier {tier!r}, got {SUPPORTED_FEATURES[key]!r}. "
+        f"Epic #2340 set this tier; a promotion / demotion needs to be "
+        f"justified in the changelog and reflected here."
+    )
+
+
+# ===========================================================================
+# SUPPORTED_FEATURES tier-aware codec gates (#2137)
+# Source: test_supported_features_tiers_2137.py
+# ===========================================================================
+
+
+_TIER_VALUES = {'stable', 'advanced', 'experimental', 'internal_only'}
+
+
+def _make_float32_da(h: int = 32, w: int = 32) -> xr.DataArray:
+    """Small float32 raster with axis-aligned coords; round-trips
+    through every Tier 1 codec and exercises the experimental codec
+    gate without exhausting CI time.
+    """
+    rng = np.random.RandomState(0)
+    arr = rng.standard_normal((h, w)).astype(np.float32)
+    return xr.DataArray(
+        arr,
+        dims=("y", "x"),
+        coords={
+            "y": np.arange(h, dtype=np.float64),
+            "x": np.arange(w, dtype=np.float64),
+        },
+        attrs={'crs': 4326},
+    )
+
+
+def _make_uint8_da(h: int = 32, w: int = 32) -> xr.DataArray:
+    """uint8 raster for codecs (jpeg2000 / j2k via glymur) that only
+    accept integer input.
+    """
+    rng = np.random.RandomState(0)
+    arr = rng.randint(0, 256, size=(h, w), dtype=np.uint8)
+    return xr.DataArray(
+        arr,
+        dims=("y", "x"),
+        coords={
+            "y": np.arange(h, dtype=np.float64),
+            "x": np.arange(w, dtype=np.float64),
+        },
+        attrs={'crs': 4326},
+    )
+
+
+# Some Tier 3 codecs constrain the supported input dtype (glymur's
+# JPEG2000 encoder accepts only uint8/uint16). Pick the dtype that
+# exercises the actual encode without re-litigating per-codec limits.
+_EXPERIMENTAL_CODEC_INPUT = {
+    'jpeg2000': _make_uint8_da,
+    'j2k': _make_uint8_da,
+    'lerc': _make_float32_da,
+    'lz4': _make_float32_da,
+}
+
+
+def test_supported_features_is_a_mapping():
+    """``SUPPORTED_FEATURES`` is a non-empty mapping from feature name
+    to tier label. The notebook and the test suite both iterate it, so
+    accidental removal would break the documentation generator and the
+    parity matrix's tier-aware selection.
+    """
+    assert isinstance(SUPPORTED_FEATURES, dict)
+    assert len(SUPPORTED_FEATURES) > 0
+    for name, tier in SUPPORTED_FEATURES.items():
+        assert isinstance(name, str) and '.' in name, name
+        assert tier in _TIER_VALUES, (name, tier)
+
+
+def test_supported_features_has_split_cog_keys():
+    """The COG entry is split into three keys (issue #2291) so the
+    writer, local reader, and HTTP reader can promote between tiers on
+    independent tracks. All three keys must resolve in
+    ``SUPPORTED_FEATURES`` with a known tier label.
+
+    Pinned here so a future refactor that folds the keys back together
+    has to update the docs, the notebook, and this test in one commit.
+    """
+    for key in ('writer.cog', 'reader.local_cog', 'reader.http_cog'):
+        assert key in SUPPORTED_FEATURES, (
+            f"{key!r} missing from SUPPORTED_FEATURES; the split was "
+            "introduced in #2291 and must stay surfaced so the writer / "
+            "local reader / HTTP reader tracks stay independent."
+        )
+        assert SUPPORTED_FEATURES[key] in _TIER_VALUES, (
+            key, SUPPORTED_FEATURES[key])
+
+
+def test_supported_features_covers_every_valid_codec():
+    """Every codec name in ``_VALID_COMPRESSIONS`` carries a tier in
+    ``SUPPORTED_FEATURES``. The gate cannot silently miss a codec.
+    """
+    classified = {
+        name.split('.', 1)[1].lower()
+        for name in SUPPORTED_FEATURES
+        if name.startswith('codec.')
+    }
+    for codec in _VALID_COMPRESSIONS:
+        assert codec.lower() in classified, (
+            f"codec {codec!r} is in _VALID_COMPRESSIONS but missing from "
+            "SUPPORTED_FEATURES; add a 'codec.<name>' entry classified "
+            "into one of stable / experimental / internal_only.")
+
+
+def test_to_geotiff_signature_has_allow_experimental_codecs():
+    """``to_geotiff`` exposes ``allow_experimental_codecs=False``.
+
+    Pinning the signature catches accidental removal during future
+    refactors: if the kwarg disappears, the writer silently drops back
+    to the unconditional acceptance of Tier 3 codecs and the issue
+    regresses.
+    """
+    params = inspect.signature(to_geotiff).parameters
+    assert 'allow_experimental_codecs' in params
+    assert params['allow_experimental_codecs'].default is False
+
+
+def test_write_geotiff_gpu_signature_has_allow_experimental_codecs():
+    """``_write_geotiff_gpu`` carries the same kwarg with the same
+    default, so the two writers expose a consistent surface and the
+    auto-dispatch path forwards a single value to either.
+    """
+    params = inspect.signature(_write_geotiff_gpu).parameters
+    assert 'allow_experimental_codecs' in params
+    assert params['allow_experimental_codecs'].default is False
+
+
+@pytest.mark.parametrize(
+    "codec",
+    sorted(
+        name.split('.', 1)[1]
+        for name, tier in SUPPORTED_FEATURES.items()
+        if name.startswith('codec.') and tier == 'stable'
+    ),
+)
+def test_stable_codecs_accept_default_call(tmp_path, codec):
+    """Tier 1 codecs round-trip a small float32 raster with no flags.
+    A regression that accidentally gates a stable codec behind the new
+    flag would surface here.
+    """
+    da = _make_float32_da()
+    path = os.path.join(str(tmp_path), f'stable_{codec}_2137.tif')
+    out = to_geotiff(da, path, compression=codec)
+    assert out == path
+    assert os.path.exists(path)
+
+
+@pytest.mark.parametrize(
+    "codec",
+    sorted(
+        name.split('.', 1)[1]
+        for name, tier in SUPPORTED_FEATURES.items()
+        if name.startswith('codec.') and tier == 'experimental'
+    ),
+)
+def test_experimental_codec_rejected_by_default(tmp_path, codec):
+    """Tier 3 codecs raise ``ValueError`` whose message names the
+    ``allow_experimental_codecs`` flag so the caller learns the
+    opt-in name from the rejection itself.
+    """
+    da = _make_float32_da()
+    path = os.path.join(str(tmp_path), f'reject_{codec}_2137.tif')
+    with pytest.raises(ValueError, match='allow_experimental_codecs'):
+        to_geotiff(da, path, compression=codec)
+
+
+@pytest.mark.parametrize(
+    "codec",
+    sorted(
+        name.split('.', 1)[1]
+        for name, tier in SUPPORTED_FEATURES.items()
+        if name.startswith('codec.') and tier == 'experimental'
+    ),
+)
+def test_experimental_codec_opt_in_emits_warning(tmp_path, codec):
+    """``allow_experimental_codecs=True`` lets the codec through and
+    emits ``GeoTIFFFallbackWarning`` once per call. The warning shape
+    matches the existing ``allow_internal_only_jpeg`` opt-in so docs
+    and downstream warning filters can target a single class.
+    """
+    da = _EXPERIMENTAL_CODEC_INPUT.get(codec, _make_float32_da)()
+    path = os.path.join(str(tmp_path), f'optin_{codec}_2137.tif')
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        try:
+            to_geotiff(da, path, compression=codec,
+                       allow_experimental_codecs=True)
+        except (ImportError, ModuleNotFoundError) as e:
+            # ``jpeg2000`` / ``j2k`` need glymur; ``lerc`` needs a
+            # codec backend. The opt-in warning still fires before the
+            # encode runs, so the warning assertion below holds even
+            # when the optional dependency is missing on the runner.
+            pytest.skip(f"optional dependency missing for {codec}: {e}")
+    fallback = [w for w in caught
+                if issubclass(w.category, GeoTIFFFallbackWarning)]
+    assert fallback, (
+        f"to_geotiff(compression={codec!r}, allow_experimental_codecs="
+        "True) must emit GeoTIFFFallbackWarning so the caller knows "
+        "the codec carries no cross-backend parity claim.")
+    # Exactly one warning per call. Pinning the count catches the
+    # double-warn regression where the CPU dispatcher fires the
+    # warning and then ``_write_geotiff_gpu`` fires it again on the GPU
+    # dispatch path; the CPU dispatcher gates its warning on
+    # ``not use_gpu`` to keep this invariant on the GPU path too.
+    assert len(fallback) == 1, (
+        f"expected exactly one GeoTIFFFallbackWarning for "
+        f"to_geotiff(compression={codec!r}, allow_experimental_codecs="
+        f"True); got {len(fallback)}: "
+        f"{[str(w.message) for w in fallback]}")
+    # Warning text names both the codec and the opt-in flag so logs
+    # are self-describing rather than pointing to a docs URL.
+    msg = str(fallback[0].message)
+    assert 'allow_experimental_codecs' in msg
+    assert codec in msg
+
+
+def test_jpeg_internal_only_not_covered_by_experimental_flag(tmp_path):
+    """``allow_experimental_codecs=True`` does NOT unlock
+    ``compression='jpeg'`` -- internal-only is the strictest tier and
+    keeps its own dedicated flag (``allow_internal_only_jpeg``). The
+    two flags do not collapse into one switch.
+    """
+    da = _make_float32_da().astype(np.uint8)
+    path = os.path.join(str(tmp_path), 'jpeg_only_experimental_2137.tif')
+    with pytest.raises(ValueError, match='allow_internal_only_jpeg'):
+        to_geotiff(
+            da, path, compression='jpeg',
+            allow_experimental_codecs=True,
+        )
+
+
+def test_jpeg_rejected_without_its_own_flag(tmp_path):
+    """``compression='jpeg'`` without ``allow_internal_only_jpeg=True``
+    raises ``ValueError`` whose message names the dedicated flag.
+    Pinned here so the Tier 4 contract sits alongside the Tier 3
+    contract in one file.
+    """
+    da = _make_float32_da().astype(np.uint8)
+    path = os.path.join(str(tmp_path), 'jpeg_no_flag_2137.tif')
+    with pytest.raises(ValueError, match='allow_internal_only_jpeg'):
+        to_geotiff(da, path, compression='jpeg')
+
+
+# ===========================================================================
+# Unsupported feature combinations (typed refusals, #2349)
+# Source: test_unsupported_features_2349.py
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# VRT parse-time gates: subClass, derived raster bands, unknown band children.
+# ---------------------------------------------------------------------------
+
+
+def test_warped_vrt_subclass_rejected_at_parse():
+    """A ``<VRTDataset subClass="VRTWarpedDataset">`` is not a plain mosaic.
+
+    Without an explicit refusal the reader would dispatch on whatever
+    simple sources the warped VRT happens to embed and drop the warping
+    semantics silently. Pin the typed error and the feature-naming
+    substring so the message stays actionable for callers grepping for
+    "warped" / "subClass".
+    """
+    xml = (
+        '<VRTDataset rasterXSize="4" rasterYSize="4" '
+        'subClass="VRTWarpedDataset"></VRTDataset>'
+    )
+    with pytest.raises(UnsupportedGeoTIFFFeatureError, match="subClass"):
+        parse_vrt(xml, '.')
+
+
+def test_pansharpened_vrt_subclass_rejected_at_parse():
+    """A ``<VRTDataset subClass="VRTPansharpenedDataset">`` is rejected too.
+
+    The subClass check covers every GDAL VRT subclass uniformly, not
+    just the warped one. Pin the pansharpened case so a caller who
+    points _read_vrt at a pansharpened VRT sees the same actionable
+    failure rather than silently mis-reading.
+    """
+    xml = (
+        '<VRTDataset rasterXSize="4" rasterYSize="4" '
+        'subClass="VRTPansharpenedDataset"></VRTDataset>'
+    )
+    with pytest.raises(UnsupportedGeoTIFFFeatureError, match="VRTPansharpened"):
+        parse_vrt(xml, '.')
+
+
+def test_derived_rasterband_subclass_rejected_at_parse():
+    """A ``<VRTRasterBand subClass="VRTDerivedRasterBand">`` is rejected.
+
+    Derived raster bands declare a pixel-function expression evaluated
+    over the sources. _read_vrt has no pixel-function evaluator and
+    would drop straight to the simple-source path, producing wrong
+    output. Pin the typed error and the band number in the message.
+    """
+    xml = (
+        '<VRTDataset rasterXSize="4" rasterYSize="4">'
+        '  <VRTRasterBand band="1" dataType="Float32" '
+        '   subClass="VRTDerivedRasterBand"></VRTRasterBand>'
+        '</VRTDataset>'
+    )
+    with pytest.raises(UnsupportedGeoTIFFFeatureError,
+                       match=r"band=1.*VRTDerivedRasterBand"):
+        parse_vrt(xml, '.')
+
+
+def test_kernel_filtered_source_rejected_at_parse():
+    """``<KernelFilteredSource>`` is a known unsupported source type.
+
+    The previous parser silently skipped every non-Simple/Complex tag
+    inside ``<VRTRasterBand>``. The new gate enumerates the known
+    output-altering children and raises on each. Pin the substring so
+    the caller can match on "KernelFilteredSource" specifically.
+    """
+    xml = (
+        '<VRTDataset rasterXSize="4" rasterYSize="4">'
+        '  <VRTRasterBand band="1" dataType="Float32">'
+        '    <KernelFilteredSource>'
+        '      <SourceFilename relativeToVRT="1">src.tif</SourceFilename>'
+        '    </KernelFilteredSource>'
+        '  </VRTRasterBand>'
+        '</VRTDataset>'
+    )
+    with pytest.raises(UnsupportedGeoTIFFFeatureError,
+                       match="KernelFilteredSource"):
+        parse_vrt(xml, '.')
+
+
+def test_pansharpening_options_rejected_at_parse():
+    """``<PansharpeningOptions>`` inside a band is rejected.
+
+    PansharpeningOptions sits under VRTRasterBand for the pansharpened
+    subClass case. The dataset-level subClass check fires first when
+    the subClass attribute is present, but a malformed VRT that omits
+    the subClass attribute still has to be rejected. Pin that path
+    here.
+    """
+    xml = (
+        '<VRTDataset rasterXSize="4" rasterYSize="4">'
+        '  <VRTRasterBand band="1" dataType="Float32">'
+        '    <PansharpeningOptions></PansharpeningOptions>'
+        '  </VRTRasterBand>'
+        '</VRTDataset>'
+    )
+    with pytest.raises(UnsupportedGeoTIFFFeatureError,
+                       match="PansharpeningOptions"):
+        parse_vrt(xml, '.')
+
+
+def test_unknown_band_child_rejected_at_parse():
+    """An unknown ``<VRTRasterBand>`` child element is rejected.
+
+    The previous parser silently skipped any unknown tag. A future GDAL
+    VRT extension that introduces a new pixel-altering element must
+    not slip past this reader as a no-op; the catch-all branch raises
+    rather than guess at semantics.
+    """
+    xml = (
+        '<VRTDataset rasterXSize="4" rasterYSize="4">'
+        '  <VRTRasterBand band="1" dataType="Float32">'
+        '    <FutureVRTPixelMutator></FutureVRTPixelMutator>'
+        '  </VRTRasterBand>'
+        '</VRTDataset>'
+    )
+    with pytest.raises(UnsupportedGeoTIFFFeatureError,
+                       match="FutureVRTPixelMutator"):
+        parse_vrt(xml, '.')
+
+
+def test_dataset_level_maskband_rejected_at_parse():
+    """A dataset-level ``<MaskBand>`` sibling of VRTRasterBand is rejected.
+
+    Per the GDAL VRT spec, ``<MaskBand>`` lives at the ``<VRTDataset>``
+    level (not inside a band). The band-children loop never sees it,
+    so without the dataset-root sweep the mask gets silently dropped.
+    Pin the typed error and the substring naming the offending tag.
+    """
+    xml = (
+        '<VRTDataset rasterXSize="4" rasterYSize="4">'
+        '  <MaskBand>'
+        '    <VRTRasterBand dataType="Byte"></VRTRasterBand>'
+        '  </MaskBand>'
+        '  <VRTRasterBand band="1" dataType="Float32"></VRTRasterBand>'
+        '</VRTDataset>'
+    )
+    with pytest.raises(UnsupportedGeoTIFFFeatureError, match="MaskBand"):
+        parse_vrt(xml, '.')
+
+
+def test_dataset_level_gcplist_rejected_at_parse():
+    """A dataset-level ``<GCPList>`` (ground-control points) is rejected.
+
+    GCPList signals a non-axis-aligned georeferencing model that
+    _read_vrt cannot honour. Pin the rejection so a future refactor
+    cannot regress to the silent no-op pre-#2349 behaviour.
+    """
+    xml = (
+        '<VRTDataset rasterXSize="4" rasterYSize="4">'
+        '  <GCPList Projection="EPSG:4326"></GCPList>'
+        '  <VRTRasterBand band="1" dataType="Float32"></VRTRasterBand>'
+        '</VRTDataset>'
+    )
+    with pytest.raises(UnsupportedGeoTIFFFeatureError, match="GCPList"):
+        parse_vrt(xml, '.')
+
+
+def test_overview_list_band_child_still_passes(tmp_path):
+    """``<OverviewList>`` and ``<Overview>`` band children are informational.
+
+    GDAL emits these on VRTs whose source GeoTIFFs carry external
+    overviews. _read_vrt does not consume VRT-level overview
+    declarations (the source-side reader handles overviews via
+    ``overview_level=``), so the elements were and remain
+    no-ops. Pin the allow-list so the catch-all "unknown element"
+    branch added in #2349 does not regress this case.
+    """
+    src = tmp_path / f'src_2349_ov_{uuid.uuid4().hex[:6]}.tif'
+    arr = np.arange(16, dtype=np.float32).reshape(4, 4)
+    y = np.arange(4, dtype=np.float64)
+    x = np.arange(4, dtype=np.float64)
+    da = xr.DataArray(arr, dims=['y', 'x'],
+                      coords={'y': y, 'x': x},
+                      attrs={'crs': 4326})
+    to_geotiff(da, str(src), compression='none')
+    xml = (
+        f'<VRTDataset rasterXSize="4" rasterYSize="4">'
+        f'  <SRS>EPSG:4326</SRS>'
+        f'  <GeoTransform>0.0, 1.0, 0.0, 0.0, 0.0, 1.0</GeoTransform>'
+        f'  <VRTRasterBand band="1" dataType="Float32">'
+        f'    <OverviewList resampling="average">2 4</OverviewList>'
+        f'    <SimpleSource>'
+        f'      <SourceFilename relativeToVRT="1">{src.name}</SourceFilename>'
+        f'      <SourceBand>1</SourceBand>'
+        f'      <SrcRect xOff="0" yOff="0" xSize="4" ySize="4"/>'
+        f'      <DstRect xOff="0" yOff="0" xSize="4" ySize="4"/>'
+        f'    </SimpleSource>'
+        f'  </VRTRasterBand>'
+        f'</VRTDataset>'
+    )
+    parsed = parse_vrt(xml, str(tmp_path))
+    assert len(parsed.bands) == 1
+    assert len(parsed.bands[0].sources) == 1
+
+
+def test_informational_band_children_still_pass(tmp_path):
+    """``<Description>`` / ``<UnitType>`` / ``<Offset>`` / ``<Scale>`` skip.
+
+    The gate enumerates known informational children that have no
+    effect on the array bytes and must still be ignored silently.
+    Pin the allow-list so a future refactor cannot regress it to
+    "raise on everything" and break legitimate VRTs.
+    """
+    src = tmp_path / f'src_2349_info_{uuid.uuid4().hex[:6]}.tif'
+    arr = np.arange(16, dtype=np.float32).reshape(4, 4)
+    y = np.arange(4, dtype=np.float64)
+    x = np.arange(4, dtype=np.float64)
+    da = xr.DataArray(arr, dims=['y', 'x'],
+                      coords={'y': y, 'x': x},
+                      attrs={'crs': 4326})
+    to_geotiff(da, str(src), compression='none')
+    xml = (
+        f'<VRTDataset rasterXSize="4" rasterYSize="4">'
+        f'  <SRS>EPSG:4326</SRS>'
+        f'  <GeoTransform>0.0, 1.0, 0.0, 0.0, 0.0, 1.0</GeoTransform>'
+        f'  <VRTRasterBand band="1" dataType="Float32">'
+        f'    <Description>test</Description>'
+        f'    <UnitType>m</UnitType>'
+        f'    <NoDataValue>-9999</NoDataValue>'
+        f'    <SimpleSource>'
+        f'      <SourceFilename relativeToVRT="1">{src.name}</SourceFilename>'
+        f'      <SourceBand>1</SourceBand>'
+        f'      <SrcRect xOff="0" yOff="0" xSize="4" ySize="4"/>'
+        f'      <DstRect xOff="0" yOff="0" xSize="4" ySize="4"/>'
+        f'    </SimpleSource>'
+        f'  </VRTRasterBand>'
+        f'</VRTDataset>'
+    )
+    parsed = parse_vrt(xml, str(tmp_path))
+    assert len(parsed.bands) == 1
+    assert len(parsed.bands[0].sources) == 1
+
+
+# ---------------------------------------------------------------------------
+# VRT writer cross-source mixed-metadata gates.
+# ---------------------------------------------------------------------------
+
+
+def _unique_dir(tmp_path, label: str) -> str:
+    d = tmp_path / f"vrt_2349_{label}_{uuid.uuid4().hex[:8]}"
+    d.mkdir()
+    return str(d)
+
+
+def _write_source(path: str, *, px: float = 1.0, py: float = -1.0,
+                  origin_x: float = 0.0, origin_y: float = 100.0,
+                  nodata: float | int | None = -9999.0,
+                  raster_type: str = 'area',
+                  crs: int = 4326,
+                  dtype=np.float32, h: int = 4, w: int = 4) -> None:
+    arr = np.arange(h * w, dtype=dtype).reshape(h, w)
+    y = origin_y + (np.arange(h) + 0.5) * py
+    x = origin_x + (np.arange(w) + 0.5) * px
+    attrs = {'crs': crs, 'raster_type': raster_type}
+    if nodata is not None:
+        attrs['nodata'] = nodata
+    da = xr.DataArray(arr, dims=['y', 'x'],
+                      coords={'y': y, 'x': x},
+                      attrs=attrs)
+    to_geotiff(da, path, compression='none', nodata=nodata)
+
+
+def test_mixed_per_source_nodata_rejected(tmp_path):
+    """Two sources with different nodata sentinels fail the write.
+
+    Legacy ``write_vrt`` picked ``first['nodata']`` for every band and
+    silently dropped the second source's sentinel. The fail-closed
+    surface refuses; the caller can override by pinning the mosaic
+    nodata via ``write_vrt(..., nodata=<value>)``. Pin the typed error
+    and a substring naming the kwarg so the message stays actionable.
+    """
+    d = _unique_dir(tmp_path, "nodata")
+    a = os.path.join(d, "a.tif")
+    b = os.path.join(d, "b.tif")
+    _write_source(a, origin_x=0.0, nodata=-9999.0)
+    _write_source(b, origin_x=4.0, nodata=-1.0)
+    vrt = os.path.join(d, "out.vrt")
+    with pytest.raises(UnsupportedGeoTIFFFeatureError,
+                       match=r"mixed.*nodata|nodata=\-9999"):
+        write_vrt(vrt, [a, b])
+
+
+def test_matching_nan_nodata_passes(tmp_path):
+    """Two sources both declaring NaN nodata are not a mismatch.
+
+    ``float('nan') != float('nan')`` evaluates True in plain Python,
+    so the naive cross-source equality check would flag a perfectly
+    consistent pair of NaN-sentinel sources as a mismatch. The
+    helper compares via ``math.isnan`` to keep two NaNs equal. Pin
+    the round-trip so a refactor cannot regress to the naive
+    comparator.
+    """
+    d = _unique_dir(tmp_path, "nan_nodata")
+    a = os.path.join(d, "a.tif")
+    b = os.path.join(d, "b.tif")
+    _write_source(a, origin_x=0.0, nodata=float('nan'))
+    _write_source(b, origin_x=4.0, nodata=float('nan'))
+    vrt = os.path.join(d, "out.vrt")
+    write_vrt(vrt, [a, b])
+    assert os.path.exists(vrt)
+
+
+def test_mixed_nodata_override_via_kwarg_passes(tmp_path):
+    """``write_vrt(..., nodata=<value>)`` opts back into flatten-to-kwarg.
+
+    The fail-closed default is the strict path; explicit caller intent
+    via the ``nodata`` kwarg overrides it. Pin that the opt-out keeps
+    working so the message is actionable rather than a dead-end.
+    """
+    d = _unique_dir(tmp_path, "nodata_ok")
+    a = os.path.join(d, "a.tif")
+    b = os.path.join(d, "b.tif")
+    _write_source(a, origin_x=0.0, nodata=-9999.0)
+    _write_source(b, origin_x=4.0, nodata=-1.0)
+    vrt = os.path.join(d, "out.vrt")
+    write_vrt(vrt, [a, b], nodata=-9999.0)
+    assert os.path.exists(vrt)
+
+
+def test_mixed_raster_type_rejected(tmp_path):
+    """Sources disagreeing on AREA_OR_POINT registration fail the write.
+
+    The mosaic writes a single dataset-level AREA_OR_POINT, so silently
+    flattening to the first source's value would shift the disagreeing
+    source by half a pixel on read. Pin the typed error and the
+    substring naming the mismatch.
+    """
+    d = _unique_dir(tmp_path, "raster_type")
+    a = os.path.join(d, "a.tif")
+    b = os.path.join(d, "b.tif")
+    _write_source(a, origin_x=0.0, raster_type='area')
+    _write_source(b, origin_x=4.0, raster_type='point')
+    vrt = os.path.join(d, "out.vrt")
+    with pytest.raises(UnsupportedGeoTIFFFeatureError,
+                       match=r"raster_type|AREA_OR_POINT"):
+        write_vrt(vrt, [a, b])
+
+
+# ---------------------------------------------------------------------------
+# Rotated / sheared write gates: regression pins for the existing
+# refusal at the eager writer entry point.
+# ---------------------------------------------------------------------------
+
+
+def test_eager_writer_rejects_rotated_6tuple_transform(tmp_path):
+    """``attrs['transform']`` 6-tuple with non-zero ``b`` or ``d`` is refused.
+
+    The eager writer emits an axis-aligned GeoTIFF; silently dropping
+    the skew terms would place the raster at the wrong location. Pin
+    the message wording so the existing match patterns in other
+    fail-closed regressions keep matching.
+    """
+    da = xr.DataArray(
+        np.zeros((4, 4), dtype=np.float32),
+        dims=['y', 'x'],
+        attrs={'transform': (1.0, 0.5, 0.0, 0.0, -1.0, 0.0)},
+    )
+    path = tmp_path / f"rotated_2349_{uuid.uuid4().hex[:6]}.tif"
+    with pytest.raises(ValueError, match=r"rotation/shear"):
+        to_geotiff(da, str(path))
+
+
+def test_eager_writer_rejects_rotated_affine_attr(tmp_path):
+    """``attrs['rotated_affine']`` (set by reader on ``allow_rotated``) refused.
+
+    The reader stamps the rotated 6-tuple on this attr when called with
+    ``allow_rotated=True``. The writer has no ModelTransformationTag
+    emit path, so a read-then-write round-trip would silently lose the
+    rotation. Pin the refusal so the regression cannot regress into a
+    silent identity-affine output.
+    """
+    da = xr.DataArray(
+        np.zeros((4, 4), dtype=np.float32),
+        dims=['y', 'x'],
+        attrs={'rotated_affine': (1.0, 0.5, 0.0, 0.0, -1.0, 0.0)},
+    )
+    path = tmp_path / f"rotated_affine_2349_{uuid.uuid4().hex[:6]}.tif"
+    with pytest.raises(ValueError, match=r"rotated_affine"):
+        to_geotiff(da, str(path))
+
+
+# ---------------------------------------------------------------------------
+# Warped / reprojection VRT gate: regression pin for the existing
+# RotatedTransformError on a VRT with non-zero GeoTransform skew terms.
+# ---------------------------------------------------------------------------
+
+
+def test_vrt_with_skewed_geotransform_rejected(tmp_path):
+    """A VRT GeoTransform with non-zero skew is rejected on read.
+
+    The GDAL GeoTransform skew terms (positions 2 and 4 in the
+    GDAL ordering) flag a warped / reprojection VRT or a rotated
+    source. _read_vrt has no resampler for the warped case; pin the
+    existing typed error so a future refactor cannot regress to the
+    silent no-georef fallback.
+    """
+    src = tmp_path / f'flat_2349_{uuid.uuid4().hex[:6]}.tif'
+    arr = np.zeros((4, 4), dtype=np.float32)
+    da = xr.DataArray(arr, dims=['y', 'x'],
+                      coords={'y': np.arange(4, dtype=np.float64),
+                              'x': np.arange(4, dtype=np.float64)},
+                      attrs={'crs': 4326})
+    to_geotiff(da, str(src), compression='none')
+
+    vrt = tmp_path / f'rotated_2349_{uuid.uuid4().hex[:6]}.vrt'
+    vrt.write_text(
+        f'<VRTDataset rasterXSize="4" rasterYSize="4">'
+        f'  <SRS>EPSG:4326</SRS>'
+        f'  <GeoTransform>0.0, 1.0, 0.5, 0.0, 0.0, -1.0</GeoTransform>'
+        f'  <VRTRasterBand band="1" dataType="Float32">'
+        f'    <SimpleSource>'
+        f'      <SourceFilename relativeToVRT="1">{src.name}</SourceFilename>'
+        f'      <SourceBand>1</SourceBand>'
+        f'      <SrcRect xOff="0" yOff="0" xSize="4" ySize="4"/>'
+        f'      <DstRect xOff="0" yOff="0" xSize="4" ySize="4"/>'
+        f'    </SimpleSource>'
+        f'  </VRTRasterBand>'
+        f'</VRTDataset>'
+    )
+    # The rotated-VRT rejection was centralised in ``_vrt_validation.py``
+    # and re-typed as ``VRTUnsupportedError`` with a message naming the
+    # skew terms. Accept either the legacy ``RotatedTransformError`` or
+    # the new typed error so the regression pin survives the validator
+    # refactor.
+    with pytest.raises(
+        (RotatedTransformError, VRTUnsupportedError),
+        match=r"rotated affine|rotation/shear",
+    ):
+        open_geotiff(str(vrt))
+
+# ===========================================================================
+# VRT stable_only gate (#2443)
+# Source: test_vrt_stable_only_2443.py
+# ===========================================================================
+
+
+_MINIMAL_VRT_XML = '<VRTDataset rasterXSize="2" rasterYSize="2"></VRTDataset>\n'
+
+
+def _write_minimal_vrt(tmp_path: Path, name: str = "stable_only_2443") -> str:
+    path = tmp_path / f"{name}.vrt"
+    path.write_text(_MINIMAL_VRT_XML, encoding="utf-8")
+    return str(path)
+
+
+def test_open_geotiff_vrt_stable_only_rejected_by_default(tmp_path):
+    """``open_geotiff(vrt, stable_only=True)`` raises the typed error."""
+    path = _write_minimal_vrt(tmp_path, "open_geotiff_default")
+    with pytest.raises(VRTStableSourcesOnlyError) as excinfo:
+        open_geotiff(path, stable_only=True)
+    msg = str(excinfo.value)
+    assert path in msg, (
+        f"expected the offending VRT path in the rejection message; "
+        f"got: {msg!r}"
+    )
+    assert "stable_only" in msg
+    assert "allow_experimental_codecs" in msg
+    assert "release_gate_geotiff" in msg
+    assert "#2342" in msg
+
+
+def test_open_geotiff_vrt_stable_only_default_false_does_not_reject(tmp_path):
+    """The default ``stable_only=False`` does not fire the new gate.
+
+    The minimal-VRT body has no ``<VRTRasterBand>`` children so the
+    read still raises the downstream :class:`VRTUnsupportedError`
+    band-count check; pinning the exact class confirms the new gate is
+    not stealing the raise site at the default flag value.
+    """
+    path = _write_minimal_vrt(tmp_path, "open_geotiff_default_false")
+    with pytest.raises(VRTUnsupportedError):
+        open_geotiff(path)
+
+
+def test_open_geotiff_vrt_stable_only_with_experimental_unlock(tmp_path):
+    """``allow_experimental_codecs=True`` is the documented unlock.
+
+    When the caller passes both ``stable_only=True`` and
+    ``allow_experimental_codecs=True`` the gate is a no-op (the per-source
+    codec gate downstream handles the rest). The read still raises the
+    downstream "no <VRTRasterBand>" :class:`VRTUnsupportedError` on
+    this minimal-VRT fixture; pinning the exact downstream class keeps
+    a future refactor from silently broadening the unlock past intent.
+    """
+    path = _write_minimal_vrt(tmp_path, "open_geotiff_unlock")
+    with pytest.raises(VRTUnsupportedError):
+        open_geotiff(
+            path,
+            stable_only=True,
+            allow_experimental_codecs=True,
+        )
+
+
+def test_read_vrt_stable_only_rejected_by_default(tmp_path):
+    """Direct ``_read_vrt(stable_only=True)`` raises the typed error too."""
+    path = _write_minimal_vrt(tmp_path, "read_vrt_direct")
+    with pytest.raises(VRTStableSourcesOnlyError):
+        _read_vrt(path, stable_only=True)
+
+
+def test_read_geotiff_dask_vrt_stable_only_rejected(tmp_path):
+    """``_read_geotiff_dask`` forwards the kwarg to ``_read_vrt`` for VRT sources."""
+    path = _write_minimal_vrt(tmp_path, "read_dask_vrt")
+    with pytest.raises(VRTStableSourcesOnlyError):
+        _read_geotiff_dask(path, stable_only=True)
+
+
+def test_vrt_stable_only_error_is_geotiff_ambiguous_metadata_error():
+    """The typed error subclasses :class:`GeoTIFFAmbiguousMetadataError`.
+
+    Callers that already ``except GeoTIFFAmbiguousMetadataError`` keep
+    catching this case without an import-list change. The release-gate
+    test in ``release_gates/test_stable_features.py`` relies on this
+    inheritance to assert on the base class.
+    """
+    assert issubclass(VRTStableSourcesOnlyError, GeoTIFFAmbiguousMetadataError)
+
+
+def test_read_vrt_stable_only_no_op_on_default(tmp_path):
+    """``stable_only=False`` (the default) is a no-op on the direct VRT path.
+
+    Same fixture as the rejection test, but the absence of the flag
+    means the read proceeds to the existing band-count validator and
+    raises :class:`VRTUnsupportedError`.
+    """
+    path = _write_minimal_vrt(tmp_path, "read_vrt_default")
+    with pytest.raises(VRTUnsupportedError):
+        _read_vrt(path)

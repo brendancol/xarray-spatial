@@ -4,6 +4,18 @@
 Focal
 *****
 
+.. caution::
+
+   Focal operations use ``dask.array.map_overlap``.  Each chunk dimension
+   must be **larger than the kernel depth** (typically 1 cell for a 3x3
+   kernel).  Chunks smaller than the depth produce wrong results.
+
+.. note::
+
+   ``mean`` and ``focal_stats`` output **float32**; ``hotspots`` outputs
+   **int8** confidence bands. Both ``mean`` and ``hotspots`` exclude NaN
+   neighbours from their neighbourhood computation.
+
 Apply
 =====
 .. autosummary::
@@ -24,6 +36,33 @@ Mean
    :toctree: _autosummary
 
    xrspatial.focal.mean
+
+Bilateral
+=========
+.. autosummary::
+   :toctree: _autosummary
+
+   xrspatial.bilateral.bilateral
+
+
+GLCM Texture
+=============
+.. autosummary::
+   :toctree: _autosummary
+
+   xrspatial.glcm.glcm_texture
+
+
+Edge Detection
+==============
+.. autosummary::
+   :toctree: _autosummary
+
+   xrspatial.edge_detection.sobel_x
+   xrspatial.edge_detection.sobel_y
+   xrspatial.edge_detection.laplacian
+   xrspatial.edge_detection.prewitt_x
+   xrspatial.edge_detection.prewitt_y
 
 
 Focal Statistics

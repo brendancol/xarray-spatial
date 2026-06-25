@@ -1,0 +1,1040 @@
+"""Security tests for the geotiff subpackage.
+
+Tests for:
+- Unbounded allocation guard
+- VRT path traversal prevention
+- GPU read and VRT read allocation guards
+"""
+from __future__ import annotations
+
+import os
+import struct
+import threading
+
+import numpy as np
+import pytest
+
+from xrspatial.geotiff._dtypes import tiff_dtype_to_numpy
+from xrspatial.geotiff._header import parse_all_ifds, parse_header
+from xrspatial.geotiff._reader import (MAX_PIXELS_DEFAULT, _check_dimensions, _read_strips,
+                                       _read_tiles, read_to_array)
+
+from .conftest import make_minimal_tiff
+
+# ---------------------------------------------------------------------------
+# Cat 1: Unbounded allocation guard
+# ---------------------------------------------------------------------------
+
+
+class TestDimensionGuard:
+    def test_check_dimensions_rejects_oversized(self):
+        """_check_dimensions raises when total pixels exceed the limit."""
+        with pytest.raises(ValueError, match="exceed the safety limit"):
+            _check_dimensions(100_000, 100_000, 1, MAX_PIXELS_DEFAULT)
+
+    def test_check_dimensions_accepts_normal(self):
+        """_check_dimensions does not raise for normal sizes."""
+        _check_dimensions(1000, 1000, 1, MAX_PIXELS_DEFAULT)
+
+    def test_check_dimensions_considers_samples(self):
+        """Multi-band images multiply the pixel budget."""
+        # 50_000 x 50_000 x 3 = 7.5 billion, should be rejected
+        with pytest.raises(ValueError, match="exceed the safety limit"):
+            _check_dimensions(50_000, 50_000, 3, MAX_PIXELS_DEFAULT)
+
+    def test_custom_limit(self):
+        """A custom max_pixels lets callers tighten or relax the limit."""
+        # Tight limit: 100 pixels
+        with pytest.raises(ValueError, match="exceed the safety limit"):
+            _check_dimensions(20, 20, 1, max_pixels=100)
+
+        # Relaxed: passes with large limit
+        _check_dimensions(100_000, 100_000, 1, max_pixels=100_000_000_000)
+
+    def test_error_message_includes_gb_estimate(self):
+        """Error message reports both pixels and a GB allocation hint.
+
+        With no dtype passed the hint falls back to float32
+        (4 bytes/pixel). Real call sites pass the actual dtype.
+        """
+        # 50000 x 50000 x 1 = 2.5e9 pixels = 10.00 GB at 4 bytes/pixel
+        # MAX_PIXELS_DEFAULT = 1e9 pixels = 4.00 GB at 4 bytes/pixel
+        with pytest.raises(ValueError) as exc:
+            _check_dimensions(50_000, 50_000, 1, MAX_PIXELS_DEFAULT)
+        msg = str(exc.value)
+        # Pixel count still present (preserves existing assertions).
+        assert "2,500,000,000 pixels" in msg
+        assert "1,000,000,000 pixels" in msg
+        # GB hint added for both the requested and the limit allocations.
+        # Uses decimal GB (10**9 bytes) to match the docstring convention.
+        assert "~10.00 GB at 4 bytes/pixel" in msg
+        assert "~4.00 GB at 4 bytes/pixel" in msg
+
+    def test_error_message_uses_passed_dtype_for_gb_hint(self):
+        """When the caller passes the decoded dtype, the GB hint reports
+        the exact byte width: f64 → 8 bytes/pixel (double the float32
+        default), u8 → 1 byte/pixel (a quarter)."""
+        # float64: 1e9 pixels * 8 bytes = 8.00 GB
+        with pytest.raises(ValueError) as exc:
+            _check_dimensions(50_000, 50_000, 1, MAX_PIXELS_DEFAULT,
+                              dtype=np.float64)
+        assert "20.00 GB at 8 bytes/pixel" in str(exc.value)
+        assert "8.00 GB at 8 bytes/pixel" in str(exc.value)
+
+        # uint8: 1e9 pixels * 1 byte = 1.00 GB
+        with pytest.raises(ValueError) as exc:
+            _check_dimensions(50_000, 50_000, 1, MAX_PIXELS_DEFAULT,
+                              dtype=np.uint8)
+        assert "2.50 GB at 1 bytes/pixel" in str(exc.value)
+        assert "1.00 GB at 1 bytes/pixel" in str(exc.value)
+
+    def test_error_message_includes_window_suggestion(self):
+        """Error message suggests window= for reading a sub-region."""
+        with pytest.raises(ValueError) as exc:
+            _check_dimensions(50_000, 50_000, 1, MAX_PIXELS_DEFAULT)
+        msg = str(exc.value)
+        assert "window=(r0, c0, r1, c1)" in msg
+        # Concrete example uses the same chunk-side as the chunks hint.
+        assert "window=(0, 0, 1024, 1024)" in msg
+
+    def test_error_message_suggests_chunks_when_dask_installed(self,
+                                                               monkeypatch):
+        """When dask is importable, suggest chunks=."""
+        # Force the 'dask installed' branch regardless of test env.
+        monkeypatch.setattr(
+            'xrspatial.geotiff._layout.importlib.util.find_spec',
+            lambda name: object() if name == 'dask' else None,
+        )
+        with pytest.raises(ValueError) as exc:
+            _check_dimensions(50_000, 50_000, 1, MAX_PIXELS_DEFAULT)
+        msg = str(exc.value)
+        assert "chunks=1024" in msg
+        assert "lazily" in msg
+        # Should not recommend installing dask.
+        assert "pip install dask" not in msg
+        assert "conda install" not in msg
+
+    def test_error_message_recommends_install_when_dask_missing(self,
+                                                                monkeypatch):
+        """When dask is not importable, recommend installation."""
+        monkeypatch.setattr(
+            'xrspatial.geotiff._layout.importlib.util.find_spec',
+            lambda name: None,
+        )
+        with pytest.raises(ValueError) as exc:
+            _check_dimensions(50_000, 50_000, 1, MAX_PIXELS_DEFAULT)
+        msg = str(exc.value)
+        assert "pip install dask" in msg
+        assert "conda install -c conda-forge dask" in msg
+        # The chunks= number is still surfaced so the user knows what to
+        # pass once dask is installed.
+        assert "chunks=1024" in msg
+
+    def test_suggested_chunk_side_scales_with_max_pixels(self):
+        """The suggested chunk side fits under max_pixels for the given
+        band count and never exceeds 1024."""
+        from xrspatial.geotiff._layout import _suggest_chunk_side
+
+        # Default budget: capped at 1024.
+        assert _suggest_chunk_side(1_000_000_000, 1) == 1024
+        # Tight budget: 100 pixels, 1 band -> side 10.
+        assert _suggest_chunk_side(100, 1) == 10
+        # Multi-band reduces the per-side budget.
+        # 1_000_000 budget, 4 bands -> sqrt(250_000) = 500.
+        assert _suggest_chunk_side(1_000_000, 4) == 500
+        # Pathological inputs do not crash.
+        assert _suggest_chunk_side(0, 1) == 1
+        assert _suggest_chunk_side(10, 0) == 3
+
+    def test_gb_hint_helper_rounds_to_two_decimals(self):
+        """_gb_hint formats bytes/pixel * count as a ~X.XX GB string."""
+        from xrspatial.geotiff._layout import _gb_hint
+
+        # No dtype: 1 billion pixels * 4 bytes (float32 default) ->
+        # 4.00 GB hint, matching MAX_PIXELS_DEFAULT's docstring.
+        assert _gb_hint(1_000_000_000) == "~4.00 GB at 4 bytes/pixel"
+        # Zero pixels still formats sensibly.
+        assert _gb_hint(0) == "~0.00 GB at 4 bytes/pixel"
+        # With dtype: itemsize drives the byte multiplier.
+        assert _gb_hint(1_000_000_000, dtype=np.float64) == \
+            "~8.00 GB at 8 bytes/pixel"
+        assert _gb_hint(1_000_000_000, dtype=np.uint8) == \
+            "~1.00 GB at 1 bytes/pixel"
+        assert _gb_hint(1_000_000_000, dtype=np.int16) == \
+            "~2.00 GB at 2 bytes/pixel"
+
+    def test_read_strips_rejects_huge_header(self):
+        """_read_strips refuses to allocate when header claims huge dims."""
+        # Build a valid TIFF with small pixel data but huge header dimensions.
+        # We fake the header to claim 100000x100000 but only provide 4x4 data.
+        data = make_minimal_tiff(4, 4, np.dtype('float32'))
+        header = parse_header(data)
+        ifds = parse_all_ifds(data, header)
+        ifd = ifds[0]
+
+        # Monkey-patch the IFD width/height to simulate a crafted header
+        from xrspatial.geotiff._header import IFDEntry
+        ifd.entries[256] = IFDEntry(tag=256, type_id=3, count=1, value=100_000)
+        ifd.entries[257] = IFDEntry(tag=257, type_id=3, count=1, value=100_000)
+
+        dtype = tiff_dtype_to_numpy(ifd.bits_per_sample, ifd.sample_format)
+
+        with pytest.raises(ValueError, match="exceed the safety limit"):
+            _read_strips(data, ifd, header, dtype, max_pixels=1_000_000)
+
+    def test_read_tiles_rejects_huge_header(self):
+        """_read_tiles refuses to allocate when header claims huge dims."""
+        data = make_minimal_tiff(8, 8, np.dtype('float32'), tiled=True, tile_size=4)
+        header = parse_header(data)
+        ifds = parse_all_ifds(data, header)
+        ifd = ifds[0]
+
+        from xrspatial.geotiff._header import IFDEntry
+        ifd.entries[256] = IFDEntry(tag=256, type_id=3, count=1, value=100_000)
+        ifd.entries[257] = IFDEntry(tag=257, type_id=3, count=1, value=100_000)
+
+        dtype = tiff_dtype_to_numpy(ifd.bits_per_sample, ifd.sample_format)
+
+        with pytest.raises(ValueError, match="exceed the safety limit"):
+            _read_tiles(data, ifd, header, dtype, max_pixels=1_000_000)
+
+    def test_read_to_array_max_pixels_kwarg(self, tmp_path):
+        """read_to_array passes max_pixels through to the internal readers."""
+        expected = np.arange(16, dtype=np.float32).reshape(4, 4)
+        data = make_minimal_tiff(4, 4, np.dtype('float32'), pixel_data=expected)
+        path = str(tmp_path / "small.tif")
+        with open(path, 'wb') as f:
+            f.write(data)
+
+        # Should succeed with a generous limit
+        arr, _ = read_to_array(path, max_pixels=1_000_000)
+        np.testing.assert_array_equal(arr, expected)
+
+        # Should fail with a tiny limit
+        with pytest.raises(ValueError, match="exceed the safety limit"):
+            read_to_array(path, max_pixels=10)
+
+    def test_normal_read_unaffected(self, tmp_path):
+        """Normal reads within the default limit are not affected."""
+        expected = np.arange(64, dtype=np.float32).reshape(8, 8)
+        data = make_minimal_tiff(8, 8, np.dtype('float32'), pixel_data=expected)
+        path = str(tmp_path / "normal.tif")
+        with open(path, 'wb') as f:
+            f.write(data)
+
+        arr, _ = read_to_array(path)
+        np.testing.assert_array_equal(arr, expected)
+
+    def test_open_geotiff_max_pixels(self, tmp_path):
+        """open_geotiff passes max_pixels through to the reader."""
+        from xrspatial.geotiff import open_geotiff
+
+        expected = np.arange(16, dtype=np.float32).reshape(4, 4)
+        data = make_minimal_tiff(4, 4, np.dtype('float32'), pixel_data=expected)
+        path = str(tmp_path / "small_1195.tif")
+        with open(path, 'wb') as f:
+            f.write(data)
+
+        # Should succeed with generous limit
+        da = open_geotiff(path, max_pixels=1_000_000)
+        np.testing.assert_array_equal(da.values, expected)
+
+        # Should fail with tiny limit
+        with pytest.raises(ValueError, match="exceed the safety limit"):
+            open_geotiff(path, max_pixels=10)
+
+    def test_open_geotiff_max_pixels_chunked_bounds_chunk(self, tmp_path):
+        """``open_geotiff(chunks=...)`` scopes max_pixels to the chunk (#2501).
+
+        A 6x6 image is 36 pixels. ``max_pixels=10`` would reject the eager
+        read, but ``chunks=2`` keeps each materialised buffer at 2x2=4
+        pixels, well under the cap. The cap still fires when a chunk
+        actually exceeds it.
+        """
+        from xrspatial.geotiff import open_geotiff
+
+        expected = np.arange(36, dtype=np.float32).reshape(6, 6)
+        data = make_minimal_tiff(6, 6, np.dtype('float32'),
+                                 pixel_data=expected)
+        path = str(tmp_path / "small_2501_chunked.tif")
+        with open(path, 'wb') as f:
+            f.write(data)
+
+        # Eager path still rejects: full image > max_pixels.
+        with pytest.raises(ValueError, match="exceed the safety limit"):
+            open_geotiff(path, max_pixels=10)
+
+        # Dask path with chunks small enough to fit: succeeds and
+        # round-trips the values.
+        da = open_geotiff(path, chunks=2, max_pixels=10)
+        np.testing.assert_array_equal(da.values, expected)
+
+        # Dask path with chunks too large for the cap: per-chunk guard
+        # fires at compute time.
+        da = open_geotiff(path, chunks=4, max_pixels=10)
+        with pytest.raises(ValueError, match="exceed the safety limit"):
+            da.compute()
+
+
+# ---------------------------------------------------------------------------
+# Cat 1c: Tile dimension guard
+# ---------------------------------------------------------------------------
+
+class TestTileDimensionGuard:
+    """Per-tile dims must also respect max_pixels, not just image dims.
+
+    A crafted TIFF can declare a tiny image while claiming a 2^30 x 2^30
+    tile. Without this guard, _decode_strip_or_tile asks the decompressor
+    for terabytes.
+    """
+
+    def test_read_tiles_rejects_huge_tile_dims(self):
+        """_read_tiles refuses to decode when tile dims would OOM."""
+        data = make_minimal_tiff(8, 8, np.dtype('float32'),
+                                 tiled=True, tile_size=4)
+        header = parse_header(data)
+        ifds = parse_all_ifds(data, header)
+        ifd = ifds[0]
+
+        # Forge tile_width / tile_length to simulate an attacker-controlled
+        # header. Image dims stay small so the image-level check passes.
+        from xrspatial.geotiff._header import IFDEntry
+        ifd.entries[322] = IFDEntry(tag=322, type_id=4, count=1,
+                                    value=1_000_000)
+        ifd.entries[323] = IFDEntry(tag=323, type_id=4, count=1,
+                                    value=1_000_000)
+
+        dtype = tiff_dtype_to_numpy(ifd.bits_per_sample, ifd.sample_format)
+
+        with pytest.raises(ValueError, match="exceed the safety limit"):
+            _read_tiles(data, ifd, header, dtype, max_pixels=1_000_000)
+
+    def test_read_tiles_rejects_zero_tile_dims(self):
+        """_read_tiles rejects tile dims of zero rather than dividing by 0."""
+        data = make_minimal_tiff(8, 8, np.dtype('float32'),
+                                 tiled=True, tile_size=4)
+        header = parse_header(data)
+        ifds = parse_all_ifds(data, header)
+        ifd = ifds[0]
+
+        from xrspatial.geotiff._header import IFDEntry
+        ifd.entries[322] = IFDEntry(tag=322, type_id=4, count=1, value=0)
+        ifd.entries[323] = IFDEntry(tag=323, type_id=4, count=1, value=0)
+
+        dtype = tiff_dtype_to_numpy(ifd.bits_per_sample, ifd.sample_format)
+
+        with pytest.raises(ValueError, match="Invalid tile dimensions"):
+            _read_tiles(data, ifd, header, dtype, max_pixels=1_000_000)
+
+    def test_normal_tile_dims_pass(self, tmp_path):
+        """Legitimate tile_size=4 on an 8x8 image still works."""
+        expected = np.arange(64, dtype=np.float32).reshape(8, 8)
+        data = make_minimal_tiff(8, 8, np.dtype('float32'),
+                                 pixel_data=expected,
+                                 tiled=True, tile_size=4)
+        path = str(tmp_path / "tile_dims_1215.tif")
+        with open(path, 'wb') as f:
+            f.write(data)
+
+        # max_pixels=1000 is generous enough for a 4x4 tile (16 pixels)
+        arr, _ = read_to_array(path, max_pixels=1000)
+        np.testing.assert_array_equal(arr, expected)
+
+    def test_open_geotiff_forged_tile_dims(self, tmp_path):
+        """End-to-end: open_geotiff rejects a TIFF with forged tile dims.
+
+        Writes a real TIFF file with a small image but a huge TileWidth
+        field, then checks that open_geotiff raises rather than OOMing.
+        """
+        from xrspatial.geotiff import open_geotiff
+
+        # Build a tiny tiled TIFF, then patch the tile_width field in the
+        # raw bytes. make_minimal_tiff stores tile_width as a SHORT at
+        # tag 322, so we re-parse, find the entry, and overwrite the
+        # inline value with a 32-bit LONG pointing at a huge number.
+        base = make_minimal_tiff(8, 8, np.dtype('float32'),
+                                 tiled=True, tile_size=4)
+        path = str(tmp_path / "forged_tile_1215.tif")
+        with open(path, 'wb') as f:
+            f.write(base)
+
+        # Parse to locate the tile-width entry, then rewrite it in place.
+        # The conftest TIFF uses little-endian SHORT for TileWidth (322).
+        import struct
+
+        # IFD starts at offset 8, then 2-byte count, then 12-byte entries
+        num_entries = struct.unpack_from('<H', base, 8)[0]
+        patched = bytearray(base)
+        for i in range(num_entries):
+            eo = 10 + i * 12
+            tag = struct.unpack_from('<H', patched, eo)[0]
+            if tag == 322 or tag == 323:
+                # Rewrite as LONG (type=4), count=1, value=1_000_000
+                struct.pack_into('<HHII', patched, eo,
+                                 tag, 4, 1, 1_000_000)
+
+        forged_path = str(tmp_path / "forged_1215_huge.tif")
+        with open(forged_path, 'wb') as f:
+            f.write(bytes(patched))
+
+        # Two valid rejection points: parse_ifd catches the mismatch
+        # between forged tile dims and the actual TileOffsets count, or
+        # validate_tile_layout's safety-limit check fires later if
+        # pre-IFD validation is ever relaxed.
+        with pytest.raises(
+            ValueError,
+            match=r"exceed the safety limit|exceeds expected value",
+        ):
+            open_geotiff(forged_path, max_pixels=1_000_000)
+
+
+# ---------------------------------------------------------------------------
+# Cat 1b: VRT allocation guard
+# ---------------------------------------------------------------------------
+
+class TestVRTAllocationGuard:
+    def test_read_vrt_rejects_huge_dimensions(self, tmp_path):
+        """read_vrt refuses to allocate when VRT XML claims huge dims."""
+        from xrspatial.geotiff._vrt import read_vrt as _read_vrt_internal
+
+        # Create a VRT with oversized dimensions but no actual source data
+        # needed -- _check_dimensions fires before any file reads
+        vrt_xml = '''<VRTDataset rasterXSize="100000" rasterYSize="100000">
+  <VRTRasterBand dataType="Float32" band="1">
+  </VRTRasterBand>
+</VRTDataset>'''
+
+        vrt_path = str(tmp_path / "huge_1195.vrt")
+        with open(vrt_path, 'w') as f:
+            f.write(vrt_xml)
+
+        with pytest.raises(ValueError, match="exceed the safety limit"):
+            _read_vrt_internal(vrt_path, max_pixels=1_000_000)
+
+    def test_read_vrt_normal_size_ok(self, tmp_path):
+        """Normal-sized VRT passes the allocation guard."""
+        from xrspatial.geotiff._vrt import read_vrt as _read_vrt_internal
+
+        vrt_xml = '''<VRTDataset rasterXSize="4" rasterYSize="4">
+  <VRTRasterBand dataType="Float32" band="1">
+  </VRTRasterBand>
+</VRTDataset>'''
+
+        vrt_path = str(tmp_path / "small_1195.vrt")
+        with open(vrt_path, 'w') as f:
+            f.write(vrt_xml)
+
+        # Should not raise -- 4x4x1 = 16 pixels
+        arr, vrt = _read_vrt_internal(vrt_path, max_pixels=1_000_000)
+        assert arr.shape == (4, 4)
+
+    def test_open_geotiff_vrt_max_pixels(self, tmp_path):
+        """open_geotiff passes max_pixels through to VRT reader."""
+        from xrspatial.geotiff import open_geotiff
+
+        vrt_xml = '''<VRTDataset rasterXSize="100000" rasterYSize="100000">
+  <VRTRasterBand dataType="Float32" band="1">
+  </VRTRasterBand>
+</VRTDataset>'''
+
+        vrt_path = str(tmp_path / "huge_vrt_1195.vrt")
+        with open(vrt_path, 'w') as f:
+            f.write(vrt_xml)
+
+        with pytest.raises(ValueError, match="exceed the safety limit"):
+            open_geotiff(vrt_path, max_pixels=1_000_000)
+
+# ---------------------------------------------------------------------------
+# Cat 5: VRT path traversal
+#
+# ``parse_vrt`` does not accept source paths that resolve outside the
+# VRT directory (or any explicit allowlist entry). The realpath call by
+# itself only normalises ``..`` segments; it does not enforce
+# containment, so a crafted VRT could otherwise hand ``read_to_array``
+# an arbitrary path.
+# ---------------------------------------------------------------------------
+
+
+class TestVRTPathTraversal:
+    def test_relative_path_traversal_rejected(self, tmp_path):
+        """Relative paths in VRT SourceFilename that escape the VRT
+        directory are rejected, not silently canonicalised."""
+        from xrspatial.geotiff._vrt import parse_vrt
+
+        vrt_xml = '''<VRTDataset rasterXSize="4" rasterYSize="4">
+  <VRTRasterBand dataType="Float32" band="1">
+    <SimpleSource>
+      <SourceFilename relativeToVRT="1">../../../etc/shadow</SourceFilename>
+      <SourceBand>1</SourceBand>
+      <SrcRect xOff="0" yOff="0" xSize="4" ySize="4"/>
+      <DstRect xOff="0" yOff="0" xSize="4" ySize="4"/>
+    </SimpleSource>
+  </VRTRasterBand>
+</VRTDataset>'''
+
+        vrt_dir = str(tmp_path / "subdir")
+        os.makedirs(vrt_dir)
+
+        with pytest.raises(ValueError, match="outside the VRT directory"):
+            parse_vrt(vrt_xml, vrt_dir)
+
+    def test_normal_relative_path_still_works(self, tmp_path):
+        """Normal relative paths without traversal still resolve correctly."""
+        from xrspatial.geotiff._vrt import parse_vrt
+
+        vrt_xml = '''<VRTDataset rasterXSize="4" rasterYSize="4">
+  <VRTRasterBand dataType="Float32" band="1">
+    <SimpleSource>
+      <SourceFilename relativeToVRT="1">data/tile.tif</SourceFilename>
+      <SourceBand>1</SourceBand>
+      <SrcRect xOff="0" yOff="0" xSize="4" ySize="4"/>
+      <DstRect xOff="0" yOff="0" xSize="4" ySize="4"/>
+    </SimpleSource>
+  </VRTRasterBand>
+</VRTDataset>'''
+
+        vrt_dir = str(tmp_path)
+        vrt = parse_vrt(vrt_xml, vrt_dir)
+        source_path = vrt.bands[0].sources[0].filename
+
+        expected = os.path.realpath(os.path.join(vrt_dir, "data", "tile.tif"))
+        assert source_path == expected
+
+    def test_absolute_path_outside_vrt_dir_rejected(self, tmp_path):
+        """Absolute paths pointing outside the VRT directory are rejected
+        by default."""
+        from xrspatial.geotiff._vrt import parse_vrt
+
+        vrt_xml = '''<VRTDataset rasterXSize="4" rasterYSize="4">
+  <VRTRasterBand dataType="Float32" band="1">
+    <SimpleSource>
+      <SourceFilename relativeToVRT="0">/tmp/../tmp/test.tif</SourceFilename>
+      <SourceBand>1</SourceBand>
+      <SrcRect xOff="0" yOff="0" xSize="4" ySize="4"/>
+      <DstRect xOff="0" yOff="0" xSize="4" ySize="4"/>
+    </SimpleSource>
+  </VRTRasterBand>
+</VRTDataset>'''
+
+        with pytest.raises(ValueError, match="outside the VRT directory"):
+            parse_vrt(vrt_xml, str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# Tile layout validation
+#
+# An adversarial TIFF can declare image dimensions that imply more tiles
+# than its TileOffsets tag supplies. The CPU path silently skipped the
+# missing tiles (zero-padded output) and the GPU tile-assembly kernel
+# read past the end of the decompression-offsets array on device.
+# ---------------------------------------------------------------------------
+
+def _make_short_offsets_tiff(
+    width: int,
+    height: int,
+    tile_size: int,
+    declared_offset_count: int,
+    dtype: np.dtype = np.dtype('float32'),
+) -> bytes:
+    """Build a tiled TIFF whose TileOffsets tag count is less than what
+    the image/tile dimensions imply.
+
+    The produced bytes are a valid TIFF that rioxarray/GDAL might still
+    accept with a warning, but our reader should reject them.
+    """
+    import math
+
+    # Start from a normal tiled TIFF, then rewrite the TileOffsets IFD
+    # entry to advertise a smaller count.
+    data = bytearray(make_minimal_tiff(
+        width, height, dtype, tiled=True, tile_size=tile_size))
+
+    # Parse to locate the TileOffsets entry.
+    header = parse_header(bytes(data))
+    ifds = parse_all_ifds(bytes(data), header)
+    ifd = ifds[0]
+
+    offsets = ifd.tile_offsets
+    assert offsets is not None
+    tiles_across = math.ceil(width / tile_size)
+    tiles_down = math.ceil(height / tile_size)
+    true_count = tiles_across * tiles_down
+    assert len(offsets) == true_count
+    assert declared_offset_count < true_count
+
+    # Find the IFD entry bytes for tag 324 (TileOffsets) and rewrite its
+    # count field. TIFF (non-BigTIFF) entries are 12 bytes: HHIi
+    # (tag, type, count, value_or_ptr).
+    bo = header.byte_order
+    ifd_offset = header.first_ifd_offset
+    num_entries = struct.unpack_from(f'{bo}H', data, ifd_offset)[0]
+    entry_offset = ifd_offset + 2
+    for i in range(num_entries):
+        eo = entry_offset + i * 12
+        tag = struct.unpack_from(f'{bo}H', data, eo)[0]
+        if tag == 324:  # TileOffsets
+            # Overwrite the count field at eo+4 (4 bytes, unsigned int).
+            struct.pack_into(
+                f'{bo}I', data, eo + 4, declared_offset_count)
+            break
+    else:
+        raise AssertionError("TileOffsets tag not found in IFD")
+
+    return bytes(data)
+
+
+class TestTileLayoutValidation:
+    """Regression tests for the tile-layout count mismatch."""
+
+    def test_validate_tile_layout_rejects_short_offsets(self):
+        """validate_tile_layout raises when offsets count < declared grid."""
+        from xrspatial.geotiff._header import validate_tile_layout
+
+        # 16x16 image with 4x4 tiles = 16 tiles, but only 4 offsets declared.
+        data = _make_short_offsets_tiff(
+            width=16, height=16, tile_size=4, declared_offset_count=4)
+        header = parse_header(data)
+        ifds = parse_all_ifds(data, header)
+        ifd = ifds[0]
+
+        with pytest.raises(ValueError, match="Malformed TIFF.*tile offsets"):
+            validate_tile_layout(ifd)
+
+    def test_validate_tile_layout_accepts_well_formed(self):
+        """validate_tile_layout accepts a normal tiled TIFF."""
+        from xrspatial.geotiff._header import validate_tile_layout
+
+        data = make_minimal_tiff(
+            8, 8, np.dtype('float32'), tiled=True, tile_size=4)
+        header = parse_header(data)
+        ifds = parse_all_ifds(data, header)
+        ifd = ifds[0]
+
+        # Should not raise.
+        validate_tile_layout(ifd)
+
+    def test_validate_tile_layout_ignores_stripped(self):
+        """validate_tile_layout is a no-op for stripped TIFFs."""
+        from xrspatial.geotiff._header import validate_tile_layout
+
+        data = make_minimal_tiff(4, 4, np.dtype('float32'))
+        header = parse_header(data)
+        ifds = parse_all_ifds(data, header)
+        ifd = ifds[0]
+
+        # Should not raise -- stripped file, not tiled.
+        validate_tile_layout(ifd)
+
+    def test_read_tiles_rejects_short_offsets(self):
+        """_read_tiles surfaces the malformed-TIFF error instead of
+        silently zero-padding missing tiles."""
+        data = _make_short_offsets_tiff(
+            width=16, height=16, tile_size=4, declared_offset_count=4)
+        header = parse_header(data)
+        ifds = parse_all_ifds(data, header)
+        ifd = ifds[0]
+        dtype = tiff_dtype_to_numpy(ifd.bits_per_sample, ifd.sample_format)
+
+        with pytest.raises(ValueError, match="Malformed TIFF"):
+            _read_tiles(data, ifd, header, dtype)
+
+    def test_read_to_array_rejects_short_offsets(self, tmp_path):
+        """End-to-end: reading a short-offsets TIFF raises a clear
+        ValueError (not a silent zero output or CUDA crash)."""
+        data = _make_short_offsets_tiff(
+            width=16, height=16, tile_size=4, declared_offset_count=4)
+        path = str(tmp_path / "malformed_1219.tif")
+        with open(path, 'wb') as f:
+            f.write(data)
+
+        with pytest.raises(ValueError, match="Malformed TIFF"):
+            read_to_array(path)
+
+    def test_boundary_exact_count_ok(self, tmp_path):
+        """A TIFF with exactly the required number of offsets reads fine."""
+        # 8x8 image, 4x4 tiles => 4 tiles exactly.
+        expected = np.arange(64, dtype=np.float32).reshape(8, 8)
+        data = make_minimal_tiff(
+            8, 8, np.dtype('float32'),
+            pixel_data=expected, tiled=True, tile_size=4)
+        path = str(tmp_path / "exact_1219.tif")
+        with open(path, 'wb') as f:
+            f.write(data)
+
+        arr, _ = read_to_array(path)
+        np.testing.assert_array_equal(arr, expected)
+
+
+# ---------------------------------------------------------------------------
+# HTTP COG: per-tile compressed-byte cap
+#
+# A crafted TIFF served over HTTP can declare arbitrarily large
+# TileByteCounts. Without the cap, _fetch_decode_cog_http_tiles passes
+# those values straight into Range GETs sized by the attacker. The
+# local-mmap path is naturally bounded by file size, so these tests
+# only exercise the HTTP path through a mock _HTTPSource.
+# ---------------------------------------------------------------------------
+
+
+def _patch_tile_byte_counts(data: bytearray, value: int) -> None:
+    """Rewrite every TileByteCounts entry in *data* (in place) to *value*.
+
+    Walks the first IFD looking for tag 325. Handles the LONG (4 byte) and
+    SHORT (2 byte) encodings, both inline and via overflow pointer. Used by
+    the tests below to forge a COG with attacker-controlled byte counts.
+    """
+    from xrspatial.geotiff._header import parse_header
+    header = parse_header(bytes(data))
+    bo = header.byte_order
+    ifd_offset = header.first_ifd_offset
+    num_entries = struct.unpack_from(f'{bo}H', data, ifd_offset)[0]
+    entry_offset = ifd_offset + 2
+
+    for i in range(num_entries):
+        eo = entry_offset + i * 12
+        tag = struct.unpack_from(f'{bo}H', data, eo)[0]
+        if tag != 325:  # TileByteCounts
+            continue
+        type_id = struct.unpack_from(f'{bo}H', data, eo + 2)[0]
+        count = struct.unpack_from(f'{bo}I', data, eo + 4)[0]
+        if type_id == 4:  # LONG
+            total = count * 4
+            if total <= 4:
+                for k in range(count):
+                    struct.pack_into(f'{bo}I', data, eo + 8 + k * 4, value)
+            else:
+                ptr = struct.unpack_from(f'{bo}I', data, eo + 8)[0]
+                for k in range(count):
+                    struct.pack_into(
+                        f'{bo}I', data, ptr + k * 4, value)
+        elif type_id == 3:  # SHORT
+            clipped = min(value, 0xFFFF)
+            total = count * 2
+            if total <= 4:
+                for k in range(count):
+                    struct.pack_into(
+                        f'{bo}H', data, eo + 8 + k * 2, clipped)
+            else:
+                ptr = struct.unpack_from(f'{bo}I', data, eo + 8)[0]
+                for k in range(count):
+                    struct.pack_into(
+                        f'{bo}H', data, ptr + k * 2, clipped)
+        return
+    raise AssertionError("TileByteCounts (tag 325) not found in IFD")
+
+
+class _MockHTTPSource:
+    """Minimal _HTTPSource stand-in that serves bytes from an in-memory buf.
+
+    Tests use this to drive _read_cog_http through the HTTP code path without
+    spinning up a real server. read_range / read_ranges_coalesced match the
+    real source's signatures so the reader cannot tell the difference.
+    """
+
+    def __init__(self, buf: bytes):
+        self._url = 'mock://'
+        self._size = len(buf)
+        self._pool = None
+        self._buf = buf
+        self._lock = threading.Lock()
+        self.calls: list[tuple[int, int]] = []
+
+    def read_range(self, start: int, length: int) -> bytes:
+        with self._lock:
+            self.calls.append((start, length))
+        return self._buf[start:start + length]
+
+    def read_all(self) -> bytes:
+        with self._lock:
+            self.calls.append((0, len(self._buf)))
+        return self._buf
+
+    def read_ranges(self, ranges, max_workers=8):
+        return [self.read_range(s, le) for s, le in ranges]
+
+    def read_ranges_coalesced(
+        self,
+        ranges,
+        max_workers=8,
+        gap_threshold=None,
+        max_coalesced_range_bytes=None,
+    ):
+        from xrspatial.geotiff._reader import (COALESCE_GAP_THRESHOLD_DEFAULT, coalesce_ranges,
+                                               split_coalesced_bytes)
+        if gap_threshold is None:
+            gap_threshold = COALESCE_GAP_THRESHOLD_DEFAULT
+        merged, mapping = coalesce_ranges(
+            ranges,
+            gap_threshold=gap_threshold,
+            max_coalesced_range_bytes=max_coalesced_range_bytes,
+        )
+        merged_bytes = self.read_ranges(merged, max_workers=max_workers)
+        return split_coalesced_bytes(merged_bytes, mapping)
+
+    def close(self):
+        pass
+
+
+class TestHTTPTileByteCountCap:
+    """Regression tests for the HTTP COG byte_count cap."""
+
+    def _build_forged_cog(self, tmp_path, byte_count_value: int) -> bytes:
+        """Build a real tiled COG, then patch every TileByteCounts entry."""
+        import xarray as xr
+
+        from xrspatial.geotiff import to_geotiff
+        arr = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        da = xr.DataArray(arr, dims=['y', 'x'])
+        path = str(tmp_path / "forged_1536.tif")
+        to_geotiff(da, path, tile_size=32, compression='deflate')
+        with open(path, 'rb') as f:
+            data = bytearray(f.read())
+        _patch_tile_byte_counts(data, byte_count_value)
+        return bytes(data)
+
+    def test_huge_byte_count_rejected(self, tmp_path, monkeypatch):
+        """A tile claiming more bytes than the cap raises ValueError."""
+        from xrspatial.geotiff import _reader as _reader_mod
+
+        # 100 MB > the 1 MB cap we set for this test
+        forged = self._build_forged_cog(tmp_path, 100 * 1024 * 1024)
+        src = _MockHTTPSource(forged)
+        monkeypatch.setattr(_reader_mod, '_HTTPSource', lambda url: src)
+        monkeypatch.setenv('XRSPATIAL_COG_MAX_TILE_BYTES', str(1024 * 1024))
+
+        with pytest.raises(ValueError, match="TileByteCount"):
+            _reader_mod._read_cog_http('http://mock/forged.tif')
+
+    def test_error_message_names_offending_value(self, tmp_path, monkeypatch):
+        """The error mentions the byte count and the cap so operators can
+        diagnose without re-reading the source."""
+        from xrspatial.geotiff import _reader as _reader_mod
+
+        forged = self._build_forged_cog(tmp_path, 50 * 1024 * 1024)
+        src = _MockHTTPSource(forged)
+        monkeypatch.setattr(_reader_mod, '_HTTPSource', lambda url: src)
+        monkeypatch.setenv('XRSPATIAL_COG_MAX_TILE_BYTES', str(1024))
+
+        with pytest.raises(ValueError) as excinfo:
+            _reader_mod._read_cog_http('http://mock/forged.tif')
+        msg = str(excinfo.value)
+        assert "52,428,800" in msg or "52428800" in msg  # the byte count
+        assert "1,024" in msg or "1024" in msg            # the cap
+        assert "denial-of-service" in msg.lower() or "malformed" in msg
+
+    def test_normal_cog_still_reads(self, tmp_path, monkeypatch):
+        """Realistic per-tile byte counts pass under the default cap."""
+        import xarray as xr
+
+        from xrspatial.geotiff import _reader as _reader_mod
+        from xrspatial.geotiff import to_geotiff
+
+        arr = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        da = xr.DataArray(arr, dims=['y', 'x'])
+        path = str(tmp_path / "normal_1536.tif")
+        to_geotiff(da, path, tile_size=32, compression='deflate')
+        with open(path, 'rb') as f:
+            buf = f.read()
+
+        src = _MockHTTPSource(buf)
+        monkeypatch.setattr(_reader_mod, '_HTTPSource', lambda url: src)
+
+        result, _ = _reader_mod._read_cog_http('http://mock/normal.tif')
+        np.testing.assert_array_equal(result, arr)
+
+    def test_env_override_lifts_cap(self, tmp_path, monkeypatch):
+        """A user with legitimate large tiles can raise the cap via env."""
+        import xarray as xr
+
+        from xrspatial.geotiff import _reader as _reader_mod
+        from xrspatial.geotiff import to_geotiff
+
+        arr = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        da = xr.DataArray(arr, dims=['y', 'x'])
+        path = str(tmp_path / "normal_env_1536.tif")
+        to_geotiff(da, path, tile_size=32, compression='deflate')
+        with open(path, 'rb') as f:
+            buf = f.read()
+
+        src = _MockHTTPSource(buf)
+        monkeypatch.setattr(_reader_mod, '_HTTPSource', lambda url: src)
+        # A tiny cap WITHOUT the env override would fire; lift it past
+        # the actual byte counts and the read should succeed.
+        monkeypatch.setenv('XRSPATIAL_COG_MAX_TILE_BYTES', str(64 * 1024 * 1024))
+
+        result, _ = _reader_mod._read_cog_http('http://mock/normal_env.tif')
+        np.testing.assert_array_equal(result, arr)
+
+    def test_local_path_respects_default_cap(self, tmp_path):
+        """Legitimate local reads stay well under the default cap.
+
+        The local path once bypassed the cap entirely. Now the cap is
+        shared, so we just confirm the default (256 MiB) leaves plenty
+        of headroom for a normal small tiled COG.
+        """
+        import xarray as xr
+
+        from xrspatial.geotiff import open_geotiff, to_geotiff
+
+        arr = np.arange(64 * 64, dtype=np.float32).reshape(64, 64)
+        da = xr.DataArray(arr, dims=['y', 'x'])
+        path = str(tmp_path / "local_normal_1664.tif")
+        to_geotiff(da, path, tile_size=32, compression='deflate')
+
+        result = open_geotiff(path)
+        np.testing.assert_array_equal(result.values, arr)
+
+
+# ---------------------------------------------------------------------------
+# XML entity expansion (billion-laughs)
+#
+# VRT and GDALMetadata payloads go through xml.etree.ElementTree, which by
+# default expands internal entities. A crafted file can OOM the host via
+# exponential entity expansion. ``_safe_xml.safe_fromstring`` refuses any
+# input carrying a DOCTYPE declaration, which is where entity definitions
+# live.
+# ---------------------------------------------------------------------------
+
+
+_BILLION_LAUGHS_PROLOGUE = (
+    '<?xml version="1.0"?>\n'
+    '<!DOCTYPE lolz [\n'
+    '  <!ENTITY lol "lol">\n'
+    '  <!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">\n'
+    '  <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">\n'
+    '  <!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;">\n'
+    ']>\n'
+)
+
+
+class TestVRTXMLEntityExpansion:
+    """parse_vrt refuses XML entity (billion-laughs) payloads."""
+
+    def test_parse_vrt_rejects_doctype(self, tmp_path):
+        """A VRT that declares ``<!DOCTYPE ...>`` is rejected outright."""
+        from xrspatial.geotiff._vrt import parse_vrt
+
+        payload = _BILLION_LAUGHS_PROLOGUE + (
+            '<VRTDataset rasterXSize="4" rasterYSize="4">\n'
+            '  <VRTRasterBand dataType="Float32" band="1">\n'
+            '    <Description>&lol4;</Description>\n'
+            '  </VRTRasterBand>\n'
+            '</VRTDataset>\n'
+        )
+
+        with pytest.raises(ValueError, match="DOCTYPE"):
+            parse_vrt(payload, str(tmp_path))
+
+    def test_open_geotiff_vrt_rejects_doctype(self, tmp_path):
+        """Routing through the public open_geotiff entry still rejects DOCTYPEs."""
+        from xrspatial.geotiff import open_geotiff
+
+        payload = _BILLION_LAUGHS_PROLOGUE + (
+            '<VRTDataset rasterXSize="4" rasterYSize="4">\n'
+            '  <VRTRasterBand dataType="Float32" band="1">\n'
+            '    <Description>&lol4;</Description>\n'
+            '  </VRTRasterBand>\n'
+            '</VRTDataset>\n'
+        )
+        vrt_path = tmp_path / "bomb.vrt"
+        vrt_path.write_text(payload)
+
+        with pytest.raises(ValueError, match="DOCTYPE"):
+            open_geotiff(str(vrt_path))
+
+    def test_normal_vrt_still_parses(self, tmp_path):
+        """A VRT without a DOCTYPE parses normally."""
+        from xrspatial.geotiff._vrt import parse_vrt
+
+        payload = (
+            '<VRTDataset rasterXSize="4" rasterYSize="4">\n'
+            '  <VRTRasterBand dataType="Float32" band="1">\n'
+            '  </VRTRasterBand>\n'
+            '</VRTDataset>\n'
+        )
+        vrt = parse_vrt(payload, str(tmp_path))
+        assert vrt.width == 4
+        assert vrt.height == 4
+
+
+class TestGDALMetadataXMLEntityExpansion:
+    """_parse_gdal_metadata refuses entity-expansion payloads."""
+
+    def test_parse_gdal_metadata_doctype_returns_empty(self):
+        """A DOCTYPE in GDALMetadata yields an empty dict, not expansion.
+
+        GDALMetadata is non-essential auxiliary metadata, so the parser
+        silently drops malformed payloads rather than failing the whole
+        TIFF read. Crucially it must NOT expand the entity.
+        """
+        from xrspatial.geotiff._geotags import _parse_gdal_metadata
+
+        payload = _BILLION_LAUGHS_PROLOGUE + (
+            '<GDALMetadata><Item name="x">&lol4;</Item></GDALMetadata>'
+        )
+        result = _parse_gdal_metadata(payload)
+        # safe_fromstring raises ValueError on DOCTYPE, which the
+        # parser catches and turns into an empty dict.
+        assert result == {}
+
+    def test_parse_gdal_metadata_normal_still_works(self):
+        """A well-formed GDALMetadata XML parses into a flat dict."""
+        from xrspatial.geotiff._geotags import _parse_gdal_metadata
+
+        payload = (
+            '<GDALMetadata>'
+            '<Item name="STATISTICS_MINIMUM">0</Item>'
+            '<Item name="STATISTICS_MAXIMUM" sample="0">255</Item>'
+            '</GDALMetadata>'
+        )
+        result = _parse_gdal_metadata(payload)
+        assert result.get('STATISTICS_MINIMUM') == '0'
+        assert result.get(('STATISTICS_MAXIMUM', 0)) == '255'
+
+
+class TestSafeXMLHelper:
+    """Direct unit tests for ``_safe_xml.safe_fromstring``."""
+
+    def test_rejects_bytes_doctype(self):
+        from xrspatial.geotiff._safe_xml import safe_fromstring
+        with pytest.raises(ValueError, match="DOCTYPE"):
+            safe_fromstring(b'<!DOCTYPE x><x/>')
+
+    def test_rejects_str_doctype(self):
+        from xrspatial.geotiff._safe_xml import safe_fromstring
+        with pytest.raises(ValueError, match="DOCTYPE"):
+            safe_fromstring('<!DOCTYPE x><x/>')
+
+    def test_rejects_doctype_with_whitespace(self):
+        """Whitespace between ``<!`` and ``DOCTYPE`` is still rejected."""
+        from xrspatial.geotiff._safe_xml import safe_fromstring
+        with pytest.raises(ValueError, match="DOCTYPE"):
+            safe_fromstring('<!   DOCTYPE x><x/>')
+
+    @pytest.mark.parametrize("encoding", [
+        "utf-16",       # with BOM
+        "utf-16-le",    # no BOM, alternating nulls
+        "utf-16-be",    # no BOM, leading null
+        "utf-32",       # with BOM
+        "utf-32-le",
+        "utf-32-be",
+        "utf-8-sig",    # UTF-8 BOM
+    ])
+    def test_rejects_doctype_in_wide_encodings(self, encoding):
+        """A DOCTYPE encoded in UTF-16 / UTF-32 still gets rejected.
+
+        The original ASCII byte-regex would miss these because the
+        DOCTYPE bytes interleave null bytes. The decoder normalizes
+        first so wide-encoded payloads cannot smuggle a DTD past
+        the scanner.
+        """
+        from xrspatial.geotiff._safe_xml import safe_fromstring
+        payload = '<!DOCTYPE x><x/>'.encode(encoding)
+        with pytest.raises(ValueError, match="DOCTYPE"):
+            safe_fromstring(payload)
+
+    def test_parses_normal_xml(self):
+        from xrspatial.geotiff._safe_xml import safe_fromstring
+        root = safe_fromstring('<root><child>hi</child></root>')
+        assert root.tag == 'root'
+        assert root.find('child').text == 'hi'

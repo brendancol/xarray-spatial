@@ -96,3 +96,17 @@ dmypy.json
 # airspeed velocity
 .asv/
 xrspatial-examples/
+*.zarr/
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+.codex/worktrees/
+.codex/scheduled_tasks.lock
+docs/superpowers/
+# AI-assistant tooling definitions are sourced from the xarray-spatial-skills
+# repo and synced in via its sync.sh; keep them present locally but untracked.
+.claude/commands/
+.codex/commands/
+.kilo/command/
+.cursor/rules/
+.cursorrules
+*.aux.xml

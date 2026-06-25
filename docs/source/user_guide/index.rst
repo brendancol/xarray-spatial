@@ -7,11 +7,17 @@ User Guide
 .. toctree::
    :maxdepth: 1
 
+   caveats
+   stability_policy
+   data_types
    classification
+   fire
    focal
    multispectral
    pathfinding
    proximity
    surface
    zonal
-   local
+   attrs_contract
+   geotiff_safe_io
+   local-migration

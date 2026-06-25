@@ -21,7 +21,16 @@ import xarray as xr
 from numba import cuda
 
 # local modules
-from xrspatial.utils import (ArrayTypeFunctionMapping, cuda_args, get_dataarray_resolution, ngjit)
+from xrspatial.utils import ArrayTypeFunctionMapping
+from xrspatial.utils import _boundary_to_dask
+from xrspatial.utils import _pad_array
+from xrspatial.utils import _validate_boundary
+from xrspatial.utils import _validate_raster
+from xrspatial.utils import cuda_args
+from xrspatial.utils import get_dataarray_resolution
+from xrspatial.utils import ngjit
+from xrspatial.dataset_support import supports_dataset
+from xrspatial.utils import _dask_task_name_kwargs
 
 
 @ngjit
@@ -38,21 +47,26 @@ def _cpu(data, cellsize):
 
 
 def _run_numpy(data: np.ndarray,
-               cellsize: Union[int, float]) -> np.ndarray:
-    # TODO: handle border edge effect
+               cellsize: Union[int, float],
+               boundary: str = 'nan') -> np.ndarray:
     data = data.astype(np.float32)
-    out = _cpu(data, cellsize)
-    return out
+    if boundary == 'nan':
+        return _cpu(data, cellsize)
+    padded = _pad_array(data, 1, boundary)
+    result = _cpu(padded, cellsize)
+    return result[1:-1, 1:-1]
 
 
 def _run_dask_numpy(data: da.Array,
-                    cellsize: Union[int, float]) -> da.Array:
+                    cellsize: Union[int, float],
+                    boundary: str = 'nan') -> da.Array:
     data = data.astype(np.float32)
     _func = partial(_cpu, cellsize=cellsize)
     out = data.map_overlap(_func,
                            depth=(1, 1),
-                           boundary=np.nan,
-                           meta=np.array(()))
+                           boundary=_boundary_to_dask(boundary),
+                           meta=np.array(()),
+                           **_dask_task_name_kwargs('xrspatial.curvature'))
     return out
 
 
@@ -75,12 +89,16 @@ def _run_gpu(arr, cellsize, out):
 
 
 def _run_cupy(data: cupy.ndarray,
-              cellsize: Union[int, float]) -> cupy.ndarray:
+              cellsize: Union[int, float],
+              boundary: str = 'nan') -> cupy.ndarray:
+    if boundary != 'nan':
+        padded = _pad_array(data, 1, boundary)
+        result = _run_cupy(padded, cellsize)
+        return result[1:-1, 1:-1]
 
     data = data.astype(cupy.float32)
-    cellsize_arr = cupy.array([float(cellsize)], dtype='f4')
+    cellsize_arr = cupy.array([float(cupy.asnumpy(cellsize).item())], dtype='f4')
 
-    # TODO: add padding
     griddim, blockdim = cuda_args(data.shape)
     out = cupy.empty(data.shape, dtype='f4')
     out[:] = cupy.nan
@@ -91,21 +109,25 @@ def _run_cupy(data: cupy.ndarray,
 
 
 def _run_dask_cupy(data: da.Array,
-                   cellsize: Union[int, float]) -> da.Array:
+                   cellsize: Union[int, float],
+                   boundary: str = 'nan') -> da.Array:
     data = data.astype(cupy.float32)
-    cellsize_arr = cupy.array([float(cellsize)], dtype='f4')
+    cellsize_arr = cupy.array([float(cupy.asnumpy(cellsize).item())], dtype='f4')
 
     _func = partial(_run_cupy, cellsize=cellsize_arr)
 
     out = data.map_overlap(_func,
                            depth=(1, 1),
-                           boundary=cupy.nan,
-                           meta=cupy.array(()))
+                           boundary=_boundary_to_dask(boundary, is_cupy=True),
+                           meta=cupy.array(()),
+                           **_dask_task_name_kwargs('xrspatial.curvature'))
     return out
 
 
+@supports_dataset
 def curvature(agg: xr.DataArray,
-              name: Optional[str] = 'curvature') -> xr.DataArray:
+              name: Optional[str] = 'curvature',
+              boundary: str = 'nan') -> xr.DataArray:
     """
     Calculates, for all cells in the array, the curvature (second
     derivative) of each cell based on the elevation of its neighbors
@@ -118,15 +140,26 @@ def curvature(agg: xr.DataArray,
 
     Parameters
     ----------
-    agg : xarray.DataArray
+    agg : xarray.DataArray or xr.Dataset
         2D NumPy, CuPy, NumPy-backed Dask xarray DataArray of elevation values.
         Must contain `res` attribute.
+        If a Dataset is passed, the operation is applied to each
+        data variable independently.
     name : str, default='curvature'
         Name of output DataArray.
+    boundary : str, default='nan'
+        How to handle edges where the kernel extends beyond the raster.
+        ``'nan'``     — fill missing neighbours with NaN (default).
+        ``'nearest'`` — repeat edge values.
+        ``'reflect'`` — mirror at boundary.
+        ``'wrap'``    — periodic / toroidal.
 
     Returns
     -------
-    curvature_agg : xarray.DataArray, of the same type as `agg`
+    curvature_agg : xarray.DataArray or xr.Dataset
+        If `agg` is a DataArray, returns a DataArray of the same type.
+        If `agg` is a Dataset, returns a Dataset with curvature computed
+        for each data variable.
         2D aggregate array of curvature values.
         All other input attributes are preserved.
 
@@ -220,9 +253,20 @@ def curvature(agg: xr.DataArray,
         Attributes:
             res:      (10, 10)
     """
+    _validate_raster(agg, func_name='curvature', name='agg')
 
     cellsize_x, cellsize_y = get_dataarray_resolution(agg)
+    if (not np.isfinite(cellsize_x) or not np.isfinite(cellsize_y)
+            or cellsize_x == 0 or cellsize_y == 0):
+        raise ValueError(
+            "curvature() requires a non-zero, finite cell size on both axes; "
+            f"got cellsize_x={cellsize_x!r}, cellsize_y={cellsize_y!r}. "
+            "Set agg.attrs['res'] to a (x, y) tuple of non-zero floats, "
+            "or attach numeric x/y coordinates to the DataArray."
+        )
     cellsize = (cellsize_x + cellsize_y) / 2
+
+    _validate_boundary(boundary)
 
     mapper = ArrayTypeFunctionMapping(
         numpy_func=_run_numpy,
@@ -230,7 +274,7 @@ def curvature(agg: xr.DataArray,
         dask_func=_run_dask_numpy,
         dask_cupy_func=_run_dask_cupy
     )
-    out = mapper(agg)(agg.data, cellsize)
+    out = mapper(agg)(agg.data, cellsize, boundary)
     return xr.DataArray(out,
                         name=name,
                         coords=agg.coords,

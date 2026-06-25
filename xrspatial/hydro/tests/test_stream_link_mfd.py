@@ -1,0 +1,355 @@
+import numpy as np
+import pytest
+import xarray as xr
+
+from xrspatial.hydro.stream_link_mfd import stream_link_mfd
+from xrspatial.tests.general_checks import (
+    create_test_raster,
+    cuda_and_cupy_available,
+    dask_array_available,
+)
+
+
+# ====================================================================
+# Helpers
+# ====================================================================
+
+def _make_fractions(dirs, shape):
+    """Build (8, H, W) fractions from a dict of {(r,c): [(k, frac), ...]}.
+
+    Cells not in *dirs* get NaN (nodata).  Cells with empty lists are
+    pits (all-zero fractions).
+    """
+    H, W = shape
+    fracs = np.full((8, H, W), np.nan, dtype=np.float64)
+    for (r, c), entries in dirs.items():
+        fracs[:, r, c] = 0.0
+        for k, f in entries:
+            fracs[k, r, c] = f
+    return fracs
+
+
+def _call(fracs, accum, threshold=0, **kwargs):
+    """Wrap raw arrays and call stream_link_mfd."""
+    frac_da = xr.DataArray(fracs, dims=['neighbor', 'y', 'x'])
+    fa_da = create_test_raster(accum)
+    return stream_link_mfd(frac_da, fa_da, threshold=threshold, **kwargs)
+
+
+# ====================================================================
+# Tests
+# ====================================================================
+
+def test_linear_chain():
+    """Single stream, no junctions -> all one link_id."""
+    fracs = _make_fractions({
+        (0, 0): [(0, 1.0)],  # E
+        (0, 1): [(0, 1.0)],  # E
+        (0, 2): [(0, 1.0)],  # E
+        (0, 3): [(0, 1.0)],  # E
+        (0, 4): [],           # pit
+    }, (1, 5))
+    accum = np.array([[1.0, 2.0, 3.0, 4.0, 5.0]], dtype=np.float64)
+    result = _call(fracs, accum, threshold=1)
+    vals = result.data
+    assert not np.any(np.isnan(vals))
+    unique = np.unique(vals[~np.isnan(vals)])
+    assert len(unique) == 1
+    # Headwater at (0,0), width=5 -> ID = 0*5 + 0 + 1 = 1
+    assert unique[0] == 1.0
+
+
+def test_y_confluence():
+    """Two headwaters merge at junction -> 3 distinct link_ids."""
+    fracs = _make_fractions({
+        (0, 0): [(1, 1.0)],   # SE
+        (0, 2): [(3, 1.0)],   # SW
+        (1, 1): [(2, 1.0)],   # S
+        (2, 1): [],            # pit
+    }, (3, 3))
+    accum = np.array([
+        [1.0, 0.0, 1.0],
+        [0.0, 3.0, 0.0],
+        [0.0, 4.0, 0.0],
+    ], dtype=np.float64)
+    result = _call(fracs, accum, threshold=1)
+    vals = result.data
+
+    # Non-stream cells are NaN
+    assert np.isnan(vals[0, 1])
+    assert np.isnan(vals[1, 0])
+    # (0,0) headwater: ID = 0*3 + 0 + 1 = 1
+    assert vals[0, 0] == 1.0
+    # (0,2) headwater: ID = 0*3 + 2 + 1 = 3
+    assert vals[0, 2] == 3.0
+    # (1,1) junction (in_degree=2): ID = 1*3 + 1 + 1 = 5
+    assert vals[1, 1] == 5.0
+    # (2,1) inherits from (1,1): ID = 5
+    assert vals[2, 1] == 5.0
+    # 3 distinct IDs
+    stream_vals = vals[~np.isnan(vals)]
+    assert len(np.unique(stream_vals)) == 3
+
+
+def test_cascade_junctions():
+    """Sequential junctions -> each segment has distinct ID.
+
+    A(0,0)->E, C(1,0)->NE(7) => B(0,1) is junction
+    B(0,1)->E, E(1,2)->N(6)  => D(0,2) is junction
+    D(0,2)->E                => F(0,3) pit
+    """
+    fracs = _make_fractions({
+        (0, 0): [(0, 1.0)],   # E to (0,1)
+        (0, 1): [(0, 1.0)],   # E to (0,2)
+        (0, 2): [(0, 1.0)],   # E to (0,3)
+        (0, 3): [],            # pit
+        (1, 0): [(7, 1.0)],   # NE to (0,1)
+        (1, 2): [(6, 1.0)],   # N to (0,2)
+    }, (2, 4))
+    accum = np.array([
+        [1.0, 3.0, 5.0, 6.0],
+        [1.0, 0.0, 1.0, 0.0],
+    ], dtype=np.float64)
+    result = _call(fracs, accum, threshold=1)
+    vals = result.data
+
+    # A(0,0) headwater: link_id = 0*4 + 0 + 1 = 1
+    assert vals[0, 0] == 1.0
+    # C(1,0) headwater: link_id = 1*4 + 0 + 1 = 5
+    assert vals[1, 0] == 5.0
+    # B(0,1) junction: link_id = 0*4 + 1 + 1 = 2
+    assert vals[0, 1] == 2.0
+    # E(1,2) headwater: link_id = 1*4 + 2 + 1 = 7
+    assert vals[1, 2] == 7.0
+    # D(0,2) junction: link_id = 0*4 + 2 + 1 = 3
+    assert vals[0, 2] == 3.0
+    # F(0,3) inherits from D: link_id = 3
+    assert vals[0, 3] == 3.0
+
+
+# ====================================================================
+# Edge cases
+# ====================================================================
+
+def test_nan_handling():
+    """NaN fractions -> NaN output."""
+    fracs = np.full((8, 2, 2), np.nan, dtype=np.float64)
+    fracs[:, 0, 0] = 0.0  # valid pit
+    accum = np.array([[5.0, 0.0], [0.0, 0.0]], dtype=np.float64)
+    result = _call(fracs, accum, threshold=1)
+    assert not np.isnan(result.data[0, 0])
+    assert np.isnan(result.data[0, 1])
+
+
+def test_single_cell():
+    """Single cell -> headwater with position-based ID."""
+    fracs = np.zeros((8, 1, 1), dtype=np.float64)
+    accum = np.array([[5.0]], dtype=np.float64)
+    result = _call(fracs, accum, threshold=1)
+    assert result.data[0, 0] == 1.0  # 0*1 + 0 + 1
+
+
+@dask_array_available
+def test_dask_matches_numpy():
+    """Dask result matches numpy."""
+    import dask.array as da
+
+    fracs = _make_fractions({
+        (0, 0): [(1, 1.0)],
+        (0, 2): [(3, 1.0)],
+        (1, 1): [(2, 1.0)],
+        (2, 1): [],
+    }, (3, 3))
+    accum = np.array([
+        [1.0, 0.0, 1.0],
+        [0.0, 3.0, 0.0],
+        [0.0, 4.0, 0.0],
+    ], dtype=np.float64)
+
+    frac_np = xr.DataArray(fracs, dims=['neighbor', 'y', 'x'])
+    fa_np = create_test_raster(accum)
+    np_result = stream_link_mfd(frac_np, fa_np, threshold=1)
+
+    frac_dask = xr.DataArray(
+        da.from_array(fracs, chunks=(8, 2, 2)),
+        dims=['neighbor', 'y', 'x'])
+    fa_dask = xr.DataArray(
+        da.from_array(accum, chunks=(2, 2)),
+        dims=['y', 'x'])
+    dask_result = stream_link_mfd(frac_dask, fa_dask, threshold=1)
+
+    np.testing.assert_array_equal(
+        np.nan_to_num(np_result.values, nan=-999),
+        np.nan_to_num(dask_result.values, nan=-999))
+
+
+@dask_array_available
+def test_dask_accum_chunk_mismatch():
+    """flow_accum chunked differently from fractions still matches numpy."""
+    import dask.array as da
+
+    fracs = _make_fractions({
+        (0, 0): [(1, 1.0)],
+        (0, 2): [(3, 1.0)],
+        (1, 1): [(2, 1.0)],
+        (2, 1): [],
+    }, (3, 3))
+    accum = np.array([
+        [1.0, 0.0, 1.0],
+        [0.0, 3.0, 0.0],
+        [0.0, 4.0, 0.0],
+    ], dtype=np.float64)
+
+    frac_np = xr.DataArray(fracs, dims=['neighbor', 'y', 'x'])
+    fa_np = create_test_raster(accum)
+    np_result = stream_link_mfd(frac_np, fa_np, threshold=1)
+
+    frac_dask = xr.DataArray(
+        da.from_array(fracs, chunks=(8, 2, 2)),
+        dims=['neighbor', 'y', 'x'])
+    # flow_accum chunked 3x3 while fractions are 2x2 -- the lazy assembly
+    # must realign it onto the fractions' tile grid.
+    fa_dask = xr.DataArray(
+        da.from_array(accum, chunks=(3, 3)),
+        dims=['y', 'x'])
+    dask_result = stream_link_mfd(frac_dask, fa_dask, threshold=1)
+
+    np.testing.assert_array_equal(
+        np.nan_to_num(np_result.values, nan=-999),
+        np.nan_to_num(dask_result.values, nan=-999))
+
+
+@dask_array_available
+def test_dask_assembly_is_lazy(monkeypatch):
+    """Building the output raster must be deferred to compute time (#2885)."""
+    import importlib
+    import dask.array as da
+    mod = importlib.import_module('xrspatial.hydro.stream_link_mfd')
+
+    counter = {'n': 0}
+    orig = mod._stream_link_mfd_tile_kernel
+
+    def _spy(*args, **kwargs):
+        counter['n'] += 1
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(mod, '_stream_link_mfd_tile_kernel', _spy)
+
+    fracs = _make_fractions({
+        (0, 0): [(1, 1.0)],
+        (0, 2): [(3, 1.0)],
+        (1, 1): [(2, 1.0)],
+        (2, 1): [],
+    }, (3, 3))
+    accum = np.array([
+        [1.0, 0.0, 1.0],
+        [0.0, 3.0, 0.0],
+        [0.0, 4.0, 0.0],
+    ], dtype=np.float64)
+
+    frac_dask = xr.DataArray(
+        da.from_array(fracs, chunks=(8, 2, 2)),
+        dims=['neighbor', 'y', 'x'])
+    fa_dask = xr.DataArray(
+        da.from_array(accum, chunks=(2, 2)),
+        dims=['y', 'x'])
+
+    result = stream_link_mfd(frac_dask, fa_dask, threshold=1)
+    # The convergence sweep runs eagerly, but assembling the result must not.
+    calls_after_call = counter['n']
+    result.data.compute()
+    assert counter['n'] - calls_after_call > 0
+
+
+# ====================================================================
+# Memory guard tests
+# ====================================================================
+
+class TestMemoryGuard:
+    """Memory guard on the eager numpy / cupy backends."""
+
+    def test_numpy_huge_raster_raises(self):
+        """Numpy backend raises MemoryError when projected RAM exceeds budget."""
+        from unittest.mock import patch
+
+        fracs = _make_fractions({(0, 0): []}, (4, 4))
+        accum = np.ones((4, 4), dtype=np.float64)
+
+        with patch(
+            "xrspatial.hydro.stream_link_mfd._available_memory_bytes",
+            return_value=1,
+        ):
+            with pytest.raises(MemoryError, match="working memory"):
+                _call(fracs, accum, threshold=1)
+
+    def test_numpy_normal_input_succeeds(self):
+        """Normal-size raster passes the guard with real memory."""
+        fracs = _make_fractions({
+            (0, 0): [(0, 1.0)],
+            (0, 1): [(0, 1.0)],
+            (0, 2): [],
+        }, (1, 3))
+        accum = np.array([[1.0, 2.0, 3.0]], dtype=np.float64)
+        result = _call(fracs, accum, threshold=1)
+        assert result.shape == (1, 3)
+
+    @dask_array_available
+    def test_dask_path_skips_guard(self):
+        """Dask backend bypasses the guard -- per-tile allocations are bounded."""
+        from unittest.mock import patch
+        import dask.array as da
+
+        fracs = _make_fractions({(0, 0): []}, (6, 6))
+        # Replace NaN with zeros so dask path doesn't choke
+        fracs = np.nan_to_num(fracs, nan=0.0)
+        accum = np.ones((6, 6), dtype=np.float64)
+
+        frac_dask = xr.DataArray(
+            da.from_array(fracs, chunks=(8, 3, 3)),
+            dims=['neighbor', 'y', 'x'])
+        fa_dask = xr.DataArray(
+            da.from_array(accum, chunks=(3, 3)),
+            dims=['y', 'x'])
+
+        with patch(
+            "xrspatial.hydro.stream_link_mfd._available_memory_bytes",
+            return_value=1,
+        ):
+            # Dask path must not trigger the guard at dispatch time
+            result = stream_link_mfd(frac_dask, fa_dask, threshold=1)
+            # We don't need to fully compute -- just assert no MemoryError
+            assert result is not None
+
+    def test_error_message_mentions_dimensions(self):
+        """The error message should mention the grid dimensions and dask."""
+        from unittest.mock import patch
+
+        fracs = _make_fractions({(0, 0): []}, (7, 9))
+        accum = np.ones((7, 9), dtype=np.float64)
+
+        with patch(
+            "xrspatial.hydro.stream_link_mfd._available_memory_bytes",
+            return_value=1,
+        ):
+            with pytest.raises(MemoryError, match=r"7x9.*dask"):
+                _call(fracs, accum, threshold=1)
+
+    @cuda_and_cupy_available
+    def test_cupy_huge_raster_raises(self):
+        """CuPy backend raises MemoryError when projected GPU RAM exceeds budget."""
+        from unittest.mock import patch
+        import cupy as cp
+
+        fracs = _make_fractions({(0, 0): []}, (4, 4))
+        accum = np.ones((4, 4), dtype=np.float64)
+
+        frac_cp = xr.DataArray(
+            cp.asarray(fracs), dims=['neighbor', 'y', 'x'])
+        fa_cp = xr.DataArray(cp.asarray(accum), dims=['y', 'x'])
+
+        with patch(
+            "xrspatial.hydro.stream_link_mfd._available_gpu_memory_bytes",
+            return_value=1,
+        ):
+            with pytest.raises(MemoryError, match="GPU working memory"):
+                stream_link_mfd(frac_cp, fa_cp, threshold=1)

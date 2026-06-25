@@ -1,9 +1,11 @@
+import warnings
+
 import numpy as np
 import pytest
 import xarray as xr
 
-from xrspatial.multispectral import (arvi, ebbi, evi, gci, nbr, nbr2, ndmi, ndvi, savi, sipi,
-                                     true_color)
+from xrspatial.multispectral import (arvi, bai, ebbi, evi, gci, mndwi, msavi2, nbr, nbr2, ndbi,
+                                     ndmi, ndsi, ndvi, ndwi, osavi, savi, sipi, true_color)
 from xrspatial.tests.general_checks import (create_test_raster, cuda_and_cupy_available,
                                             dask_array_available,
                                             general_output_checks)
@@ -215,19 +217,18 @@ def qgis_ndmi():
 
 @pytest.fixture
 def qgis_savi():
-    # this result is obtained by using NIR, and red band data
-    # running through QGIS Raster Calculator with formula:
-    # savi = (nir - red) / ((nir + red + soil_factor) * (1 + soil_factor))
+    # Correct SAVI (Huete 1988):
+    # savi = ((nir - red) / (nir + red + L)) * (1 + L)
     # with default value of soil_factor=1
     result = np.array([
-        [0., 0.10726268, 0.10682587, 0.09168259],
-        [0.10089815, 0.10729991, 0.10749393, np.nan],
-        [0.11363809, 0.11995638, 0.11994251, 0.10915995],
-        [0.10226355, 0.11864913, 0.12966092, 0.11774762],
-        [0.09810041, 0.10675804, 0.12213238, 0.11514599],
-        [0.09377059, 0.10416108, 0.11123802, 0.10735555],
-        [0.09097284, 0.0988547, 0.10404798, 0.10413785],
-        [0.0870268, 0.09878284, 0.105046, 0.10514525]], dtype=np.float32)
+        [0., 0.4290507, 0.4273035, 0.3667304],
+        [0.4035926, 0.4291996, 0.4299757, np.nan],
+        [0.4545524, 0.4798255, 0.4797700, 0.4366398],
+        [0.4090542, 0.4745965, 0.5186437, 0.4709905],
+        [0.3924016, 0.4270322, 0.4885295, 0.4605840],
+        [0.3750824, 0.4166443, 0.4449521, 0.4294222],
+        [0.3638914, 0.3954188, 0.4161919, 0.4165514],
+        [0.3481072, 0.3951314, 0.4201840, 0.4205810]], dtype=np.float32)
     return result
 
 
@@ -314,7 +315,8 @@ def data_uint_dtype_evi(dtype):
 def data_uint_dtype_savi(dtype):
     nir = xr.DataArray(np.array([[1, 1], [1, 1]], dtype=dtype))
     red = xr.DataArray(np.array([[0, 1], [0, 2]], dtype=dtype))
-    result = np.array([[0.25, 0.], [0.25, -0.125]], dtype=np.float32)
+    # Correct SAVI with L=1: ((nir-red)/(nir+red+1)) * 2
+    result = np.array([[1.0, 0.], [1.0, -0.5]], dtype=np.float32)
     return nir, red, result
 
 
@@ -422,6 +424,50 @@ def test_savi_gpu(nir_data, red_data, qgis_savi):
     # test default savi where soil_factor = 1.0
     result = savi(nir_data, red_data, soil_factor=1.0)
     general_output_checks(nir_data, result, qgis_savi)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "cupy", "dask+numpy", "dask+cupy"])
+def test_savi_formula_1094(backend):
+    """Verify SAVI against the Huete (1988) formula directly.
+
+    Regression test for #1094: (1+L) was in the denominator instead
+    of the numerator.
+    """
+    from xrspatial.tests.general_checks import has_cuda_and_cupy, dask_array_available as _dask_avail
+    if 'cupy' in backend and not has_cuda_and_cupy():
+        pytest.skip("Requires CUDA and CuPy")
+    try:
+        import dask.array
+    except ImportError:
+        if 'dask' in backend:
+            pytest.skip("Requires Dask")
+
+    nir_arr = np.array([[0.8, 0.6], [0.4, 0.0]])
+    red_arr = np.array([[0.2, 0.3], [0.4, 0.0]])
+
+    nir_agg = create_test_raster(nir_arr, backend=backend, chunks=(2, 2))
+    red_agg = create_test_raster(red_arr, backend=backend, chunks=(2, 2))
+
+    L = 0.5
+    result = savi(nir_agg, red_agg, soil_factor=L)
+    data = result.data
+    if hasattr(data, 'compute'):
+        data = data.compute()
+    if hasattr(data, 'get'):
+        data = data.get()
+    data = np.asarray(data)
+
+    # Correct: ((NIR - Red) / (NIR + Red + L)) * (1 + L)
+    expected = np.where(
+        (nir_arr + red_arr + L) != 0,
+        ((nir_arr - red_arr) / (nir_arr + red_arr + L)) * (1 + L),
+        np.nan,
+    ).astype(np.float32)
+
+    np.testing.assert_allclose(data, expected, rtol=1e-5, equal_nan=True)
+
+    # Spot check: NIR=0.8, Red=0.2, L=0.5 -> (0.6/1.5)*1.5 = 0.6
+    assert abs(float(data[0, 0]) - 0.6) < 1e-5
 
 
 # arvi -------------
@@ -564,6 +610,78 @@ def test_ndmi_gpu(nir_data, swir1_data, qgis_ndmi):
     general_output_checks(nir_data, result, qgis_ndmi)
 
 
+# NDWI -------------
+@pytest.fixture
+def qgis_ndwi():
+    # ndwi = (green - nir) / (green + nir) (McFeeters 1996)
+    result = np.array([
+        [np.nan, -0.2320068, -0.23210263, -0.21423551],
+        [-0.22254029, -0.23180144, -0.235312, -0.2211059],
+        [-0.24289227, -0.25083458, -0.2549164, -0.24188565],
+        [-0.22563742, -0.24941655, -0.26744354, -0.2553725],
+        [-0.21855864, -0.23148255, -0.2561782, -0.2507751],
+        [-0.21073432, -0.22702534, -0.2389085, -0.23820192],
+        [np.nan, -0.21753107, -0.22816707, -0.23095176],
+        [-0.19747348, -0.21694742, -0.22818612, -0.23183313]], dtype=np.float32)
+    return result
+
+
+@pytest.mark.parametrize("backend", ["numpy", "dask+numpy"])
+def test_ndwi_cpu(green_data, nir_data, qgis_ndwi):
+    result = ndwi(green_data, nir_data)
+    general_output_checks(green_data, result, qgis_ndwi, verify_dtype=True)
+
+
+@pytest.mark.parametrize("dtype", ["uint8", "uint16"])
+def test_ndwi_uint_dtype(data_uint_dtype_normalized_ratio):
+    band1, band2, expected = data_uint_dtype_normalized_ratio
+    result = ndwi(band1, band2)
+    general_output_checks(band1, result, expected, verify_dtype=True)
+
+
+@cuda_and_cupy_available
+@pytest.mark.parametrize("backend", ["cupy", "dask+cupy"])
+def test_ndwi_gpu(green_data, nir_data, qgis_ndwi):
+    result = ndwi(green_data, nir_data)
+    general_output_checks(green_data, result, qgis_ndwi, verify_dtype=True)
+
+
+# MNDWI -------------
+@pytest.fixture
+def qgis_mndwi():
+    # mndwi = (green - swir) / (green + swir) (Xu 2006)
+    result = np.array([
+        [np.nan, np.nan, -0.26194495, -0.26206443],
+        [-0.26261762, -0.26020542, -0.25978518, -0.26561797],
+        [-0.25730222, -0.2494394, -0.23911245, -0.2536854],
+        [-0.26400298, -0.24535443, -0.22509761, -0.23552124],
+        [-0.26765746, -0.25924546, -0.24043757, -0.23135419],
+        [-0.26640218, -0.26112, -0.25202343, -0.24712521],
+        [np.nan, -0.26235265, -0.26109785, -0.26053476],
+        [-0.2712647, -0.26619077, -0.2616606, -0.2564316]], dtype=np.float32)
+    return result
+
+
+@pytest.mark.parametrize("backend", ["numpy", "dask+numpy"])
+def test_mndwi_cpu(green_data, swir1_data, qgis_mndwi):
+    result = mndwi(green_data, swir1_data)
+    general_output_checks(green_data, result, qgis_mndwi, verify_dtype=True)
+
+
+@pytest.mark.parametrize("dtype", ["uint8", "uint16"])
+def test_mndwi_uint_dtype(data_uint_dtype_normalized_ratio):
+    band1, band2, expected = data_uint_dtype_normalized_ratio
+    result = mndwi(band1, band2)
+    general_output_checks(band1, result, expected, verify_dtype=True)
+
+
+@cuda_and_cupy_available
+@pytest.mark.parametrize("backend", ["cupy", "dask+cupy"])
+def test_mndwi_gpu(green_data, swir1_data, qgis_mndwi):
+    result = mndwi(green_data, swir1_data)
+    general_output_checks(green_data, result, qgis_mndwi, verify_dtype=True)
+
+
 # EBBI -------------
 @pytest.mark.parametrize("backend", ["numpy", "dask+numpy"])
 def test_ebbi_cpu_against_qgis(red_data, swir1_data, tir_data, qgis_ebbi):
@@ -612,4 +730,644 @@ def test_true_color_numpy_equals_dask_numpy(random_data):
 
     np.testing.assert_allclose(
         numpy_result.data, dask_result.compute().data, equal_nan=True
+    )
+
+
+@cuda_and_cupy_available
+@pytest.mark.parametrize("size", [(2, 4), (10, 15)])
+@pytest.mark.parametrize(
+    "dtype", [np.int32, np.int64, np.uint32, np.uint64, np.float32, np.float64])
+@pytest.mark.parametrize("backend", ["cupy", "dask+cupy"])
+def test_true_color_gpu(random_data, backend):
+    # numpy baseline
+    red_np = create_test_raster(random_data, backend="numpy")
+    green_np = create_test_raster(random_data, backend="numpy")
+    blue_np = create_test_raster(random_data, backend="numpy")
+    numpy_result = true_color(red_np, green_np, blue_np)
+
+    # gpu version
+    red_gpu = create_test_raster(random_data, backend=backend)
+    green_gpu = create_test_raster(random_data, backend=backend)
+    blue_gpu = create_test_raster(random_data, backend=backend)
+    gpu_result = true_color(red_gpu, green_gpu, blue_gpu)
+
+    general_output_checks(red_gpu, gpu_result, verify_attrs=False)
+
+    gpu_data = gpu_result.data
+    if hasattr(gpu_data, 'compute'):
+        gpu_data = gpu_data.compute()
+    if hasattr(gpu_data, 'get'):
+        gpu_data = gpu_data.get()
+
+    np.testing.assert_allclose(
+        numpy_result.data, gpu_data, equal_nan=True
+    )
+
+
+# true_color memory guards ----------
+def test_true_color_numpy_memory_guard(monkeypatch):
+    """Numpy true_color path raises MemoryError before allocation when the
+    projected footprint exceeds 50% of available RAM."""
+    from xrspatial import multispectral
+
+    # Pretend only 1 MB of RAM is available.  Even a 2x2 raster needs
+    # 24 * 2 * 2 = 96 bytes which is under 0.5 * 1 MB, so we also pretend
+    # the request is huge by faking a much larger raster shape via
+    # patching _check_true_color_memory's input.  Cleaner: use a 10000x10000
+    # raster shape but only allocate a 2x2 array, by patching _check first.
+    monkeypatch.setattr(
+        multispectral, '_available_memory_bytes', lambda: 1024 * 1024
+    )
+
+    red = xr.DataArray(np.ones((2, 2), dtype=np.float32), dims=['y', 'x'])
+    green = xr.DataArray(np.ones((2, 2), dtype=np.float32), dims=['y', 'x'])
+    blue = xr.DataArray(np.ones((2, 2), dtype=np.float32), dims=['y', 'x'])
+    red = red.assign_coords(y=[0, 1], x=[0, 1])
+    green = green.assign_coords(y=[0, 1], x=[0, 1])
+    blue = blue.assign_coords(y=[0, 1], x=[0, 1])
+
+    # 2x2 with 1 MB available is fine -- guard should pass.
+    out = multispectral.true_color(red, green, blue)
+    assert out.shape == (2, 2, 4)
+
+    # Now call _check_true_color_memory directly with a "huge" shape to
+    # confirm it raises before any allocation runs.
+    with pytest.raises(MemoryError, match='true_color'):
+        multispectral._check_true_color_memory(100_000, 100_000)
+
+
+def test_true_color_numpy_memory_guard_blocks_large_input(monkeypatch):
+    """End-to-end: the numpy true_color path raises MemoryError at the
+    public API entry, before np.zeros runs."""
+    from xrspatial import multispectral
+
+    # 100x100 raster, but pretend only 1000 bytes of RAM are free.  The
+    # 24 bytes/pixel * 100 * 100 = 240_000 byte budget exceeds 0.5 * 1000
+    # by orders of magnitude, so the guard fires.
+    monkeypatch.setattr(multispectral, '_available_memory_bytes', lambda: 1000)
+
+    red = xr.DataArray(np.ones((100, 100), dtype=np.float32), dims=['y', 'x'])
+    green = xr.DataArray(np.ones((100, 100), dtype=np.float32), dims=['y', 'x'])
+    blue = xr.DataArray(np.ones((100, 100), dtype=np.float32), dims=['y', 'x'])
+    red = red.assign_coords(y=np.arange(100), x=np.arange(100))
+    green = green.assign_coords(y=np.arange(100), x=np.arange(100))
+    blue = blue.assign_coords(y=np.arange(100), x=np.arange(100))
+
+    with pytest.raises(MemoryError, match='100x100'):
+        multispectral.true_color(red, green, blue)
+
+
+def test_true_color_gpu_memory_guard_silent_when_query_fails(monkeypatch):
+    """The GPU guard is a no-op when _available_gpu_memory_bytes returns 0
+    (cupy not installed or memGetInfo failed)."""
+    from xrspatial import multispectral
+
+    monkeypatch.setattr(
+        multispectral, '_available_gpu_memory_bytes', lambda: 0
+    )
+    # No raise: even a "100kx100k" input is allowed past the guard since
+    # the helper returned 0.
+    multispectral._check_true_color_gpu_memory(100_000, 100_000)
+
+
+def test_true_color_gpu_memory_guard_raises_when_oversized(monkeypatch):
+    """When free GPU memory is reported as small, _check_true_color_gpu_memory
+    raises MemoryError for an oversized request."""
+    from xrspatial import multispectral
+
+    monkeypatch.setattr(
+        multispectral, '_available_gpu_memory_bytes', lambda: 1024 * 1024
+    )
+    with pytest.raises(MemoryError, match='GPU working memory'):
+        multispectral._check_true_color_gpu_memory(100_000, 100_000)
+
+
+def test_true_color_mismatched_shapes_raises():
+    red = xr.DataArray(np.ones((4, 4), dtype=np.float32), dims=['y', 'x'])
+    red = red.assign_coords(y=np.arange(4), x=np.arange(4))
+    green = xr.DataArray(np.ones((4, 5), dtype=np.float32), dims=['y', 'x'])
+    green = green.assign_coords(y=np.arange(4), x=np.arange(5))
+    blue = xr.DataArray(np.ones((4, 4), dtype=np.float32), dims=['y', 'x'])
+    blue = blue.assign_coords(y=np.arange(4), x=np.arange(4))
+
+    with pytest.raises(ValueError, match='equal shapes'):
+        true_color(red, green, blue)
+
+
+@dask_array_available
+def test_true_color_mismatched_shapes_raises_dask():
+    import dask.array as da
+    red = xr.DataArray(
+        da.ones((4, 4), chunks=(2, 2), dtype=np.float32), dims=['y', 'x'])
+    red = red.assign_coords(y=np.arange(4), x=np.arange(4))
+    green = xr.DataArray(
+        da.ones((4, 5), chunks=(2, 2), dtype=np.float32), dims=['y', 'x'])
+    green = green.assign_coords(y=np.arange(4), x=np.arange(5))
+    blue = xr.DataArray(
+        da.ones((4, 4), chunks=(2, 2), dtype=np.float32), dims=['y', 'x'])
+    blue = blue.assign_coords(y=np.arange(4), x=np.arange(4))
+
+    with pytest.raises(ValueError, match='equal shapes'):
+        true_color(red, green, blue)
+
+
+def test_true_color_mismatched_backends_raises():
+    pytest.importorskip('dask.array')
+    import dask.array as da
+    red = xr.DataArray(np.ones((4, 4), dtype=np.float32), dims=['y', 'x'])
+    red = red.assign_coords(y=np.arange(4), x=np.arange(4))
+    green = xr.DataArray(
+        da.ones((4, 4), chunks=(2, 2), dtype=np.float32), dims=['y', 'x'])
+    green = green.assign_coords(y=np.arange(4), x=np.arange(4))
+    blue = xr.DataArray(np.ones((4, 4), dtype=np.float32), dims=['y', 'x'])
+    blue = blue.assign_coords(y=np.arange(4), x=np.arange(4))
+
+    with pytest.raises(ValueError, match='same backend'):
+        true_color(red, green, blue)
+
+
+# true_color metadata propagation (issue #3429) ----------
+def _tc_band(backend):
+    data = np.random.default_rng(3429).random((6, 6)).astype(np.float32)
+    return create_test_raster(
+        data, backend=backend, dims=['lat', 'lon'],
+        attrs={'res': (0.5, 0.5), 'crs': 'EPSG: 5070'},
+    )
+
+
+@pytest.mark.parametrize(
+    "backend",
+    ["numpy",
+     pytest.param("dask+numpy", marks=dask_array_available),
+     pytest.param("cupy", marks=cuda_and_cupy_available),
+     pytest.param("dask+cupy", marks=cuda_and_cupy_available)],
+)
+def test_true_color_preserves_non_yx_dims(backend):
+    # true_color used to hardcode y/x and raised KeyError on lat/lon input.
+    r = _tc_band(backend)
+    g = _tc_band(backend)
+    b = _tc_band(backend)
+    out = true_color(r, g, b)
+    assert out.dims == ('lat', 'lon', 'band')
+    np.testing.assert_allclose(out['lat'].data, r['lat'].data)
+    np.testing.assert_allclose(out['lon'].data, r['lon'].data)
+    assert out.attrs == r.attrs
+
+
+def test_true_color_preserves_extra_coords():
+    # A non-spatial coord (e.g. rioxarray's spatial_ref) must pass through.
+    r = _tc_band('numpy').assign_coords(spatial_ref=0)
+    out = true_color(r, r.copy(), r.copy())
+    assert 'spatial_ref' in out.coords
+    assert int(out['spatial_ref']) == 0
+
+
+# NDSI ----------
+@pytest.fixture
+def expected_ndsi():
+    # ndsi = (green - swir1) / (green + swir1)
+    result = np.array(
+        [[np.nan, np.nan, -0.26194495, -0.26206443],
+         [-0.26261762, -0.26020542, -0.25978518, -0.26561797],
+         [-0.25730222, -0.2494394, -0.23911245, -0.2536854],
+         [-0.26400298, -0.24535443, -0.22509761, -0.23552124],
+         [-0.26765746, -0.25924546, -0.24043757, -0.23135419],
+         [-0.26640218, -0.26112, -0.25202343, -0.24712521],
+         [np.nan, -0.26235265, -0.26109785, -0.26053476],
+         [-0.2712647, -0.26619077, -0.2616606, -0.2564316]],
+        dtype=np.float32)
+    return result
+
+
+@pytest.mark.parametrize("backend", ["numpy"])
+def test_ndsi_cpu(green_data, swir1_data, expected_ndsi):
+    result = ndsi(green_data, swir1_data)
+    general_output_checks(green_data, result, expected_ndsi, verify_dtype=True)
+
+
+@dask_array_available
+@pytest.mark.parametrize("backend", ["dask+numpy"])
+def test_ndsi_dask_cpu(green_data, swir1_data, expected_ndsi):
+    result = ndsi(green_data, swir1_data)
+    general_output_checks(green_data, result, expected_ndsi, verify_dtype=True)
+
+
+@pytest.mark.parametrize("dtype", ["uint8", "uint16"])
+def test_ndsi_uint_dtype(data_uint_dtype_normalized_ratio):
+    band1, band2, expected = data_uint_dtype_normalized_ratio
+    result = ndsi(band1, band2)
+    general_output_checks(band1, result, expected, verify_dtype=True)
+
+
+@cuda_and_cupy_available
+@pytest.mark.parametrize("backend", ["cupy", "dask+cupy"])
+def test_ndsi_gpu(green_data, swir1_data, expected_ndsi):
+    result = ndsi(green_data, swir1_data)
+    general_output_checks(green_data, result, expected_ndsi, verify_dtype=True)
+
+
+# NDBI ----------
+@pytest.fixture
+def expected_ndbi():
+    # ndbi = (swir1 - nir) / (swir1 + nir)
+    # This is the negation of NDMI
+    result = np.array(
+        [[np.nan, np.nan, 0.03177413, 0.05067392],
+         [0.04256495, 0.03022716, 0.02606663, 0.04728937],
+         [0.01537057, -0.00148832, -0.01682979, 0.01257116],
+         [0.04079571, -0.00432691, -0.04505849, -0.02112163],
+         [0.05214949, 0.02953535, -0.01677381, -0.02061706],
+         [0.05897893, 0.03624317, 0.01395517, 0.00948141],
+         [0.06901949, 0.04753435, 0.03501688, 0.031477],
+         [0.07796776, 0.0522614, 0.03560007, 0.02615326]],
+        dtype=np.float32)
+    return result
+
+
+@pytest.mark.parametrize("backend", ["numpy"])
+def test_ndbi_cpu(swir1_data, nir_data, expected_ndbi):
+    result = ndbi(swir1_data, nir_data)
+    general_output_checks(swir1_data, result, expected_ndbi, verify_dtype=True)
+
+
+@dask_array_available
+@pytest.mark.parametrize("backend", ["dask+numpy"])
+def test_ndbi_dask_cpu(swir1_data, nir_data, expected_ndbi):
+    result = ndbi(swir1_data, nir_data)
+    general_output_checks(swir1_data, result, expected_ndbi, verify_dtype=True)
+
+
+@pytest.mark.parametrize("dtype", ["uint8", "uint16"])
+def test_ndbi_uint_dtype(data_uint_dtype_normalized_ratio):
+    band1, band2, expected = data_uint_dtype_normalized_ratio
+    result = ndbi(band1, band2)
+    general_output_checks(band1, result, expected, verify_dtype=True)
+
+
+@cuda_and_cupy_available
+@pytest.mark.parametrize("backend", ["cupy", "dask+cupy"])
+def test_ndbi_gpu(swir1_data, nir_data, expected_ndbi):
+    result = ndbi(swir1_data, nir_data)
+    general_output_checks(swir1_data, result, expected_ndbi, verify_dtype=True)
+
+
+# BAI ----------
+@pytest.fixture
+def expected_bai():
+    # bai = 1 / ((0.1 - red)^2 + (0.06 - nir)^2)
+    # Test data is in DN (~10000s), so values are very small
+    result = np.array(
+        [[7.3529404e+01, 2.7792613e-09, 2.7054787e-09, 2.5152656e-09],
+         [2.8557849e-09, 2.7959937e-09, 2.6707474e-09, np.nan],
+         [2.7371723e-09, 2.6744016e-09, 2.5038351e-09, 2.4271707e-09],
+         [2.8354468e-09, 2.6310520e-09, 2.4230655e-09, 2.3545275e-09],
+         [2.8594838e-09, 2.7730043e-09, 2.5268809e-09, 2.3337139e-09],
+         [2.9034652e-09, 2.8091214e-09, 2.6725904e-09, 2.4026150e-09],
+         [2.9388227e-09, 2.8624791e-09, 2.7285640e-09, 2.5389413e-09],
+         [2.9447718e-09, 2.8741514e-09, 2.7449920e-09, 2.5835027e-09]],
+        dtype=np.float32)
+    return result
+
+
+@pytest.fixture
+def data_uint_dtype_bai(dtype):
+    red = xr.DataArray(np.array([[1, 1], [1, 1]], dtype=dtype))
+    nir = xr.DataArray(np.array([[0, 1], [1, 2]], dtype=dtype))
+    # bai = 1 / ((0.1 - red)^2 + (0.06 - nir)^2)
+    result = np.array(
+        [[1.2291054, 0.5904582], [0.5904582, 0.21864615]],
+        dtype=np.float32)
+    return red, nir, result
+
+
+@pytest.mark.parametrize("backend", ["numpy"])
+def test_bai_cpu(red_data, nir_data, expected_bai):
+    result = bai(red_data, nir_data)
+    general_output_checks(red_data, result, expected_bai, verify_dtype=True)
+
+
+@dask_array_available
+@pytest.mark.parametrize("backend", ["dask+numpy"])
+def test_bai_dask_cpu(red_data, nir_data, expected_bai):
+    result = bai(red_data, nir_data)
+    general_output_checks(red_data, result, expected_bai, verify_dtype=True)
+
+
+@pytest.mark.parametrize("dtype", ["uint8", "uint16"])
+def test_bai_uint_dtype(data_uint_dtype_bai):
+    red_data, nir_data, expected = data_uint_dtype_bai
+    result = bai(red_data, nir_data)
+    general_output_checks(red_data, result, expected, verify_dtype=True)
+
+
+@cuda_and_cupy_available
+@pytest.mark.parametrize("backend", ["cupy", "dask+cupy"])
+def test_bai_gpu(red_data, nir_data, expected_bai):
+    result = bai(red_data, nir_data)
+    general_output_checks(red_data, result, expected_bai, verify_dtype=True)
+
+
+# MSAVI2 ----------
+@pytest.fixture
+def expected_msavi2():
+    # msavi2 = (2*nir + 1 - sqrt((2*nir + 1)^2 - 8*(nir - red))) / 2
+    result = np.array(
+        [[0., 0.35253906, 0.3515625, 0.31054688],
+         [0.3359375, 0.35351562, 0.3544922, np.nan],
+         [0.3701172, 0.38671875, 0.38671875, 0.359375],
+         [0.3388672, 0.38476562, 0.41210938, 0.3828125],
+         [0.328125, 0.3515625, 0.39257812, 0.375],
+         [0.31640625, 0.34472656, 0.3642578, 0.35351562],
+         [0.3076172, 0.33007812, 0.34472656, 0.34570312],
+         [0.296875, 0.33007812, 0.34765625, 0.34765625]],
+        dtype=np.float32)
+    return result
+
+
+@pytest.fixture
+def data_uint_dtype_msavi2(dtype):
+    nir = xr.DataArray(np.array([[2, 3], [1, 4]], dtype=dtype))
+    red = xr.DataArray(np.array([[1, 2], [0, 3]], dtype=dtype))
+    # msavi2 = (2*nir + 1 - sqrt((2*nir + 1)^2 - 8*(nir - red))) / 2
+    result = np.array(
+        [[0.43844724, 0.29843783], [1., 0.22799826]],
+        dtype=np.float32)
+    return nir, red, result
+
+
+@pytest.mark.parametrize("backend", ["numpy"])
+def test_msavi2_cpu(nir_data, red_data, expected_msavi2):
+    result = msavi2(nir_data, red_data)
+    general_output_checks(nir_data, result, expected_msavi2, verify_dtype=True)
+
+
+@dask_array_available
+@pytest.mark.parametrize("backend", ["dask+numpy"])
+def test_msavi2_dask_cpu(nir_data, red_data, expected_msavi2):
+    result = msavi2(nir_data, red_data)
+    general_output_checks(nir_data, result, expected_msavi2, verify_dtype=True)
+
+
+@pytest.mark.parametrize("dtype", ["uint8", "uint16"])
+def test_msavi2_uint_dtype(data_uint_dtype_msavi2):
+    nir_data, red_data, expected = data_uint_dtype_msavi2
+    result = msavi2(nir_data, red_data)
+    general_output_checks(nir_data, result, expected, verify_dtype=True)
+
+
+@cuda_and_cupy_available
+@pytest.mark.parametrize("backend", ["cupy", "dask+cupy"])
+def test_msavi2_gpu(nir_data, red_data, expected_msavi2):
+    # GPU sqrt has slightly different precision than CPU (~0.002 for
+    # large DN values), so use a looser tolerance.
+    result = msavi2(nir_data, red_data)
+    general_output_checks(nir_data, result, expected_msavi2,
+                          verify_dtype=True, rtol=6e-3)
+
+
+# OSAVI ----------
+@pytest.fixture
+def expected_osavi():
+    # osavi = (nir - red) / (nir + red + 0.16)
+    # With test DN data (~10000s), the 0.16 constant is negligible,
+    # so results are very close to NDVI.
+    result = np.array(
+        [[0., 0.21453223, 0.2136585, 0.18337074],
+         [0.20180285, 0.21460672, 0.2149946, np.nan],
+         [0.22728342, 0.23992033, 0.23989235, 0.21832643],
+         [0.20453371, 0.23730567, 0.25932968, 0.23550221],
+         [0.19620718, 0.21352291, 0.24427226, 0.23029876],
+         [0.1875473, 0.20832887, 0.22248302, 0.21471749],
+         [0.18195164, 0.1977158, 0.20810257, 0.20828208],
+         [0.17405929, 0.1975721, 0.21009867, 0.21029699]],
+        dtype=np.float32)
+    return result
+
+
+@pytest.fixture
+def data_uint_dtype_osavi(dtype):
+    nir = xr.DataArray(np.array([[2, 3], [1, 4]], dtype=dtype))
+    red = xr.DataArray(np.array([[1, 2], [0, 3]], dtype=dtype))
+    # osavi = (nir - red) / (nir + red + 0.16)
+    result = np.array(
+        [[0.3164557, 0.19379845], [0.862069, 0.13966481]],
+        dtype=np.float32)
+    return nir, red, result
+
+
+@pytest.mark.parametrize("backend", ["numpy"])
+def test_osavi_cpu(nir_data, red_data, expected_osavi):
+    result = osavi(nir_data, red_data)
+    general_output_checks(nir_data, result, expected_osavi, verify_dtype=True)
+
+
+@dask_array_available
+@pytest.mark.parametrize("backend", ["dask+numpy"])
+def test_osavi_dask_cpu(nir_data, red_data, expected_osavi):
+    result = osavi(nir_data, red_data)
+    general_output_checks(nir_data, result, expected_osavi, verify_dtype=True)
+
+
+@pytest.mark.parametrize("dtype", ["uint8", "uint16"])
+def test_osavi_uint_dtype(data_uint_dtype_osavi):
+    nir_data, red_data, expected = data_uint_dtype_osavi
+    result = osavi(nir_data, red_data)
+    general_output_checks(nir_data, result, expected, verify_dtype=True)
+
+
+@cuda_and_cupy_available
+@pytest.mark.parametrize("backend", ["cupy", "dask+cupy"])
+def test_osavi_gpu(nir_data, red_data, expected_osavi):
+    result = osavi(nir_data, red_data)
+    general_output_checks(nir_data, result, expected_osavi, verify_dtype=True)
+
+
+# Cross-index consistency checks ----------
+@pytest.mark.parametrize("backend", ["numpy"])
+def test_ndbi_is_negation_of_ndmi(swir1_data, nir_data, qgis_ndmi):
+    # NDBI(swir1, nir) = -NDMI(nir, swir1)
+    result_ndbi = ndbi(swir1_data, nir_data)
+    result_data = result_ndbi.values
+    np.testing.assert_allclose(result_data, -qgis_ndmi, equal_nan=True, rtol=1e-5)
+
+
+@pytest.mark.parametrize("backend", ["numpy"])
+def test_osavi_approaches_ndvi_for_large_dn(nir_data, red_data, qgis_ndvi):
+    # With DN values >> 0.16, OSAVI and NDVI should be nearly identical.
+    # Skip (0,0) where both bands are 0: NDVI=NaN (0/0), OSAVI=0 (0/0.16).
+    result_osavi = osavi(nir_data, red_data)
+    osavi_vals = result_osavi.values
+    ndvi_vals = qgis_ndvi.copy()
+    # Mask out cells where both inputs are zero
+    mask = np.isnan(ndvi_vals) & ~np.isnan(osavi_vals)
+    osavi_vals[mask] = np.nan
+    np.testing.assert_allclose(
+        osavi_vals, ndvi_vals, equal_nan=True, rtol=1e-3)
+
+
+# true_color edge cases and parameters (#3431) ----------
+def _true_color_to_numpy(result):
+    # Pull a true_color result back to a host numpy array regardless of
+    # backend (numpy / cupy / dask+numpy / dask+cupy).
+    #
+    # The dask path casts the normalized float buffer (which holds NaN for
+    # nodata/zero-range cells) to uint8 lazily, so the "invalid value
+    # encountered in cast" RuntimeWarning surfaces here at compute time
+    # rather than inside true_color's own catch_warnings block. That NaN->0
+    # cast is the documented behaviour these tests assert on, so silence it.
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        data = result.data
+        if hasattr(data, 'compute'):
+            data = data.compute()
+        if hasattr(data, 'get'):
+            data = data.get()
+        return np.asarray(data)
+
+
+@pytest.fixture
+def true_color_nan_bands(backend):
+    # Red band carries a NaN and a value at/below the default nodata=1 so
+    # both legs of the alpha mask (isnan(r) OR r <= nodata) are exercised.
+    red = np.array([[np.nan, 5000.], [1.0, 8000.]], dtype=np.float64)
+    green = np.array([[3000., 5000.], [4000., 8000.]], dtype=np.float64)
+    blue = np.array([[2000., 5000.], [3000., 8000.]], dtype=np.float64)
+    r = create_test_raster(red, backend=backend, chunks=(2, 2))
+    g = create_test_raster(green, backend=backend, chunks=(2, 2))
+    b = create_test_raster(blue, backend=backend, chunks=(2, 2))
+    return r, g, b
+
+
+@pytest.mark.parametrize("backend", ["numpy", "dask+numpy"])
+def test_true_color_nan_alpha_cpu(true_color_nan_bands):
+    # NaN input and r <= nodata input must both drive the alpha channel
+    # to 0 (transparent); the other pixels are opaque (255).
+    r, g, b = true_color_nan_bands
+    result = true_color(r, g, b, nodata=1)
+    alpha = _true_color_to_numpy(result)[:, :, 3]
+    expected_alpha = np.array([[0, 255], [0, 255]], dtype=np.uint8)
+    np.testing.assert_array_equal(alpha, expected_alpha)
+
+
+@cuda_and_cupy_available
+@pytest.mark.parametrize("backend", ["cupy", "dask+cupy"])
+def test_true_color_nan_alpha_gpu(true_color_nan_bands):
+    r, g, b = true_color_nan_bands
+    result = true_color(r, g, b, nodata=1)
+    alpha = _true_color_to_numpy(result)[:, :, 3]
+    expected_alpha = np.array([[0, 255], [0, 255]], dtype=np.uint8)
+    np.testing.assert_array_equal(alpha, expected_alpha)
+
+
+@pytest.mark.parametrize("backend", ["numpy", "dask+numpy"])
+def test_true_color_all_equal_input(backend):
+    # Zero-range input hits the `range_val != 0` false branch in
+    # _normalize_data_cpu, leaving the RGB channels at the NaN->0 fill.
+    const = np.full((3, 3), 5000., dtype=np.float64)
+    r = create_test_raster(const, backend=backend, chunks=(3, 3))
+    g = create_test_raster(const, backend=backend, chunks=(3, 3))
+    b = create_test_raster(const, backend=backend, chunks=(3, 3))
+    result = true_color(r, g, b)
+    data = _true_color_to_numpy(result)
+    assert data.shape == (3, 3, 4)
+    # range_val == 0 -> normalize returns all-NaN -> uint8 cast yields 0
+    np.testing.assert_array_equal(data[:, :, :3], np.zeros((3, 3, 3), dtype=np.uint8))
+    # all input > nodata default and not NaN, so alpha is fully opaque
+    np.testing.assert_array_equal(data[:, :, 3], np.full((3, 3), 255, dtype=np.uint8))
+
+
+@pytest.mark.parametrize("backend", ["numpy", "dask+numpy"])
+def test_true_color_nondefault_params_change_output(backend):
+    # Non-default nodata / c / th should change the result relative to the
+    # defaults, confirming the parameters are threaded through.
+    rng = np.random.default_rng(3431)
+    arr = rng.uniform(100, 9000, size=(4, 4)).astype(np.float64)
+    r = create_test_raster(arr, backend=backend, chunks=(4, 4))
+    g = create_test_raster(arr, backend=backend, chunks=(4, 4))
+    b = create_test_raster(arr, backend=backend, chunks=(4, 4))
+
+    default = _true_color_to_numpy(true_color(r, g, b))
+    tuned = _true_color_to_numpy(true_color(r, g, b, c=5.0, th=0.5))
+    assert not np.array_equal(default[:, :, :3], tuned[:, :, :3])
+
+    # nodata high enough to mask every pixel -> alpha all 0
+    masked = _true_color_to_numpy(true_color(r, g, b, nodata=1e9))
+    np.testing.assert_array_equal(
+        masked[:, :, 3], np.zeros((4, 4), dtype=np.uint8))
+
+
+# evi / savi validation error paths (#3431) ----------
+@pytest.fixture
+def _small_bands():
+    data = np.array([[0.5, 0.6], [0.4, 0.3]], dtype=np.float64)
+    a = xr.DataArray(data, dims=['y', 'x']).assign_coords(y=[0, 1], x=[0, 1])
+    return a, a.copy(), a.copy()
+
+
+def test_evi_c1_must_be_numeric(_small_bands):
+    nir, red, blue = _small_bands
+    with pytest.raises(ValueError, match='c1 must be numeric'):
+        evi(nir, red, blue, c1='not-a-number')
+
+
+def test_evi_c2_must_be_numeric(_small_bands):
+    nir, red, blue = _small_bands
+    with pytest.raises(ValueError, match='c2 must be numeric'):
+        evi(nir, red, blue, c2='not-a-number')
+
+
+@pytest.mark.parametrize("bad_soil", [1.5, -1.5])
+def test_evi_soil_factor_out_of_range(_small_bands, bad_soil):
+    nir, red, blue = _small_bands
+    with pytest.raises(ValueError, match='soil factor must be between'):
+        evi(nir, red, blue, soil_factor=bad_soil)
+
+
+def test_evi_negative_gain(_small_bands):
+    nir, red, blue = _small_bands
+    with pytest.raises(ValueError, match='gain must be greater than 0'):
+        evi(nir, red, blue, gain=-1.0)
+
+
+@pytest.mark.parametrize("bad_soil", [1.5, -1.5])
+def test_savi_soil_factor_out_of_range(bad_soil):
+    data = np.array([[0.5, 0.6], [0.4, 0.3]], dtype=np.float64)
+    nir = xr.DataArray(data, dims=['y', 'x']).assign_coords(y=[0, 1], x=[0, 1])
+    red = nir.copy()
+    with pytest.raises(ValueError, match='soil factor must be between'):
+        savi(nir, red, soil_factor=bad_soil)
+
+
+@pytest.mark.parametrize(
+    "func",
+    [arvi, bai, ebbi, evi, gci, mndwi, msavi2, nbr, nbr2, ndbi,
+     ndmi, ndsi, ndvi, ndwi, osavi, savi, sipi],
+)
+def test_docstring_params_match_signature(func):
+    # Every parameter documented in the numpy-style "Parameters" section
+    # must exist in the signature (and vice versa). Guards against
+    # docstring/signature drift such as nbr documenting `swir_agg`
+    # while the signature accepts `swir2_agg`.
+    import inspect
+    import re
+
+    sig_params = set(inspect.signature(func).parameters)
+
+    doc = inspect.getdoc(func) or ""
+    lines = doc.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.strip() == "Parameters")
+    # Skip the "----------" underline row.
+    documented = []
+    for ln in lines[start + 2:]:
+        if ln.strip() in ("Returns", "References", "Notes", "Examples"):
+            break
+        # Parameter entries are flush-left "name : type" lines.
+        m = re.match(r"^(\w+)\s*:", ln)
+        if m:
+            documented.append(m.group(1))
+    documented = set(documented)
+
+    assert documented == sig_params, (
+        f"{func.__name__}: documented params {sorted(documented)} != "
+        f"signature params {sorted(sig_params)}"
     )
