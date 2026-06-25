@@ -317,6 +317,28 @@ class TestCNRunoffValidation:
         with pytest.raises(TypeError, match="curve_number must be numeric"):
             curve_number_runoff(rainfall, curve_number="high")
 
+    def test_cn_dataarray_out_of_range(self):
+        # Scalar path rejects CN <= 0 or > 100; the DataArray path must
+        # apply the same physical (0, 100] range, else it silently emits
+        # negative / nonsensical runoff (divide-by-zero at CN=0).
+        rainfall = create_test_raster(np.full((1, 3), 100.0, dtype=np.float64))
+        for bad in (0.0, -10.0, 150.0):
+            cn = create_test_raster(
+                np.full((1, 3), bad, dtype=np.float64), name='cn')
+            with pytest.raises(ValueError,
+                               match="curve_number DataArray values"):
+                curve_number_runoff(rainfall, curve_number=cn)
+
+    def test_cn_dataarray_nan_allowed(self):
+        # NaN in a CN DataArray must still pass validation (it propagates
+        # to NaN output; regression #1104), unlike out-of-range values.
+        rainfall = create_test_raster(np.full((1, 2), 100.0, dtype=np.float64))
+        cn = create_test_raster(
+            np.array([[80.0, np.nan]], dtype=np.float64), name='cn')
+        result = curve_number_runoff(rainfall, curve_number=cn)
+        assert np.isfinite(result.data[0, 0])
+        assert np.isnan(result.data[0, 1])
+
 
 @dask_array_available
 class TestCNRunoffDask:

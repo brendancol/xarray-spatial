@@ -58,6 +58,35 @@ def _validate_mannings_n_dataarray(mannings_n):
             "values (no zeros, negatives, NaN, or Inf)."
         )
 
+
+def _validate_curve_number_dataarray(curve_number):
+    """Enforce physical (0, 100] range on a curve_number DataArray.
+
+    Mirrors the scalar-path check (`if cn <= 0 or cn > 100: raise`).
+    Without this guard, a CN raster containing 0 yields a divide-by-zero
+    (S = inf), and out-of-range values (<= 0 or > 100) silently produce
+    negative or nonsensical runoff that propagates into downstream flood
+    analysis.  ``NaN`` is allowed and propagates to ``NaN`` output (see
+    #1104); ``Inf`` and finite out-of-range values are rejected.
+    """
+    _validate_raster(curve_number, func_name='curve_number_runoff',
+                     name='curve_number', ndim=2)
+    data = curve_number.data
+    if data.size == 0:
+        return
+    # Use the array's own namespace so cupy / dask+cupy inputs are checked
+    # in place (``.values`` raises on cupy via implicit-conversion guard).
+    if is_cupy_array(data):
+        import cupy as xp
+    else:
+        xp = np
+    ok = xp.isnan(data) | ((data > 0) & (data <= 100))
+    if not bool(ok.all()):
+        raise ValueError(
+            "curve_number DataArray values must be in (0, 100] "
+            "(NaN allowed)."
+        )
+
 # ---------------------------------------------------------------------------
 # NLCD-to-Manning's n lookup (Chow 1959; Arcement & Schneider 1989)
 # ---------------------------------------------------------------------------
@@ -317,6 +346,7 @@ def curve_number_runoff(
                      name='rainfall')
 
     if isinstance(curve_number, xr.DataArray):
+        _validate_curve_number_dataarray(curve_number)
         cn_data = curve_number.data
     elif isinstance(curve_number, (int, float)):
         if curve_number <= 0 or curve_number > 100:
