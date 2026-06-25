@@ -61,6 +61,7 @@ def test_dask_write_round_trips_categories(tmp_path):
 
     assert os.path.exists(path + ".aux.xml")
     back = open_geotiff(path)
+    np.testing.assert_array_equal(back.values, _CODES)
     assert back.attrs["category_names"] == _NAMES
     assert list(back.attrs["category_colors"]) == _COLORS
 
@@ -76,6 +77,7 @@ def test_gpu_write_round_trips_categories(tmp_path):
 
     assert os.path.exists(path + ".aux.xml")
     back = open_geotiff(path)
+    np.testing.assert_array_equal(back.values, _CODES)
     assert back.attrs["category_names"] == _NAMES
     assert list(back.attrs["category_colors"]) == _COLORS
 
@@ -93,5 +95,6 @@ def test_round_trips_names_without_colors(tmp_path):
 
     assert os.path.exists(path + ".aux.xml")
     back = open_geotiff(path)
+    np.testing.assert_array_equal(back.values, _CODES)
     assert back.attrs["category_names"] == _NAMES
     assert "category_colors" not in back.attrs
