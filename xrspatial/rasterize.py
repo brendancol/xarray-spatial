@@ -4849,6 +4849,25 @@ def rasterize(
     if like_attrs is not None and not reuse_like_coords:
         for k in ('res', 'transform'):
             out_attrs.pop(k, None)
+    # rioxarray stashes the affine transform a second time inside the
+    # ``spatial_ref`` grid-mapping coord as ``attrs['GeoTransform']`` (a
+    # space-separated GDAL 6-tuple), and ``rio.transform()`` /
+    # ``rio.resolution()`` prefer that cached value over recomputing from
+    # the x/y coords.  ``spatial_ref`` is carried through verbatim via
+    # ``like_extra_coords``, so a reshaped grid would otherwise hand back
+    # the template's GeoTransform alongside fresh coords -- the same
+    # stale-grid lie the res/transform strip above guards against, just
+    # through the coord channel.  Drop the GeoTransform when the grid was
+    # reshaped so rioxarray recomputes it from the (correct) coords; copy
+    # the coord first so the template's own attrs are not mutated in place.
+    if not reuse_like_coords and 'spatial_ref' in like_extra_coords:
+        sr = like_extra_coords['spatial_ref']
+        if 'GeoTransform' in sr.attrs:
+            sr = sr.copy()
+            sr.attrs = {k: v for k, v in sr.attrs.items()
+                        if k != 'GeoTransform'}
+            like_extra_coords = dict(like_extra_coords)
+            like_extra_coords['spatial_ref'] = sr
     try:
         fill_as_float = float(fill)
         fill_is_nan = np.isnan(fill_as_float)
