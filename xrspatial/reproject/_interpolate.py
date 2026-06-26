@@ -1,0 +1,860 @@
+"""Per-backend resampling via numba JIT (nearest/bilinear) or map_coordinates (cubic)."""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+from numba import njit
+
+try:
+    from numba import cuda as _cuda
+    _HAS_CUDA = True
+except ImportError:
+    _HAS_CUDA = False
+
+
+_RESAMPLING_ORDERS = {
+    'nearest': 0,
+    'bilinear': 1,
+    'cubic': 3,
+}
+
+
+def _validate_resampling(resampling):
+    if resampling not in _RESAMPLING_ORDERS:
+        raise ValueError(
+            f"resampling must be one of {list(_RESAMPLING_ORDERS)}, "
+            f"got {resampling!r}"
+        )
+    return _RESAMPLING_ORDERS[resampling]
+
+
+# ---------------------------------------------------------------------------
+# Numba kernels for nearest and bilinear resampling
+# ---------------------------------------------------------------------------
+
+@njit(nogil=True, cache=True)
+def _resample_nearest_jit(src, row_coords, col_coords, nodata):
+    """Nearest-neighbor resampling with NaN propagation."""
+    h_out, w_out = row_coords.shape
+    sh, sw = src.shape
+    out = np.empty((h_out, w_out), dtype=np.float64)
+    for i in range(h_out):
+        for j in range(w_out):
+            r = row_coords[i, j]
+            c = col_coords[i, j]
+            if r < -1.0 or r > sh or c < -1.0 or c > sw:
+                out[i, j] = nodata
+                continue
+            ri = int(np.floor(r + 0.5))
+            ci = int(np.floor(c + 0.5))
+            if ri < 0 or ri >= sh or ci < 0 or ci >= sw:
+                out[i, j] = nodata
+                continue
+            v = src[ri, ci]
+            # NaN check: works for float64
+            if v != v:
+                out[i, j] = nodata
+            else:
+                out[i, j] = v
+    return out
+
+
+@njit(nogil=True, cache=True)
+def _resample_cubic_jit(src, row_coords, col_coords, nodata):
+    """Catmull-Rom cubic resampling with NaN-aware fallback to bilinear.
+
+    Separable: interpolate 4 row-slices along columns, then combine
+    along rows.  When any of the 16 neighbors is NaN, falls back to
+    bilinear with weight renormalization (matching GDAL behavior).
+    """
+    h_out, w_out = row_coords.shape
+    sh, sw = src.shape
+    out = np.empty((h_out, w_out), dtype=np.float64)
+    for i in range(h_out):
+        for j in range(w_out):
+            r = row_coords[i, j]
+            c = col_coords[i, j]
+            if r < -1.0 or r > sh or c < -1.0 or c > sw:
+                out[i, j] = nodata
+                continue
+
+            r0 = int(np.floor(r))
+            c0 = int(np.floor(c))
+            fr = r - r0
+            fc = c - c0
+
+            # Catmull-Rom column weights (a = -0.5)
+            fc2 = fc * fc
+            fc3 = fc2 * fc
+            wc0 = -0.5 * fc3 + fc2 - 0.5 * fc
+            wc1 = 1.5 * fc3 - 2.5 * fc2 + 1.0
+            wc2 = -1.5 * fc3 + 2.0 * fc2 + 0.5 * fc
+            wc3 = 0.5 * fc3 - 0.5 * fc2
+
+            # Catmull-Rom row weights
+            fr2 = fr * fr
+            fr3 = fr2 * fr
+            wr0 = -0.5 * fr3 + fr2 - 0.5 * fr
+            wr1 = 1.5 * fr3 - 2.5 * fr2 + 1.0
+            wr2 = -1.5 * fr3 + 2.0 * fr2 + 0.5 * fr
+            wr3 = 0.5 * fr3 - 0.5 * fr2
+
+            val = 0.0
+            has_nan = False
+            for di in range(4):
+                ri = r0 - 1 + di
+                if ri < 0 or ri >= sh:
+                    has_nan = True
+                    break
+                # Interpolate along columns for this row
+                rv = 0.0
+                for dj in range(4):
+                    cj = c0 - 1 + dj
+                    if cj < 0 or cj >= sw:
+                        has_nan = True
+                        break
+                    sv = src[ri, cj]
+                    if sv != sv:  # NaN check
+                        has_nan = True
+                        break
+                    if dj == 0:
+                        rv = sv * wc0
+                    elif dj == 1:
+                        rv += sv * wc1
+                    elif dj == 2:
+                        rv += sv * wc2
+                    else:
+                        rv += sv * wc3
+                if has_nan:
+                    break
+                if di == 0:
+                    val = rv * wr0
+                elif di == 1:
+                    val += rv * wr1
+                elif di == 2:
+                    val += rv * wr2
+                else:
+                    val += rv * wr3
+
+            if not has_nan:
+                out[i, j] = val
+            else:
+                # Fall back to bilinear with weight renormalization
+                r1 = r0 + 1
+                c1 = c0 + 1
+                dr = r - r0
+                dc = c - c0
+
+                w00 = (1.0 - dr) * (1.0 - dc)
+                w01 = (1.0 - dr) * dc
+                w10 = dr * (1.0 - dc)
+                w11 = dr * dc
+
+                accum = 0.0
+                wsum = 0.0
+
+                if 0 <= r0 < sh and 0 <= c0 < sw:
+                    v = src[r0, c0]
+                    if v == v:
+                        accum += w00 * v
+                        wsum += w00
+
+                if 0 <= r0 < sh and 0 <= c1 < sw:
+                    v = src[r0, c1]
+                    if v == v:
+                        accum += w01 * v
+                        wsum += w01
+
+                if 0 <= r1 < sh and 0 <= c0 < sw:
+                    v = src[r1, c0]
+                    if v == v:
+                        accum += w10 * v
+                        wsum += w10
+
+                if 0 <= r1 < sh and 0 <= c1 < sw:
+                    v = src[r1, c1]
+                    if v == v:
+                        accum += w11 * v
+                        wsum += w11
+
+                if wsum > 1e-10:
+                    out[i, j] = accum / wsum
+                else:
+                    out[i, j] = nodata
+    return out
+
+
+@njit(nogil=True, cache=True)
+def _resample_bilinear_jit(src, row_coords, col_coords, nodata):
+    """Bilinear resampling matching GDAL's weight-renormalization approach.
+
+    When a neighbor is out-of-bounds or NaN, its weight is excluded and
+    the result is renormalized from the remaining valid neighbors.  This
+    matches GDAL's GWKBilinearResample4Sample behavior.
+    """
+    h_out, w_out = row_coords.shape
+    sh, sw = src.shape
+    out = np.empty((h_out, w_out), dtype=np.float64)
+    for i in range(h_out):
+        for j in range(w_out):
+            r = row_coords[i, j]
+            c = col_coords[i, j]
+            if r < -1.0 or r > sh or c < -1.0 or c > sw:
+                out[i, j] = nodata
+                continue
+
+            r0 = int(np.floor(r))
+            c0 = int(np.floor(c))
+            r1 = r0 + 1
+            c1 = c0 + 1
+            dr = r - r0
+            dc = c - c0
+
+            w00 = (1.0 - dr) * (1.0 - dc)
+            w01 = (1.0 - dr) * dc
+            w10 = dr * (1.0 - dc)
+            w11 = dr * dc
+
+            accum = 0.0
+            wsum = 0.0
+
+            # Accumulate only valid, in-bounds neighbors
+            if 0 <= r0 < sh and 0 <= c0 < sw:
+                v = src[r0, c0]
+                if v == v:  # not NaN
+                    accum += w00 * v
+                    wsum += w00
+
+            if 0 <= r0 < sh and 0 <= c1 < sw:
+                v = src[r0, c1]
+                if v == v:
+                    accum += w01 * v
+                    wsum += w01
+
+            if 0 <= r1 < sh and 0 <= c0 < sw:
+                v = src[r1, c0]
+                if v == v:
+                    accum += w10 * v
+                    wsum += w10
+
+            if 0 <= r1 < sh and 0 <= c1 < sw:
+                v = src[r1, c1]
+                if v == v:
+                    accum += w11 * v
+                    wsum += w11
+
+            if wsum > 1e-10:
+                out[i, j] = accum / wsum
+            else:
+                out[i, j] = nodata
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Public numpy resampler
+# ---------------------------------------------------------------------------
+
+def _resample_numpy(source_window, src_row_coords, src_col_coords,
+                    resampling='bilinear', nodata=np.nan):
+    """Resample a numpy source window at fractional pixel coordinates.
+
+    Uses numba JIT for nearest and bilinear (fast path), falls back to
+    scipy.ndimage.map_coordinates for cubic.
+
+    Parameters
+    ----------
+    source_window : ndarray (H_src, W_src)
+    src_row_coords, src_col_coords : ndarray (H_out, W_out)
+    resampling : str
+    nodata : float
+
+    Returns
+    -------
+    ndarray (H_out, W_out)
+    """
+    order = _validate_resampling(resampling)
+
+    is_integer = np.issubdtype(source_window.dtype, np.integer)
+    work = source_window.astype(np.float64) if is_integer else source_window
+
+    # Ensure float64 and contiguous for numba
+    if work.dtype != np.float64:
+        work = work.astype(np.float64)
+    work = np.ascontiguousarray(work)
+    rc = np.ascontiguousarray(src_row_coords, dtype=np.float64)
+    cc = np.ascontiguousarray(src_col_coords, dtype=np.float64)
+
+    nd = float(nodata)
+
+    if order == 0:
+        result = _resample_nearest_jit(work, rc, cc, nd)
+        if is_integer:
+            info = np.iinfo(source_window.dtype)
+            result = np.clip(np.round(result), info.min, info.max).astype(source_window.dtype)
+        return result
+
+    if order == 1:
+        result = _resample_bilinear_jit(work, rc, cc, nd)
+        if is_integer:
+            info = np.iinfo(source_window.dtype)
+            result = np.clip(np.round(result), info.min, info.max).astype(source_window.dtype)
+        return result
+
+    # Cubic: numba Catmull-Rom (handles NaN inline, no extra passes)
+    result = _resample_cubic_jit(work, rc, cc, nd)
+    if is_integer:
+        info = np.iinfo(source_window.dtype)
+        result = np.clip(np.round(result), info.min, info.max).astype(source_window.dtype)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# CUDA resampling kernels
+# ---------------------------------------------------------------------------
+
+if _HAS_CUDA:
+
+    @_cuda.jit
+    def _resample_nearest_cuda(src, row_coords, col_coords, out, nodata):
+        """Nearest-neighbor resampling kernel (CUDA)."""
+        i, j = _cuda.grid(2)
+        h_out = out.shape[0]
+        w_out = out.shape[1]
+        if i >= h_out or j >= w_out:
+            return
+        sh = src.shape[0]
+        sw = src.shape[1]
+        r = row_coords[i, j]
+        c = col_coords[i, j]
+        if r < -1.0 or r > sh or c < -1.0 or c > sw:
+            out[i, j] = nodata
+            return
+        ri = int(math.floor(r + 0.5))
+        ci = int(math.floor(c + 0.5))
+        if ri < 0 or ri >= sh or ci < 0 or ci >= sw:
+            out[i, j] = nodata
+            return
+        v = src[ri, ci]
+        # NaN check
+        if v != v:
+            out[i, j] = nodata
+        else:
+            out[i, j] = v
+
+    @_cuda.jit
+    def _resample_bilinear_cuda(src, row_coords, col_coords, out, nodata):
+        """Bilinear resampling kernel (CUDA), GDAL-matching renormalization."""
+        i, j = _cuda.grid(2)
+        h_out = out.shape[0]
+        w_out = out.shape[1]
+        if i >= h_out or j >= w_out:
+            return
+        sh = src.shape[0]
+        sw = src.shape[1]
+        r = row_coords[i, j]
+        c = col_coords[i, j]
+        if r < -1.0 or r > sh or c < -1.0 or c > sw:
+            out[i, j] = nodata
+            return
+
+        r0 = int(math.floor(r))
+        c0 = int(math.floor(c))
+        r1 = r0 + 1
+        c1 = c0 + 1
+        dr = r - r0
+        dc = c - c0
+
+        w00 = (1.0 - dr) * (1.0 - dc)
+        w01 = (1.0 - dr) * dc
+        w10 = dr * (1.0 - dc)
+        w11 = dr * dc
+
+        accum = 0.0
+        wsum = 0.0
+
+        if 0 <= r0 < sh and 0 <= c0 < sw:
+            v = src[r0, c0]
+            if v == v:
+                accum += w00 * v
+                wsum += w00
+        if 0 <= r0 < sh and 0 <= c1 < sw:
+            v = src[r0, c1]
+            if v == v:
+                accum += w01 * v
+                wsum += w01
+        if 0 <= r1 < sh and 0 <= c0 < sw:
+            v = src[r1, c0]
+            if v == v:
+                accum += w10 * v
+                wsum += w10
+        if 0 <= r1 < sh and 0 <= c1 < sw:
+            v = src[r1, c1]
+            if v == v:
+                accum += w11 * v
+                wsum += w11
+
+        if wsum > 1e-10:
+            out[i, j] = accum / wsum
+        else:
+            out[i, j] = nodata
+
+    @_cuda.jit
+    def _resample_cubic_cuda(src, row_coords, col_coords, out, nodata):
+        """Catmull-Rom cubic resampling kernel (CUDA)."""
+        i, j = _cuda.grid(2)
+        h_out = out.shape[0]
+        w_out = out.shape[1]
+        if i >= h_out or j >= w_out:
+            return
+        sh = src.shape[0]
+        sw = src.shape[1]
+        r = row_coords[i, j]
+        c = col_coords[i, j]
+        if r < -1.0 or r > sh or c < -1.0 or c > sw:
+            out[i, j] = nodata
+            return
+
+        r0 = int(math.floor(r))
+        c0 = int(math.floor(c))
+        fr = r - r0
+        fc = c - c0
+
+        # Catmull-Rom column weights (a = -0.5)
+        fc2 = fc * fc
+        fc3 = fc2 * fc
+        wc0 = -0.5 * fc3 + fc2 - 0.5 * fc
+        wc1 = 1.5 * fc3 - 2.5 * fc2 + 1.0
+        wc2 = -1.5 * fc3 + 2.0 * fc2 + 0.5 * fc
+        wc3 = 0.5 * fc3 - 0.5 * fc2
+
+        # Catmull-Rom row weights
+        fr2 = fr * fr
+        fr3 = fr2 * fr
+        wr0 = -0.5 * fr3 + fr2 - 0.5 * fr
+        wr1 = 1.5 * fr3 - 2.5 * fr2 + 1.0
+        wr2 = -1.5 * fr3 + 2.0 * fr2 + 0.5 * fr
+        wr3 = 0.5 * fr3 - 0.5 * fr2
+
+        val = 0.0
+        has_nan = False
+
+        # If any of the 4x4 stencil neighbors is outside source, fall
+        # back to bilinear (matches GDAL behavior for boundary pixels).
+        if r0 - 1 < 0 or r0 + 2 >= sh or c0 - 1 < 0 or c0 + 2 >= sw:
+            has_nan = True
+
+        # Row 0
+        ric = r0 - 1
+        if ric < 0:
+            ric = 0
+        elif ric >= sh:
+            ric = sh - 1
+        # Unrolled column loop for row 0
+        cjc = c0 - 1
+        if cjc < 0:
+            cjc = 0
+        elif cjc >= sw:
+            cjc = sw - 1
+        sv = src[ric, cjc]
+        if sv != sv:
+            has_nan = True
+        if not has_nan:
+            rv0 = sv * wc0
+            cjc = c0
+            if cjc < 0:
+                cjc = 0
+            elif cjc >= sw:
+                cjc = sw - 1
+            sv = src[ric, cjc]
+            if sv != sv:
+                has_nan = True
+        if not has_nan:
+            rv0 += sv * wc1
+            cjc = c0 + 1
+            if cjc < 0:
+                cjc = 0
+            elif cjc >= sw:
+                cjc = sw - 1
+            sv = src[ric, cjc]
+            if sv != sv:
+                has_nan = True
+        if not has_nan:
+            rv0 += sv * wc2
+            cjc = c0 + 2
+            if cjc < 0:
+                cjc = 0
+            elif cjc >= sw:
+                cjc = sw - 1
+            sv = src[ric, cjc]
+            if sv != sv:
+                has_nan = True
+        if not has_nan:
+            rv0 += sv * wc3
+            val = rv0 * wr0
+
+        # Row 1
+        if not has_nan:
+            ric = r0
+            if ric < 0:
+                ric = 0
+            elif ric >= sh:
+                ric = sh - 1
+            cjc = c0 - 1
+            if cjc < 0:
+                cjc = 0
+            elif cjc >= sw:
+                cjc = sw - 1
+            sv = src[ric, cjc]
+            if sv != sv:
+                has_nan = True
+        if not has_nan:
+            rv1 = sv * wc0
+            cjc = c0
+            if cjc < 0:
+                cjc = 0
+            elif cjc >= sw:
+                cjc = sw - 1
+            sv = src[ric, cjc]
+            if sv != sv:
+                has_nan = True
+        if not has_nan:
+            rv1 += sv * wc1
+            cjc = c0 + 1
+            if cjc < 0:
+                cjc = 0
+            elif cjc >= sw:
+                cjc = sw - 1
+            sv = src[ric, cjc]
+            if sv != sv:
+                has_nan = True
+        if not has_nan:
+            rv1 += sv * wc2
+            cjc = c0 + 2
+            if cjc < 0:
+                cjc = 0
+            elif cjc >= sw:
+                cjc = sw - 1
+            sv = src[ric, cjc]
+            if sv != sv:
+                has_nan = True
+        if not has_nan:
+            rv1 += sv * wc3
+            val += rv1 * wr1
+
+        # Row 2
+        if not has_nan:
+            ric = r0 + 1
+            if ric < 0:
+                ric = 0
+            elif ric >= sh:
+                ric = sh - 1
+            cjc = c0 - 1
+            if cjc < 0:
+                cjc = 0
+            elif cjc >= sw:
+                cjc = sw - 1
+            sv = src[ric, cjc]
+            if sv != sv:
+                has_nan = True
+        if not has_nan:
+            rv2 = sv * wc0
+            cjc = c0
+            if cjc < 0:
+                cjc = 0
+            elif cjc >= sw:
+                cjc = sw - 1
+            sv = src[ric, cjc]
+            if sv != sv:
+                has_nan = True
+        if not has_nan:
+            rv2 += sv * wc1
+            cjc = c0 + 1
+            if cjc < 0:
+                cjc = 0
+            elif cjc >= sw:
+                cjc = sw - 1
+            sv = src[ric, cjc]
+            if sv != sv:
+                has_nan = True
+        if not has_nan:
+            rv2 += sv * wc2
+            cjc = c0 + 2
+            if cjc < 0:
+                cjc = 0
+            elif cjc >= sw:
+                cjc = sw - 1
+            sv = src[ric, cjc]
+            if sv != sv:
+                has_nan = True
+        if not has_nan:
+            rv2 += sv * wc3
+            val += rv2 * wr2
+
+        # Row 3
+        if not has_nan:
+            ric = r0 + 2
+            if ric < 0:
+                ric = 0
+            elif ric >= sh:
+                ric = sh - 1
+            cjc = c0 - 1
+            if cjc < 0:
+                cjc = 0
+            elif cjc >= sw:
+                cjc = sw - 1
+            sv = src[ric, cjc]
+            if sv != sv:
+                has_nan = True
+        if not has_nan:
+            rv3 = sv * wc0
+            cjc = c0
+            if cjc < 0:
+                cjc = 0
+            elif cjc >= sw:
+                cjc = sw - 1
+            sv = src[ric, cjc]
+            if sv != sv:
+                has_nan = True
+        if not has_nan:
+            rv3 += sv * wc1
+            cjc = c0 + 1
+            if cjc < 0:
+                cjc = 0
+            elif cjc >= sw:
+                cjc = sw - 1
+            sv = src[ric, cjc]
+            if sv != sv:
+                has_nan = True
+        if not has_nan:
+            rv3 += sv * wc2
+            cjc = c0 + 2
+            if cjc < 0:
+                cjc = 0
+            elif cjc >= sw:
+                cjc = sw - 1
+            sv = src[ric, cjc]
+            if sv != sv:
+                has_nan = True
+        if not has_nan:
+            rv3 += sv * wc3
+            val += rv3 * wr3
+
+        if not has_nan:
+            out[i, j] = val
+        else:
+            # Fall back to bilinear with weight renormalization
+            r1b = r0 + 1
+            c1b = c0 + 1
+            dr = r - r0
+            dc = c - c0
+
+            w00 = (1.0 - dr) * (1.0 - dc)
+            w01 = (1.0 - dr) * dc
+            w10 = dr * (1.0 - dc)
+            w11 = dr * dc
+
+            accum = 0.0
+            wsum = 0.0
+
+            if 0 <= r0 < sh and 0 <= c0 < sw:
+                v = src[r0, c0]
+                if v == v:
+                    accum += w00 * v
+                    wsum += w00
+            if 0 <= r0 < sh and 0 <= c1b < sw:
+                v = src[r0, c1b]
+                if v == v:
+                    accum += w01 * v
+                    wsum += w01
+            if 0 <= r1b < sh and 0 <= c0 < sw:
+                v = src[r1b, c0]
+                if v == v:
+                    accum += w10 * v
+                    wsum += w10
+            if 0 <= r1b < sh and 0 <= c1b < sw:
+                v = src[r1b, c1b]
+                if v == v:
+                    accum += w11 * v
+                    wsum += w11
+
+            if wsum > 1e-10:
+                out[i, j] = accum / wsum
+            else:
+                out[i, j] = nodata
+
+
+# ---------------------------------------------------------------------------
+# Native CuPy resampler using CUDA kernels
+# ---------------------------------------------------------------------------
+
+def _resample_cupy_native(source_window, src_row_coords, src_col_coords,
+                          resampling='bilinear', nodata=np.nan):
+    """Resample using custom CUDA kernels (all data stays on GPU).
+
+    Unlike ``_resample_cupy`` which uses ``cupyx.scipy.ndimage.map_coordinates``,
+    this function uses hand-written CUDA kernels that match the Numba CPU
+    kernels exactly, including inline NaN handling.
+
+    Parameters
+    ----------
+    source_window : cupy.ndarray (H_src, W_src)
+    src_row_coords, src_col_coords : cupy.ndarray (H_out, W_out)
+    resampling : str
+    nodata : float
+
+    Returns
+    -------
+    cupy.ndarray (H_out, W_out)
+    """
+    if not _HAS_CUDA:
+        raise RuntimeError("numba.cuda is required for _resample_cupy_native")
+
+    import cupy as cp
+
+    order = _validate_resampling(resampling)
+
+    is_integer = cp.issubdtype(source_window.dtype, cp.integer)
+    if is_integer:
+        work = source_window.astype(cp.float64)
+    else:
+        work = source_window
+    if work.dtype != cp.float64:
+        work = work.astype(cp.float64)
+
+    # Ensure inputs are CuPy arrays
+    if not isinstance(src_row_coords, cp.ndarray):
+        src_row_coords = cp.asarray(src_row_coords)
+    if not isinstance(src_col_coords, cp.ndarray):
+        src_col_coords = cp.asarray(src_col_coords)
+    rc = cp.ascontiguousarray(src_row_coords, dtype=cp.float64)
+    cc = cp.ascontiguousarray(src_col_coords, dtype=cp.float64)
+
+    # Convert sentinel nodata to NaN so kernels can detect it
+    if not np.isnan(nodata):
+        work = work.copy()
+        work[work == nodata] = cp.nan
+
+    h_out, w_out = rc.shape
+    out = cp.empty((h_out, w_out), dtype=cp.float64)
+    nd = float(nodata)
+
+    # Launch configuration: (16, 16) thread blocks
+    threads_per_block = (16, 16)
+    blocks_per_grid = (
+        (h_out + threads_per_block[0] - 1) // threads_per_block[0],
+        (w_out + threads_per_block[1] - 1) // threads_per_block[1],
+    )
+
+    if order == 0:
+        _resample_nearest_cuda[blocks_per_grid, threads_per_block](
+            work, rc, cc, out, nd
+        )
+        if is_integer:
+            info = cp.iinfo(source_window.dtype)
+            out = cp.clip(cp.round(out), info.min, info.max).astype(
+                source_window.dtype
+            )
+        return out
+
+    if order == 1:
+        _resample_bilinear_cuda[blocks_per_grid, threads_per_block](
+            work, rc, cc, out, nd
+        )
+        if is_integer:
+            info = cp.iinfo(source_window.dtype)
+            out = cp.clip(cp.round(out), info.min, info.max).astype(
+                source_window.dtype
+            )
+        return out
+
+    # Cubic
+    _resample_cubic_cuda[blocks_per_grid, threads_per_block](
+        work, rc, cc, out, nd
+    )
+    if is_integer:
+        info = cp.iinfo(source_window.dtype)
+        out = cp.clip(cp.round(out), info.min, info.max).astype(
+            source_window.dtype
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# CuPy resampler (uses cupyx.scipy.ndimage.map_coordinates)
+# ---------------------------------------------------------------------------
+
+def _resample_cupy(source_window, src_row_coords, src_col_coords,
+                   resampling='bilinear', nodata=np.nan):
+    """Resample a CuPy source window via ``cupyx.scipy.ndimage.map_coordinates``.
+
+    Control grid is on CPU (pyproj is CPU-only); coordinates are
+    transferred to GPU for interpolation.
+
+    Note: this is NOT numerically equivalent to ``_resample_numpy``. Its
+    cubic path is a prefiltered B-spline (not Catmull-Rom) and its
+    ``mode='constant'`` boundary handling bleeds ``cval`` into the
+    half-pixel border band instead of renormalizing. The reproject
+    pipeline therefore routes the cupy backend through
+    ``_resample_cupy_native`` (which matches the numpy kernels exactly);
+    this function is retained only for the ``TestCuPyResampler*`` clipping
+    unit tests. See GH #2620.
+    """
+    import cupy as cp
+    from cupyx.scipy.ndimage import map_coordinates
+
+    order = _validate_resampling(resampling)
+
+    is_integer = cp.issubdtype(source_window.dtype, cp.integer)
+    if is_integer:
+        work = source_window.astype(cp.float64)
+    else:
+        work = source_window
+
+    # Transfer coordinate arrays to GPU
+    if not isinstance(src_row_coords, cp.ndarray):
+        src_row_coords = cp.asarray(src_row_coords)
+    if not isinstance(src_col_coords, cp.ndarray):
+        src_col_coords = cp.asarray(src_col_coords)
+
+    if cp.issubdtype(work.dtype, cp.floating):
+        nan_mask = cp.isnan(work)
+        has_nan = bool(nan_mask.any())
+    else:
+        nan_mask = None
+        has_nan = False
+    if has_nan:
+        if not is_integer:
+            work = work.copy()
+        work[nan_mask] = 0.0
+
+    coords = cp.array([src_row_coords.ravel(), src_col_coords.ravel()])
+    result = map_coordinates(
+        work, coords, order=order, mode='constant', cval=0.0
+    ).reshape(src_row_coords.shape)
+
+    h, w = source_window.shape
+    oob = (
+        (src_row_coords < -1.0) | (src_row_coords > h) |
+        (src_col_coords < -1.0) | (src_col_coords > w)
+    )
+
+    if has_nan:
+        nan_weight = map_coordinates(
+            nan_mask.astype(cp.float64), coords,
+            order=order, mode='constant', cval=1.0
+        ).reshape(src_row_coords.shape)
+        # Any nonzero weight means NaN pixels contributed to the output.
+        # Use 1e-6 instead of 0.0 to absorb floating-point interpolation
+        # noise from map_coordinates on the binary mask.
+        oob = oob | (nan_weight > 1e-6)
+
+    result[oob] = nodata
+
+    if is_integer:
+        info = cp.iinfo(source_window.dtype)
+        result = cp.clip(cp.round(result), info.min, info.max).astype(
+            source_window.dtype
+        )
+
+    return result

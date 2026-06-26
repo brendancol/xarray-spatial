@@ -7,11 +7,29 @@ Reference
 .. toctree::
    :maxdepth: 2
 
+   dask_laziness
    classification
+   dasymetric
+   diffusion
+   fire
+   flood
    focal
+   geotiff
+   geotiff_release_contract
+   geotiff_internals
+   release_gate_geotiff
+   hydrology
+   interpolation
+   kde
+   mcda
+   morphology
    multispectral
    pathfinding
    proximity
+   reproject
+   resample
    surface
+   templates
+   terrain_metrics
+   utilities
    zonal
-   local
