@@ -125,6 +125,55 @@ def test_bump_preserves_coords():
     np.testing.assert_array_equal(result.coords['lon'].values, xs)
 
 
+def test_bump_preserves_attrs_and_name():
+    """When agg is a georeferenced template, bump must carry its attrs and
+    name onto the output instead of clobbering them with a placeholder
+    res=1.  A stale scalar res poisons downstream cellsize math because
+    get_dataarray_resolution prefers attrs['res'] over the coords.
+    """
+    from xrspatial.utils import get_dataarray_resolution
+
+    ys = np.arange(8, dtype=float) * 133333.0
+    xs = np.arange(8, dtype=float) * 80000.0
+    agg = xr.DataArray(
+        np.zeros((8, 8)),
+        dims=['y', 'x'],
+        coords={'y': ys, 'x': xs},
+        name='Elevation',
+        attrs=dict(res=(80000.0, 133333.0), crs='EPSG:3857',
+                   nodatavals=(-9999.0,)),
+    )
+    result = bump(agg=agg, count=10, spread=1)
+
+    assert result.name == 'Elevation'
+    assert result.attrs['res'] == (80000.0, 133333.0)
+    assert result.attrs['crs'] == 'EPSG:3857'
+    assert result.attrs['nodatavals'] == (-9999.0,)
+    # Downstream cellsize must reflect the real coordinate spacing.
+    assert get_dataarray_resolution(result) == (80000.0, 133333.0)
+
+
+@dask_array_available
+def test_bump_preserves_attrs_and_name_dask():
+    """Dask backend must preserve attrs and name too (and must not leak an
+    internal task token like ``concatenate-<hash>`` as the DataArray name).
+    """
+    ys = np.arange(8, dtype=float) * 133333.0
+    xs = np.arange(8, dtype=float) * 80000.0
+    agg = xr.DataArray(
+        da.zeros((8, 8), chunks=(4, 4), dtype=np.float64),
+        dims=['y', 'x'],
+        coords={'y': ys, 'x': xs},
+        name='Elevation',
+        attrs=dict(res=(80000.0, 133333.0), crs='EPSG:3857'),
+    )
+    result = bump(agg=agg, count=10, spread=1)
+
+    assert result.name == 'Elevation'
+    assert result.attrs['res'] == (80000.0, 133333.0)
+    assert result.attrs['crs'] == 'EPSG:3857'
+
+
 def test_bump_agg_infers_shape():
     """When agg is given, width/height are inferred — no need to pass them."""
     agg = xr.DataArray(np.zeros((15, 25)), dims=['y', 'x'])

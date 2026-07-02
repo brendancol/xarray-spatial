@@ -399,9 +399,10 @@ def bump(width: int = None,
         )
         out = mapper(agg)(agg.data, w, h, locs, heights, spread)
         return DataArray(out,
+                         name=agg.name,
                          coords=agg.coords,
                          dims=agg.dims,
-                         attrs=dict(res=1))
+                         attrs=dict(agg.attrs))
     else:
         bumps = _finish_bump(w, h, locs, heights, spread)
         return DataArray(bumps, dims=['y', 'x'], attrs=dict(res=1))
