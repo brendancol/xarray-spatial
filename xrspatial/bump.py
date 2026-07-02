@@ -57,11 +57,17 @@ def _finish_bump(width, height, locs, heights, spread):
         z = heights[i]
         out[y, x] = out[y, x] + z
         if s > 0:
+            # Capture the deposited centre height once.  Reading the mutable
+            # out[y, x] inside the loop (and letting the d2==0 term double it)
+            # made the spread order-dependent and left a single bump lopsided
+            # toward +x/+y.  Skip the centre and use the fixed amplitude so the
+            # decay is radially symmetric.
+            base = out[y, x]
             for nx in range(max(x - spread, 0), min(x + spread + 1, width)):
                 for ny in range(max(y - spread, 0), min(y + spread + 1, height)):
                     d2 = (nx - x) * (nx - x) + (ny - y) * (ny - y)
-                    if d2 <= s:
-                        out[ny, nx] = out[ny, nx] + (out[y, x] * ((s - d2) / s))
+                    if 0 < d2 <= s:
+                        out[ny, nx] = out[ny, nx] + (base * ((s - d2) / s))
     return out
 
 

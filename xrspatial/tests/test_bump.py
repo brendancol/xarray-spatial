@@ -181,6 +181,34 @@ def test_bump_spread_reaches_both_sides_1102():
     assert out[0, 0] == 0, "corner should be 0"
 
 
+def test_bump_single_bump_is_radially_symmetric():
+    """A lone bump must decay symmetrically from its center.
+
+    Regression test: the spread read the mutable out[y, x] each inner
+    iteration and included the center itself (d2 == 0, weight 1), so the
+    center doubled mid-loop and neighbors visited afterward got twice the
+    amplitude of those visited before. A single bump came out lopsided
+    toward +x/+y and was not invariant under rotation or reflection.
+    """
+    from xrspatial.bump import _finish_bump
+
+    locs = np.array([[5, 5]], dtype=np.int32)
+    heights = np.array([10.0])
+    out = _finish_bump(11, 11, locs, heights, spread=3)
+
+    # Center equals the deposited height, not double it.
+    assert out[5, 5] == 10.0
+
+    # Opposite neighbors match.
+    assert out[5, 4] == out[5, 6]
+    assert out[4, 5] == out[6, 5]
+
+    # Invariant under 90-degree rotation and both axis flips.
+    np.testing.assert_array_equal(out, np.rot90(out))
+    np.testing.assert_array_equal(out, out[:, ::-1])
+    np.testing.assert_array_equal(out, out[::-1, :])
+
+
 # --- Issue #1206 regression tests ---
 
 def test_bump_locs_use_int32_not_uint16():
