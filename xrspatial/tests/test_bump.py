@@ -4,6 +4,7 @@ except ImportError:
     da = None
 
 import numpy as np
+import pytest
 import xarray as xr
 
 from xrspatial import bump
@@ -297,6 +298,21 @@ def test_bump_raster_memory_guard_mentions_raster_bytes():
 
 
 @dask_array_available
+def test_bump_dask_count_guard_reports_location_arrays():
+    """On a dask agg the raster is never materialized, so a runaway
+    ``count`` trips the guard on the location/height arrays alone and the
+    message must name those (not the output raster) as the culprit (#1231)."""
+    import pytest
+
+    agg = xr.DataArray(
+        da.zeros((1_000, 1_000), chunks=(500, 500), dtype=np.float64),
+        dims=['y', 'x'],
+    )
+    with pytest.raises(MemoryError, match="location/height arrays"):
+        bump(agg=agg, count=50_000_000_000)
+
+
+@dask_array_available
 def test_bump_dask_bypasses_raster_guard():
     """Dask paths build the output lazily, so the raster-size guard
     must not reject a huge dask-backed agg (#1231)."""
@@ -309,3 +325,113 @@ def test_bump_dask_bypasses_raster_guard():
     result = bump(agg=agg, count=10, spread=0)
     assert result.shape == (100_000, 100_000)
     assert isinstance(result.data, da.Array)
+
+
+# --- Parameter coverage: custom height_func ---
+
+def test_bump_custom_height_func():
+    """The public ``height_func`` argument is the main customization point
+    but the default-``None`` path is all that other tests exercise.  A
+    custom function must actually drive the output magnitudes."""
+    def constant_height(locs):
+        return np.full(len(locs), 7.0)
+
+    np.random.seed(7)
+    # spread=0 keeps only the centre pixels, so every non-zero cell is the
+    # height the custom function returned (up to per-pixel accumulation).
+    result = bump(width=40, height=40, count=3, spread=0,
+                  height_func=constant_height)
+    nz = result.values[result.values != 0]
+    assert nz.size > 0
+    # Values are sums of the constant 7.0 over coincident bumps.
+    assert np.all(nz % 7.0 == 0)
+    assert result.values.max() >= 7.0
+
+
+def test_bump_custom_height_func_through_agg():
+    """height_func must also flow through the agg (backend-dispatch) path."""
+    def constant_height(locs):
+        return np.full(len(locs), 3.0)
+
+    agg = xr.DataArray(np.zeros((30, 30)), dims=['y', 'x'])
+    np.random.seed(11)
+    result = bump(agg=agg, count=2, spread=0, height_func=constant_height)
+    nz = result.values[result.values != 0]
+    assert nz.size > 0
+    assert np.all(nz % 3.0 == 0)
+
+
+# --- Geometric edge cases ---
+
+def test_bump_single_pixel_raster():
+    """A 1x1 raster must not raise on the spread-clamping loops."""
+    result = bump(width=1, height=1, count=1, spread=1)
+    assert result.shape == (1, 1)
+    assert result.values[0, 0] > 0
+
+
+def test_bump_single_column_strip():
+    """A 1-wide (Nx1) strip exercises kernel-boundary clamping in x."""
+    result = bump(width=1, height=10, count=3, spread=2)
+    assert result.shape == (10, 1)
+    assert np.count_nonzero(result.values) > 0
+
+
+def test_bump_single_row_strip():
+    """A 1-tall (1xN) strip exercises kernel-boundary clamping in y."""
+    result = bump(width=10, height=1, count=3, spread=2)
+    assert result.shape == (1, 10)
+    assert np.count_nonzero(result.values) > 0
+
+
+# --- Backend coverage: empty (bump-free) chunks in the dask paths ---
+
+@dask_array_available
+def test_bump_dask_numpy_sparse_chunks_match_numpy():
+    """Multi-chunk dask+numpy with few bumps leaves some chunks empty
+    (the ``part is None`` branch), which must still match numpy."""
+    agg_np = xr.DataArray(np.zeros((40, 40)), dims=['y', 'x'])
+    agg_dask = agg_np.copy()
+    agg_dask.data = da.from_array(agg_dask.data, chunks=(20, 20))
+
+    np.random.seed(1)
+    result_np = bump(agg=agg_np, count=3, spread=1)
+
+    np.random.seed(1)
+    result_dask = bump(agg=agg_dask, count=3, spread=1)
+
+    assert isinstance(result_dask.data, da.Array)
+    np.testing.assert_array_equal(result_np.values, result_dask.values)
+
+
+@dask_array_available
+@cuda_and_cupy_available
+@pytest.mark.xfail(
+    reason="dask+cupy empty-chunk path appends numpy da.zeros; da.block "
+           "then fails to concatenate numpy and cupy chunks (bump.py:146). "
+           "Known backend bug surfaced by the test-coverage sweep 2026-07-02.",
+    strict=False,
+)
+def test_bump_dask_cupy_sparse_chunks_match_numpy():
+    """Multi-chunk dask+cupy with bump-free chunks must match numpy.
+
+    Currently raises ``TypeError`` on compute because empty chunks are
+    materialized as numpy ``da.zeros`` and cannot be concatenated with the
+    cupy bump chunks.  Dense inputs (every chunk has a bump) work.
+    """
+    import cupy
+
+    agg_dc = xr.DataArray(
+        da.from_array(cupy.zeros((40, 40)), chunks=(20, 20)),
+        dims=['y', 'x'],
+    )
+    agg_np = xr.DataArray(np.zeros((40, 40)), dims=['y', 'x'])
+
+    np.random.seed(1)
+    result_np = bump(agg=agg_np, count=3, spread=1)
+
+    np.random.seed(1)
+    result_dc = bump(agg=agg_dc, count=3, spread=1)
+
+    computed = result_dc.data.compute()
+    np.testing.assert_array_equal(result_np.values, computed.get())
