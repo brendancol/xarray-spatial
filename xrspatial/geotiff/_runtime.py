@@ -1,0 +1,156 @@
+"""Geotiff module-level runtime state: sentinels, fallback warning, strict mode.
+
+These live in their own module so that backend extractions can import
+a single canonical binding for each sentinel and helper without
+threading them through ``__init__.py``. Sentinel object identity is
+preserved by Python's module cache: every import of this module
+returns the same module instance, so ``_GPU_DEPRECATED_SENTINEL is
+other._GPU_DEPRECATED_SENTINEL`` resolves correctly regardless of
+which caller imported it.
+"""
+from __future__ import annotations
+
+import os
+
+# Sentinels distinguishing "user passed this kwarg explicitly" from "user
+# passed nothing". A plain default of None does not work because None is
+# itself a value a caller could supply. ``_read_geotiff_gpu`` needs both
+# sentinels so it can tell whether the deprecated ``gpu=`` and the new
+# ``on_gpu_failure=`` were *each* supplied, and refuse the ambiguous
+# both-supplied case regardless of which values were chosen.
+# ``open_geotiff`` also uses ``_ON_GPU_FAILURE_SENTINEL`` to distinguish
+# "caller never set on_gpu_failure" (default sentinel: skip forwarding so
+# the _read_geotiff_gpu signature default applies) from "caller set
+# on_gpu_failure=<value>" (forward verbatim).
+_GPU_DEPRECATED_SENTINEL = object()
+_ON_GPU_FAILURE_SENTINEL = object()
+# ``_build_vrt`` needs to distinguish "user passed crs_wkt= explicitly"
+# (deprecation path) from "user passed nothing" (no warning, pick CRS
+# from the first source). A plain default of None does not work because
+# None is itself a value a caller could supply alongside crs=.
+_CRS_WKT_DEPRECATED_SENTINEL = object()
+# ``open_geotiff`` needs to tell "caller never set missing_sources" (default
+# sentinel: skip forwarding so the _read_vrt default applies, and reject the
+# kwarg up front for non-VRT sources) from "caller set missing_sources=<value>"
+# (forward verbatim to _read_vrt). Mirrors the on_gpu_failure pattern.
+_MISSING_SOURCES_SENTINEL = object()
+# ``_build_vrt`` historically named its first positional kwarg ``vrt_path``
+# while ``to_geotiff`` / ``_write_geotiff_gpu`` use ``path``. The deprecation
+# shim adds ``path`` as the new name and accepts ``vrt_path`` with a
+# DeprecationWarning. The sentinel pattern distinguishes "user passed
+# vrt_path= explicitly" from "user passed nothing", which is the same
+# rationale ``_CRS_WKT_DEPRECATED_SENTINEL`` documents above.
+_VRT_PATH_DEPRECATED_SENTINEL = object()
+# ``_build_vrt`` also needs to distinguish "user passed path= explicitly"
+# (including an explicit ``path=None``, which is an error) from "user
+# passed nothing" (fall through to the ``vrt_path`` shim). Without this
+# sentinel, ``_build_vrt(None, sources)`` silently fell through to the
+# ``path is None`` branch and raised a "missing required argument"
+# TypeError for the wrong reason.
+_VRT_PATH_MISSING_SENTINEL = object()
+# ``open_geotiff`` renamed ``mask_nodata`` -> ``masked`` (and flipped the
+# default from True to False) and ``name`` -> ``default_name`` to match
+# rioxarray's ``open_rasterio``. Each sentinel distinguishes "caller passed
+# the deprecated alias" from "caller passed nothing", so passing both the old
+# and new name raises TypeError and the old name alone warns. Same rationale
+# as ``_GPU_DEPRECATED_SENTINEL`` above.
+_MASK_NODATA_DEPRECATED_SENTINEL = object()
+_NAME_DEPRECATED_SENTINEL = object()
+# ``mask_and_scale`` was renamed to ``unpack`` (the operation unpacks
+# CF-packed integers via SCALE/OFFSET). Same sentinel deprecation as the
+# pair above: the old name still works but warns, and passing both raises.
+_MASK_AND_SCALE_DEPRECATED_SENTINEL = object()
+
+
+# Spatial dim names recognised on 3D writer inputs. ``y``/``x`` are the
+# canonical TIFF axes; aliases are accepted so a user who happens to use
+# ``lat``/``lon`` or ``row``/``col`` is not bounced by the validator.
+_Y_DIM_NAMES = ('y', 'lat', 'latitude', 'row')
+_X_DIM_NAMES = ('x', 'lon', 'longitude', 'col')
+
+
+# Used by the writer ambiguous-metadata validators in
+# ``_writers/eager.py`` and ``_writers/gpu.py`` so the
+# ``NonUniformCoordsError`` check fires for alias-named coords too.
+def _resolve_spatial_coords(data):
+    """Return ``(coord_y, coord_x)`` arrays for a DataArray, honoring aliases.
+
+    ``to_geotiff`` documents that spatial dims may be named with any of
+    the aliases in ``_Y_DIM_NAMES`` / ``_X_DIM_NAMES`` (``lat``/``lon``,
+    ``latitude``/``longitude``, ``row``/``col``), not just the canonical
+    ``y``/``x``. The ambiguous-metadata validator at the writer entry
+    points needs to see the alias-named coord arrays so its
+    ``NonUniformCoordsError`` check fires consistently. Without this
+    helper, only literal ``coords['y']`` / ``coords['x']`` are passed
+    in, and a DataArray with ``lat``/``lon`` coords slips past the
+    validator entirely.
+
+    Returns a tuple of ``numpy.ndarray`` (or ``None`` per axis if no
+    matching coord is present). Resolution picks the first alias from
+    ``_Y_DIM_NAMES`` / ``_X_DIM_NAMES`` that appears in ``data.coords``;
+    the canonical ``y``/``x`` names come first so existing arrays keep
+    matching exactly the same coord as before.
+    """
+    coords = getattr(data, 'coords', None)
+    if coords is None:
+        return None, None
+
+    def _first_match(names):
+        for name in names:
+            if name in coords:
+                return coords[name].values
+        return None
+
+    return _first_match(_Y_DIM_NAMES), _first_match(_X_DIM_NAMES)
+
+
+# Temporal dim names. Used by the 3D writer validator to refuse
+# ``(y, x, <temporal>)`` inputs that would otherwise be silently treated
+# as multiband rasters. CF / xarray conventions cover ``time`` and ``t``;
+# the rest match common upstream-pipeline aliases.
+_TIME_DIM_NAMES = ('time', 't', 'date', 'datetime', 'times', 'dates')
+
+
+class GeoTIFFFallbackWarning(UserWarning):
+    """Warning emitted when a geotiff helper falls back to a slower path.
+
+    Raised in the same call sites that would silently return ``None`` under
+    the historic ``except Exception: return None`` pattern. The
+    ``XRSPATIAL_GEOTIFF_STRICT=1`` env var promotes these warnings to
+    exceptions.
+    """
+
+
+def _geotiff_strict_mode() -> bool:
+    """Return True when ``XRSPATIAL_GEOTIFF_STRICT`` is set to a truthy value.
+
+    Strict mode promotes the audited silent fallbacks into
+    raised exceptions. Useful in CI to catch GPU-path or VRT regressions
+    that would otherwise hide behind a CPU fallback or a missing tile.
+    """
+    return os.environ.get(
+        'XRSPATIAL_GEOTIFF_STRICT', '').lower() in ('1', 'true', 'yes')
+
+
+def _gpu_fallback_warning_message(auto_detected: bool, exc: BaseException) -> str:
+    """Build the ``to_geotiff`` GPU-to-CPU fallback warning text.
+
+    ``to_geotiff`` reaches the GPU writer two ways: an explicit
+    ``gpu=True`` argument, or the auto-detect branch when ``gpu is
+    None`` and the data lives on a CuPy device. The wording differs
+    because blaming the fallback on a flag the caller never set sends
+    them to fix the wrong thing. Both routes share the exception
+    payload format so callers can grep ``type(e).__name__: e`` either
+    way.
+    """
+    suffix = f"({type(exc).__name__}: {exc})."
+    if auto_detected:
+        return (
+            "Data is on the GPU and was routed to the GPU writer, but "
+            "the writer is unavailable; falling back to CPU and copying "
+            "the array to host. " + suffix
+        )
+    return (
+        "to_geotiff(gpu=True) was requested but the GPU writer is "
+        "unavailable; falling back to CPU. " + suffix
+    )

@@ -1,0 +1,740 @@
+# Golden corpus manifest for geotiff backend parity tests.
+#
+# This file is the contract for what a fixture is. The generator
+# script `generate.py` reads it and rebuilds the TIFFs deterministically.
+# Adding a new fixture is a manifest edit plus a re-run of the generator.
+#
+# Schema (see generate.py for the authoritative validator):
+#
+# version: integer. Bumped when the schema shape changes.
+# defaults: optional map applied to every fixture before its own keys.
+# fixtures: list of fixture entries. Each entry has these keys:
+#
+#   id:               str    Stable identifier, also used as the file stem.
+#   description:      str    One-line human summary.
+#   width:            int    Pixel width.
+#   height:           int    Pixel height.
+#   bands:            int    Number of bands (>= 1).
+#   dtype:            str    numpy dtype string, e.g. "uint8", "int16",
+#                            "float32", "float64".
+#   byte_order:       str    "little" or "big". Native is "little".
+#   layout:           str    "stripped" or "tiled".
+#   tile_size:        int    Tile edge in pixels. Required when layout=tiled.
+#                            Must be a multiple of 16 per the TIFF spec.
+#   blocksize:        int    Rows per strip. Required when layout=stripped.
+#   planar_config:    str    "contig" (chunky) or "separate" (planar).
+#   compression:      str    one of:
+#                              none, deflate, lzw, lerc, jpeg, packbits
+#   predictor:        int    1 (none), 2 (horizontal), or 3 (floating point).
+#                            Only meaningful for deflate / lzw / zstd.
+#   compression_level: int   Codec-specific level. Optional. -1 means default.
+#   max_z_error:      float  LERC max_z_error. Optional, LERC only.
+#   photometric:      str    "minisblack", "miniswhite", "rgb", "ycbcr".
+#                            "miniswhite" exercises the inverted-mask path.
+#   nodata:           any    Nodata sentinel value. Allowed forms:
+#                              null              no nodata tag at all
+#                              <number>          integer or float sentinel
+#                              "nan"             float NaN (string-encoded so
+#                                                YAML stays portable)
+#                              "miniswhite"      no nodata tag, photometric
+#                                                miniswhite acts as the mask
+#   crs:              map    CRS spec. Exactly one of:
+#                              {epsg: <int>}                    EPSG code
+#                              {wkt: <str>}                     full WKT 2
+#                              {citation: <str>}                citation-only,
+#                                                               no projection
+#                              null                             no CRS
+#   transform:        list   Affine as [a, b, c, d, e, f]. c, f are origin.
+#                            Optional; defaults applied per-fixture.
+#   overviews:        list   Optional. Decimation factors, e.g. [2, 4].
+#                            Empty list or omitted means no overviews.
+#   overview_resampling: str Optional. "nearest", "average", "cubic", etc.
+#                            Default "nearest".
+#   external_overview: bool  Optional. If true, write a sidecar `.ovr` file
+#                            instead of internal overviews. The sidecar
+#                            file ships next to the `.tif` and must be
+#                            committed alongside it.
+#   cog:              bool   Optional. If true, write with GDAL's COG
+#                            driver (tiled, IFD-ordered, internal
+#                            overviews per https://www.cogeo.org/spec/).
+#                            Implies layout=tiled and overviews built by
+#                            the driver. The `compression` / `predictor`
+#                            entries are forwarded to the COG driver.
+#   sparse:           bool   Optional. If true, pass SPARSE_OK=TRUE to the
+#                            GDAL GTiff driver so the writer may elide
+#                            all-zero (or all-nodata) tiles. The on-disk
+#                            TileByteCounts entry for an elided tile is
+#                            0; the reader reconstructs the tile as
+#                            implicit zeros. Requires layout=tiled.
+#                            Mutually exclusive with cog=true (the COG
+#                            copy step rewrites the file and drops the
+#                            sparse encoding).
+#   gdal_metadata:    map    Optional. Written into the GDAL_METADATA tag as
+#                            {<domain>: {<item>: <str>}}. Domain "" is the
+#                            default. Used to exercise XML escaping and the
+#                            extra_tags safe-filter path. Recognised GDAL
+#                            domains include "", "IMAGE_STRUCTURE",
+#                            "SUBDATASETS", and any custom user domain.
+#   extra_tags:       map    Optional. Real TIFF tag overrides written as
+#                            actual IFD entries (not GDAL_METADATA XML).
+#                            Keys may be string names ("ImageDescription",
+#                            "Software", "Artist") or integers (private
+#                            tag codes like 65000). Values are strings.
+#                            The generator writes the raster with rasterio
+#                            first (for the GeoTIFF tags) and then rewrites
+#                            with tifffile to inject these as concrete TIFF
+#                            tags, since rasterio cannot emit private
+#                            numeric tags directly.
+#   pixel_pattern:    str    How the generator fills pixel data. One of:
+#                              "ramp"         deterministic linear ramp
+#                              "checker"      block checker for compression
+#                              "noise"        seeded numpy.random (seed below)
+#                              "uniform"      single constant value
+#                              "noise_with_corners"
+#                                             seeded noise (same as "noise")
+#                                             with the four corner pixels of
+#                                             each band forced to the dtype's
+#                                             min/max sentinels. Integer-only
+#                                             corner stamping; floats keep
+#                                             noise as-is.
+#   pixel_seed:       int    Seed for "noise" and "noise_with_corners"
+#                            patterns. Default 0.
+#   pixel_value:      number Constant for "uniform" patterns.
+#
+#   tags:             list   Optional. Free-form tags used to filter the
+#                            corpus from CLI / pytest selectors, e.g.
+#                            ["fast", "compression", "predictor"].
+#   tolerance:        map    Optional. Per-fixture comparison tolerance.
+#                            Keys: {atol: float, rtol: float, lossy: bool}.
+#                            "lossy: true" means bit-equality is not
+#                            expected (used for jpeg). The oracle (Phase 1
+#                            PR 2, not in this PR) is responsible for
+#                            interpreting these.
+#
+# Determinism rules:
+#   - No timestamps.
+#   - All randomness goes through pixel_seed.
+#   - The generator iterates `fixtures` in declared order and emits files
+#     in sorted-id order.
+
+version: 1
+
+defaults:
+  bands: 1
+  byte_order: little
+  layout: stripped
+  blocksize: 64
+  planar_config: contig
+  compression: none
+  predictor: 1
+  photometric: minisblack
+  nodata: null
+  crs:
+    epsg: 4326
+  transform: [0.001, 0.0, -120.0, 0.0, -0.001, 45.0]
+  pixel_pattern: ramp
+  pixel_seed: 0
+  tags: []
+
+# One canonical example. Phase 2 PRs (3-9 in the plan) populate the rest.
+# Schema-only example; not yet wired to any backend.
+fixtures:
+  - id: example_tiled_uint16_deflate_pred2
+    description: >-
+      Canonical example showing every schema field. Tiled uint16 with
+      deflate + predictor 2, an integer nodata sentinel, internal
+      overviews, EPSG CRS, and a GDAL_METADATA entry.
+    width: 128
+    height: 128
+    bands: 1
+    dtype: uint16
+    byte_order: little
+    layout: tiled
+    tile_size: 64
+    planar_config: contig
+    compression: deflate
+    predictor: 2
+    compression_level: 6
+    photometric: minisblack
+    nodata: 0
+    crs:
+      epsg: 32613
+    transform: [10.0, 0.0, 500000.0, 0.0, -10.0, 4500000.0]
+    overviews: [2]
+    overview_resampling: nearest
+    external_overview: false
+    gdal_metadata:
+      "":
+        UNITS: meters
+        AREA_OR_POINT: Area
+    extra_tags:
+      Software: xrspatial-golden-corpus
+    pixel_pattern: ramp
+    tags: [fast, tiled, deflate, predictor2, nodata, overviews]
+    tolerance:
+      atol: 0.0
+      rtol: 0.0
+      lossy: false
+
+  # Phase 2 PR 3 (#1930): layout x byte_order cross product on a single
+  # small uint16 raster. Same shape, same nodata, same compression-free
+  # encoding across all four; the only variation is tiled-vs-stripped and
+  # little-vs-big endian. uint16 is the smallest dtype where byte order
+  # is observable on disk.
+  - id: stripped_le_uint16
+    description: >-
+      32x32 uint16 raster, stripped layout, little-endian. Baseline for
+      the layout x byte_order matrix.
+    width: 32
+    height: 32
+    dtype: uint16
+    byte_order: little
+    layout: stripped
+    blocksize: 16
+    nodata: 0
+    pixel_pattern: noise
+    pixel_seed: 1930
+    tags: [fast, stripped, little_endian, layout_endian_matrix]
+
+  - id: tiled_le_uint16
+    description: >-
+      32x32 uint16 raster, tiled layout (16-pixel tiles), little-endian.
+    width: 32
+    height: 32
+    dtype: uint16
+    byte_order: little
+    layout: tiled
+    tile_size: 16
+    nodata: 0
+    pixel_pattern: noise
+    pixel_seed: 1930
+    tags: [fast, tiled, little_endian, layout_endian_matrix]
+
+  - id: stripped_be_uint16
+    description: >-
+      32x32 uint16 raster, stripped layout, big-endian. Exercises byte
+      swap on read against the little-endian sibling.
+    width: 32
+    height: 32
+    dtype: uint16
+    byte_order: big
+    layout: stripped
+    blocksize: 16
+    nodata: 0
+    pixel_pattern: noise
+    pixel_seed: 1930
+    tags: [fast, stripped, big_endian, layout_endian_matrix]
+
+  - id: tiled_be_uint16
+    description: >-
+      32x32 uint16 raster, tiled layout (16-pixel tiles), big-endian.
+    width: 32
+    height: 32
+    dtype: uint16
+    byte_order: big
+    layout: tiled
+    tile_size: 16
+    nodata: 0
+    pixel_pattern: noise
+    pixel_seed: 1930
+    tags: [fast, tiled, big_endian, layout_endian_matrix]
+
+  # ---------------------------------------------------------------------
+  # Phase 2 PR 4 -- dtype variants (#1930).
+  #
+  # Eight single-band fixtures, one per supported dtype. All entries
+  # inherit the manifest defaults (stripped layout, blocksize 64,
+  # compression=none, minisblack, EPSG:4326, fixed transform) and override
+  # only ``dtype``, ``pixel_pattern``, ``pixel_seed``, and pixel dimensions
+  # (20 x 20 -- chosen so the float64 file stays under the 4 kB ceiling).
+  # Integer dtypes use the ``noise_with_corners`` pattern, which
+  # plants the dtype's min and max sentinels in the four corner pixels so
+  # readers exercise the dtype-edge values. Float dtypes use plain
+  # ``noise``; a NaN-in-pixels variant is the job of Phase 2 PR 6 (nodata).
+  # Each fixture uses a unique ``pixel_seed`` so dtypes do not share bit
+  # patterns once written.
+  # ---------------------------------------------------------------------
+  - id: dtype_int8
+    description: >-
+      Single-band int8 stripped uncompressed; corner pixels carry the int8
+      min/max sentinels.
+    width: 20
+    height: 20
+    dtype: int8
+    pixel_pattern: noise_with_corners
+    pixel_seed: 1001
+    tags: [fast, dtype, int8]
+  - id: dtype_uint8
+    description: >-
+      Single-band uint8 stripped uncompressed; corner pixels carry the
+      uint8 min/max sentinels.
+    width: 20
+    height: 20
+    dtype: uint8
+    pixel_pattern: noise_with_corners
+    pixel_seed: 1002
+    tags: [fast, dtype, uint8]
+  - id: dtype_int16
+    description: >-
+      Single-band int16 stripped uncompressed; corner pixels carry the
+      int16 min/max sentinels.
+    width: 20
+    height: 20
+    dtype: int16
+    pixel_pattern: noise_with_corners
+    pixel_seed: 1003
+    tags: [fast, dtype, int16]
+  - id: dtype_uint16
+    description: >-
+      Single-band uint16 stripped uncompressed; corner pixels carry the
+      uint16 min/max sentinels.
+    width: 20
+    height: 20
+    dtype: uint16
+    pixel_pattern: noise_with_corners
+    pixel_seed: 1004
+    tags: [fast, dtype, uint16]
+  - id: dtype_int32
+    description: >-
+      Single-band int32 stripped uncompressed; corner pixels carry the
+      int32 min/max sentinels.
+    width: 20
+    height: 20
+    dtype: int32
+    pixel_pattern: noise_with_corners
+    pixel_seed: 1005
+    tags: [fast, dtype, int32]
+  - id: dtype_uint32
+    description: >-
+      Single-band uint32 stripped uncompressed; corner pixels carry the
+      uint32 min/max sentinels.
+    width: 20
+    height: 20
+    dtype: uint32
+    pixel_pattern: noise_with_corners
+    pixel_seed: 1006
+    tags: [fast, dtype, uint32]
+  - id: dtype_float32
+    description: >-
+      Single-band float32 stripped uncompressed. NaN-in-pixels handling is
+      deferred to Phase 2 PR 6 (nodata).
+    width: 20
+    height: 20
+    dtype: float32
+    pixel_pattern: noise
+    pixel_seed: 1007
+    tags: [fast, dtype, float32]
+  - id: dtype_float64
+    description: >-
+      Single-band float64 stripped uncompressed. NaN-in-pixels handling is
+      deferred to Phase 2 PR 6 (nodata).
+    width: 20
+    height: 20
+    dtype: float64
+    pixel_pattern: noise
+    pixel_seed: 1008
+    tags: [fast, dtype, float64]
+
+  # ---------------------------------------------------------------------
+  # Phase 2 PR 5 -- compression coverage.
+  #
+  # Five major codecs across six entries: uncompressed (none), deflate
+  # (with predictor 2 over int and predictor 3 over float), lzw (with
+  # predictor 2 over int), lerc on float, and jpeg in YCbCr on uint8.
+  # The jpeg entry is intrinsically lossy; the oracle is called with
+  # lossy=True for that one.
+  #
+  # Source data uses the "checker" pattern so compression has structure
+  # to exploit; arrays are kept tiny (under 8 KB target file size).
+  # LERC and JPEG availability depends on the GDAL build; the smoke
+  # test skips those cells when the codec is unavailable.
+  # ---------------------------------------------------------------------
+
+  - id: compression_none_uint8
+    description: >-
+      Baseline uncompressed uint8. Establishes the size floor and exercises
+      the no-codec write path for parity with the compressed cells.
+    width: 64
+    height: 64
+    dtype: uint8
+    compression: none
+    predictor: 1
+    pixel_pattern: checker
+    tags: [compression, none]
+    tolerance:
+      atol: 0.0
+      rtol: 0.0
+      lossy: false
+
+  - id: compression_deflate_predictor2_uint16
+    description: >-
+      Deflate with predictor 2 (horizontal differencing) on uint16.
+      Predictor 2 is the standard integer predictor; this is the most
+      common deflate configuration in the wild.
+    width: 64
+    height: 64
+    dtype: uint16
+    compression: deflate
+    predictor: 2
+    compression_level: 6
+    pixel_pattern: checker
+    tags: [compression, deflate, predictor2]
+    tolerance:
+      atol: 0.0
+      rtol: 0.0
+      lossy: false
+
+  - id: compression_deflate_predictor3_float32
+    description: >-
+      Deflate with predictor 3 (floating-point predictor) on float32.
+      Predictor 3 is float-only and exercises the byte-shuffled write
+      path that hit issue #1313.
+    width: 64
+    height: 64
+    dtype: float32
+    compression: deflate
+    predictor: 3
+    compression_level: 6
+    pixel_pattern: checker
+    tags: [compression, deflate, predictor3, float]
+    tolerance:
+      atol: 0.0
+      rtol: 0.0
+      lossy: false
+
+  - id: compression_lzw_predictor2_int16
+    description: >-
+      LZW with predictor 2 on signed int16. Covers the LZW codec branch
+      and the signed-integer predictor combination.
+    width: 64
+    height: 64
+    dtype: int16
+    compression: lzw
+    predictor: 2
+    pixel_pattern: checker
+    tags: [compression, lzw, predictor2]
+    tolerance:
+      atol: 0.0
+      rtol: 0.0
+      lossy: false
+
+  - id: compression_lerc_float32
+    description: >-
+      LERC on float32 with a small max_z_error. LERC is bit-exact only
+      when max_z_error is 0; this fixture asserts the lossless setting
+      (max_z_error 0) so it is comparable to the other codecs.
+    width: 64
+    height: 64
+    dtype: float32
+    compression: lerc
+    predictor: 1
+    max_z_error: 0.0
+    pixel_pattern: checker
+    tags: [compression, lerc, float]
+    tolerance:
+      atol: 0.0
+      rtol: 0.0
+      lossy: false
+
+  - id: compression_jpeg_uint8_ycbcr
+    description: >-
+      JPEG in YCbCr photometric on 3-band uint8 tiled raster. JPEG is
+      intrinsically lossy; the oracle is invoked with lossy=True for
+      this cell. Strict bit-exact comparison is expected to fail.
+    width: 64
+    height: 64
+    bands: 3
+    dtype: uint8
+    layout: tiled
+    tile_size: 32
+    compression: jpeg
+    predictor: 1
+    compression_level: 75
+    photometric: ycbcr
+    pixel_pattern: checker
+    tags: [compression, jpeg, lossy, ycbcr]
+    tolerance:
+      atol: 0.0
+      rtol: 0.0
+      lossy: true
+
+  # ----- Phase 2 PR 6: nodata sentinels (issue #1930) -----
+  # Three fixtures, one per nodata convention. Each one places at least
+  # one pixel on the sentinel so the oracle's nodata-masking semantics
+  # are exercised, not just the tag round-trip. Per-fixture pixel_seed
+  # keeps the noise pattern stable across regenerations.
+  - id: nodata_int_sentinel_uint16
+    description: >-
+      uint16 raster with an explicit integer nodata sentinel (0). A
+      handful of pixels are forced to 0 so the masked-data path is
+      reachable once a read backend lands in Phase 3.
+    width: 16
+    height: 16
+    dtype: uint16
+    nodata: 0
+    pixel_pattern: noise
+    pixel_seed: 1930006
+    tags: [fast, nodata, int_sentinel]
+    tolerance:
+      atol: 0.0
+      rtol: 0.0
+      lossy: false
+
+  - id: nodata_nan_float32
+    description: >-
+      float32 raster with NaN nodata. A few cells are written as NaN so
+      the oracle's NaN-aware equality (equal_nan=True) is the only path
+      that can pass.
+    width: 16
+    height: 16
+    dtype: float32
+    nodata: "nan"
+    pixel_pattern: noise
+    pixel_seed: 1930007
+    tags: [fast, nodata, nan]
+    tolerance:
+      atol: 0.0
+      rtol: 0.0
+      lossy: false
+
+  - id: nodata_miniswhite_uint8
+    description: >-
+      uint8 raster with photometric=miniswhite and no explicit nodata
+      tag. Per the TIFF spec, white-as-min means the dtype max value
+      (255 for uint8) acts as the "background" sentinel. The fixture
+      seeds a few pixels at 255 so backends that honour the photometric
+      tag have something to invert.
+    width: 16
+    height: 16
+    dtype: uint8
+    photometric: miniswhite
+    nodata: miniswhite
+    pixel_pattern: noise
+    pixel_seed: 1930008
+    tags: [fast, nodata, miniswhite, photometric]
+    tolerance:
+      atol: 0.0
+      rtol: 0.0
+      lossy: false
+
+  # Phase 2 PR 8: CRS representation variants. Three fixtures, one per
+  # CRS encoding the manifest allows. Pixel content is irrelevant; the
+  # contract under test is what the GeoTIFF tags say about the CRS.
+  - id: crs_epsg_3857
+    description: >-
+      EPSG-coded CRS. Web Mercator (EPSG:3857). Exercises the
+      straight EPSG path in the oracle.
+    width: 8
+    height: 8
+    dtype: uint8
+    crs:
+      epsg: 3857
+    transform: [10.0, 0.0, -8000000.0, 0.0, -10.0, 5000000.0]
+    tags: [fast, crs, epsg]
+  - id: crs_wkt_utm10n
+    description: >-
+      WKT-encoded CRS for EPSG:32610 (UTM 10N), but with AUTHORITY
+      blocks stripped so the WKT is not byte-identical to what
+      rasterio emits for from_epsg(32610). Exercises the oracle's
+      EPSG-code-equality fallback added in PR #1991.
+    width: 8
+    height: 8
+    dtype: uint8
+    crs:
+      wkt: 'PROJCS["WGS 84 / UTM zone 10N",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["latitude_of_origin",0],PARAMETER["central_meridian",-123],PARAMETER["scale_factor",0.9996],PARAMETER["false_easting",500000],PARAMETER["false_northing",0],UNIT["metre",1],AXIS["Easting",EAST],AXIS["Northing",NORTH]]'
+    transform: [10.0, 0.0, 500000.0, 0.0, -10.0, 4500000.0]
+    tags: [fast, crs, wkt]
+  - id: crs_citation_only
+    description: >-
+      Citation-only CRS: a user-supplied name with no AUTHORITY tag
+      and no formally registered EPSG code. PROJ round-trips it as a
+      generic geographic CRS keyed only by name. Exercises the
+      oracle's non-EPSG WKT fallback.
+    width: 8
+    height: 8
+    dtype: uint8
+    crs:
+      citation: User-provided projection, no formal EPSG/WKT
+    transform: [0.001, 0.0, -120.0, 0.0, -0.001, 45.0]
+    tags: [fast, crs, citation]
+
+  # ---------------------------------------------------------------------
+  # Phase 2 PR 9 -- GDAL_METADATA + extra_tags (#1930).
+  #
+  # Two fixtures exercising the cross-domain GDAL metadata path and the
+  # arbitrary-tag pass-through path.
+  # ---------------------------------------------------------------------
+  - id: gdal_metadata_namespaced_uint16
+    description: >-
+      Stripped uint16 with GDAL_METADATA entries across multiple domains
+      (default, IMAGE_STRUCTURE, SUBDATASETS, and a custom user domain).
+      Exercises the reader's cross-domain key handling.
+    width: 16
+    height: 16
+    dtype: uint16
+    blocksize: 16
+    gdal_metadata:
+      "":
+        UNITS: meters
+        AREA_OR_POINT: Area
+      # IMAGE_STRUCTURE is a GDAL-managed domain. GDAL overwrites
+      # COMPRESSION and INTERLEAVE on write based on the real codec /
+      # planar config, so the values below are placeholders. The point
+      # of listing them is to make the domain non-empty so the reader
+      # has to enumerate it.
+      IMAGE_STRUCTURE:
+        COMPRESSION: NONE
+        INTERLEAVE: PIXEL
+      SUBDATASETS:
+        SUBDATASET_1_NAME: "fixture:band1"
+        SUBDATASET_1_DESC: "single-band view"
+      CUSTOM_DOMAIN:
+        owner: xrspatial-corpus
+        purpose: cross-domain metadata smoke
+    pixel_pattern: ramp
+    tags: [fast, metadata, gdal_metadata]
+    tolerance:
+      atol: 0.0
+      rtol: 0.0
+      lossy: false
+
+  - id: extra_tags_uint16
+    description: >-
+      Stripped uint16 with arbitrary TIFF tags (ImageDescription, Artist,
+      Software, and a private numeric tag 65000) written as real IFD
+      entries via a tifffile post-pass. Exercises attribute round-tripping
+      of pass-through tags across backends.
+    width: 16
+    height: 16
+    dtype: uint16
+    blocksize: 16
+    extra_tags:
+      ImageDescription: "xrspatial golden corpus fixture"
+      Software: "xrspatial-golden-corpus"
+      Artist: "xarray-contrib"
+      65000: "private-tag-payload"
+    pixel_pattern: ramp
+    tags: [fast, metadata, extra_tags]
+    tolerance:
+      atol: 0.0
+      rtol: 0.0
+      lossy: false
+
+  # ---------------------------------------------------------------------
+  # Phase 2 PR 7: overview / COG variants.
+  #
+  # These three fixtures cover the overview-storage axis:
+  #   * internal overviews living inside the .tif IFD chain
+  #   * external overviews living in a sidecar .tif.ovr file
+  #   * a Cloud-Optimised GeoTIFF layout (tiled + IFD-ordered overviews)
+  # ---------------------------------------------------------------------
+  - id: overview_internal_uint16
+    description: >-
+      Stripped uint16 with internal overviews built at decimation [2, 4].
+      Exercises the in-file overview IFD chain.
+    width: 64
+    height: 64
+    dtype: uint16
+    compression: deflate
+    overviews: [2, 4]
+    overview_resampling: nearest
+    pixel_pattern: ramp
+    tags: [fast, overviews, internal-overview]
+
+  - id: overview_external_ovr_uint16
+    description: >-
+      Stripped uint16 whose overviews live in a sidecar `.ovr` file.
+      Exercises the external-overview lookup path.
+    width: 64
+    height: 64
+    dtype: uint16
+    compression: deflate
+    overviews: [2, 4]
+    overview_resampling: nearest
+    external_overview: true
+    pixel_pattern: ramp
+    tags: [fast, overviews, external-overview]
+
+  - id: cog_internal_overview_uint16
+    description: >-
+      Cloud-Optimised GeoTIFF: tiled, internal overviews, IFD ordering
+      per https://www.cogeo.org/spec/. Written via GDAL's COG driver.
+    width: 64
+    height: 64
+    dtype: uint16
+    layout: tiled
+    tile_size: 16
+    compression: deflate
+    overviews: [2, 4]
+    overview_resampling: nearest
+    cog: true
+    pixel_pattern: ramp
+    tags: [fast, tiled, overviews, cog]
+
+  # ---------------------------------------------------------------------
+  # Phase 4 PR (#1930): planar-separate (BSQ) and sparse-tiled coverage.
+  #
+  # The corpus through Phase 3 ships only ``planar_config: contig`` (BIP)
+  # rasters and only fully-populated strip/tile byte counts. These two
+  # fixtures close those holes:
+  #
+  # * ``planar_separate_uint8_rgb`` flips ``planar_config`` to
+  #   ``separate`` (BSQ / PLANARCONFIG=2). The reader has a distinct code
+  #   path for band-major storage and parity across backends had been
+  #   asserted only indirectly via the JPEG-YCbCr cell (which is lossy
+  #   and uses contig + ycbcr photometric).
+  #
+  # * ``sparse_tiled_uint16`` exercises GDAL's SPARSE_OK=TRUE creation
+  #   option. With a uniform zero pattern and deflate, GDAL elides every
+  #   tile (TileByteCounts all read 0 on disk) and the reader has to
+  #   reconstruct the implicit zeros. Real cloud-optimised GeoTIFFs do
+  #   this routinely; the corpus did not.
+  # ---------------------------------------------------------------------
+  - id: planar_separate_uint8_rgb
+    description: >-
+      3-band uint8 RGB raster, planar_config=separate (BSQ). Bands are
+      stored as three contiguous planes rather than pixel-interleaved.
+      Deflate + predictor 2 keeps the file inside the 12 KB per-fixture
+      budget. The noise pattern gives each band distinct pixel content
+      so a hypothetical band-permutation or band-duplication bug in the
+      BSQ decode path surfaces as a pixel mismatch rather than passing
+      silently.
+    width: 32
+    height: 32
+    bands: 3
+    dtype: uint8
+    layout: tiled
+    tile_size: 16
+    planar_config: separate
+    compression: deflate
+    predictor: 2
+    photometric: rgb
+    pixel_pattern: noise
+    pixel_seed: 1930042
+    tags: [fast, planar, separate, multiband]
+    tolerance:
+      atol: 0.0
+      rtol: 0.0
+      lossy: false
+
+  - id: sparse_tiled_uint16
+    description: >-
+      Single-band uint16 tiled raster (64x64, 16-px tiles -> 4x4 tile
+      grid = 16 tiles). Written with SPARSE_OK=TRUE and a uniform value
+      of 0, so GDAL elides every tile and TileByteCounts reads 0 for
+      each entry on disk. The reader reconstructs the implicit zeros on
+      decode.
+    width: 64
+    height: 64
+    dtype: uint16
+    layout: tiled
+    tile_size: 16
+    compression: deflate
+    sparse: true
+    pixel_pattern: uniform
+    pixel_value: 0
+    tags: [fast, tiled, sparse]
+    tolerance:
+      atol: 0.0
+      rtol: 0.0
+      lossy: false

@@ -1,0 +1,432 @@
+"""Vertical datum transformations: ellipsoidal height <-> orthometric height.
+
+Provides geoid undulation lookup from vendored EGM96 (2.6MB, 15-arcmin
+global grid) for converting between:
+
+- **Ellipsoidal height** (height above the WGS84 ellipsoid, what GPS gives)
+- **Orthometric height** (height above mean sea level / geoid, what maps show)
+- **Depth below chart datum** (bathymetric convention, positive downward)
+
+The relationship is:
+    h_ellipsoidal = H_orthometric + N_geoid
+
+where N is the geoid undulation (can be positive or negative, ranges
+from -107m to +85m globally for EGM96).
+
+Usage
+-----
+>>> from xrspatial.reproject import geoid_height, ellipsoidal_to_orthometric
+>>> N = geoid_height(-74.0, 40.7)                    # New York: ~-33m
+>>> H = ellipsoidal_to_orthometric(h_gps, lon, lat)  # GPS -> map height
+>>> h = orthometric_to_ellipsoidal(H_map, lon, lat)  # map height -> GPS
+"""
+from __future__ import annotations
+
+import math
+import os
+import threading
+
+import numpy as np
+from numba import njit, prange
+
+# Serializes parallel=True kernel launches; numba's workqueue threading
+# layer aborts the process when two host threads enter parallel regions
+# at the same time (#3141). Shared with the projection kernels because
+# the hazard spans kernels, not instances of one kernel.
+from ._projections import _PARALLEL_KERNEL_LOCK
+
+# ---------------------------------------------------------------------------
+# Geoid grid loading
+# ---------------------------------------------------------------------------
+
+_VENDORED_DIR = os.path.join(os.path.dirname(__file__), 'grids')
+_PROJ_CDN = "https://cdn.proj.org"
+
+_GEOID_MODELS = {
+    'EGM96': (
+        'us_nga_egm96_15.tif',
+        f'{_PROJ_CDN}/us_nga_egm96_15.tif',
+    ),
+    'EGM2008': (
+        'us_nga_egm08_25.tif',
+        f'{_PROJ_CDN}/us_nga_egm08_25.tif',
+    ),
+}
+
+_loaded_geoids = {}
+_loaded_geoids_lock = threading.Lock()
+
+
+def _find_file(filename, cdn_url=None):
+    """Find a file: vendored dir, user cache, then download."""
+    vendored = os.path.join(_VENDORED_DIR, filename)
+    if os.path.exists(vendored):
+        return vendored
+
+    cache_dir = os.path.join(os.path.expanduser('~'), '.cache', 'xrspatial', 'proj_grids')
+    cached = os.path.join(cache_dir, filename)
+    if os.path.exists(cached):
+        return cached
+
+    if cdn_url:
+        os.makedirs(cache_dir, exist_ok=True)
+        import urllib.request
+        urllib.request.urlretrieve(cdn_url, cached)
+        return cached
+    return None
+
+
+def _load_geoid(model='EGM96'):
+    """Load a geoid model, returning (data, left, top, res_x, res_y, h, w)."""
+    with _loaded_geoids_lock:
+        if model in _loaded_geoids:
+            return _loaded_geoids[model]
+
+    if model not in _GEOID_MODELS:
+        raise ValueError(f"Unknown geoid model: {model!r}. "
+                         f"Available: {list(_GEOID_MODELS)}")
+
+    filename, cdn_url = _GEOID_MODELS[model]
+    path = _find_file(filename, cdn_url)
+    if path is None:
+        raise FileNotFoundError(
+            f"Geoid model {model} not found. File: {filename}")
+
+    try:
+        import rasterio
+        with rasterio.open(path) as ds:
+            data = ds.read(1).astype(np.float64)
+            b = ds.bounds
+            h, w = ds.height, ds.width
+            res_x = (b.right - b.left) / w
+            res_y = (b.top - b.bottom) / h
+            result = (np.ascontiguousarray(data), b.left, b.top, res_x, res_y, h, w)
+    except ImportError:
+        from xrspatial.geotiff import open_geotiff
+        da = open_geotiff(path)
+        vals = da.values.astype(np.float64)
+        if vals.ndim == 3:
+            vals = vals[0] if vals.shape[0] == 1 else vals[:, :, 0]
+        y = da.coords['y'].values
+        x = da.coords['x'].values
+        h, w = vals.shape
+        res_x = abs(float(x[1] - x[0])) if len(x) > 1 else 0.25
+        res_y = abs(float(y[1] - y[0])) if len(y) > 1 else 0.25
+        left = float(x[0]) - res_x / 2
+        top = float(y[0]) + res_y / 2
+        result = (np.ascontiguousarray(vals), left, top, res_x, res_y, h, w)
+
+    with _loaded_geoids_lock:
+        _loaded_geoids[model] = result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Numba interpolation
+# ---------------------------------------------------------------------------
+
+@njit(nogil=True, cache=True)
+def _interp_geoid_point(lon, lat, data, left, top, res_x, res_y, h, w):
+    """Bilinear interpolation of geoid undulation at a single point.
+
+    The geoid GeoTIFF is pixel-center anchored: ``data[r, c]`` is the
+    value at ``(left + (c + 0.5) * res_x, top - (r + 0.5) * res_y)``.
+    The continuous interpolation index is therefore
+    ``(coord - edge) / res - 0.5`` rather than ``(coord - edge) / res``.
+    Without the ``-0.5`` correction the lookup at a pixel center
+    returned a blend of the target pixel and its neighbour, giving up to
+    ~2 m error on EGM96 at 15 arcmin. See GH #2508.
+    """
+    # Wrap longitude to [-180, 180)
+    lon_w = lon
+    while lon_w < -180.0:
+        lon_w += 360.0
+    while lon_w >= 180.0:
+        lon_w -= 360.0
+
+    # Pixel-center index space: data[r, c] sits at fractional index (r, c).
+    col_f = (lon_w - left) / res_x - 0.5
+    row_f = (top - lat) / res_y - 0.5
+
+    # Latitude beyond the outermost pixel centers is treated as outside
+    # the defined region. Querying exactly on the southern edge (lat ==
+    # bottom + 0.5*res_y) gives row_f == h-1 which is still in-bounds.
+    if row_f < -0.5 or row_f > h - 0.5:
+        return math.nan
+
+    # Clamp half-pixel border to the edge pixel center so a query that
+    # falls between the outer pixel center and the raster bound returns
+    # that pixel's value rather than NaN. This matches PROJ's edge
+    # handling for vgridshift.
+    if row_f < 0.0:
+        row_f = 0.0
+    if row_f > h - 1:
+        row_f = h - 1.0
+
+    # Wrap column for global grids. ``int(...)`` rounds toward zero so
+    # negative fractions need ``math.floor`` to stay on the left
+    # neighbour (col_f = -0.5 -> c0 = -1 -> w-1, the antipodal column).
+    c0_raw = int(math.floor(col_f))
+    c0 = c0_raw % w
+    c1 = (c0 + 1) % w
+    r0 = int(row_f)
+    if r0 >= h - 1:
+        r0 = h - 2
+    r1 = r0 + 1
+
+    dc = col_f - c0_raw
+    dr = row_f - r0
+
+    N = (data[r0, c0] * (1.0 - dr) * (1.0 - dc) +
+         data[r0, c1] * (1.0 - dr) * dc +
+         data[r1, c0] * dr * (1.0 - dc) +
+         data[r1, c1] * dr * dc)
+    return N
+
+
+@njit(nogil=True, cache=True, parallel=True)
+def _interp_geoid_batch(lons, lats, out, data, left, top, res_x, res_y, h, w):
+    """Batch bilinear interpolation of geoid undulation."""
+    for i in prange(lons.shape[0]):
+        out[i] = _interp_geoid_point(lons[i], lats[i], data, left, top,
+                                     res_x, res_y, h, w)
+
+
+@njit(nogil=True, cache=True, parallel=True)
+def _interp_geoid_2d(lons_2d, lats_2d, out_2d, data, left, top, res_x, res_y, h, w):
+    """2D batch geoid interpolation for raster grids."""
+    for i in prange(lons_2d.shape[0]):
+        for j in range(lons_2d.shape[1]):
+            out_2d[i, j] = _interp_geoid_point(
+                lons_2d[i, j], lats_2d[i, j], data, left, top,
+                res_x, res_y, h, w)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def geoid_height(lon, lat, model='EGM96'):
+    """Get the geoid undulation N at given coordinates.
+
+    Parameters
+    ----------
+    lon, lat : float, array-like, or xr.DataArray
+        Geographic coordinates in degrees (WGS84).
+    model : str
+        Geoid model: 'EGM96' (vendored, 2.6MB) or 'EGM2008' (77MB, downloaded on first use).
+
+    Returns
+    -------
+    N : float or numpy.ndarray
+        Geoid undulation in metres. Positive means the geoid is above
+        the ellipsoid. A Python ``float`` when both *lon* and *lat* are
+        scalars; otherwise a ``numpy.ndarray`` with the same shape as
+        the inputs. Array-like and ``xr.DataArray`` inputs both come
+        back as a plain ndarray (coords and attrs are not carried
+        through).
+
+    Examples
+    --------
+    >>> geoid_height(-74.0, 40.7)           # New York: ~-33m
+    >>> geoid_height(np.array([0, 90]), np.array([0, 0]))  # batch
+    """
+    data, left, top, res_x, res_y, h, w = _load_geoid(model)
+
+    scalar = np.ndim(lon) == 0 and np.ndim(lat) == 0
+    lon_in = np.asarray(lon, dtype=np.float64)
+    lat_in = np.asarray(lat, dtype=np.float64)
+    # Reject mismatched shapes before raveling. The numba kernel below runs
+    # under @njit(parallel=True) and indexes lat by lon.shape[0], so a
+    # shorter lat array would read past its end and silently return wrong
+    # values rather than raising IndexError. See GH issue #2026.
+    if lon_in.shape != lat_in.shape:
+        raise ValueError(
+            f"geoid_height(): lon and lat must have the same shape, "
+            f"got lon.shape={lon_in.shape} and lat.shape={lat_in.shape}."
+        )
+    lon_arr = np.atleast_1d(lon_in).ravel()
+    lat_arr = np.atleast_1d(lat_in).ravel()
+
+    if not np.isfinite(lon_arr).all():
+        raise ValueError(
+            "geoid_height(): lon contains non-finite values (NaN or Inf)."
+        )
+    if not np.isfinite(lat_arr).all():
+        raise ValueError(
+            "geoid_height(): lat contains non-finite values (NaN or Inf)."
+        )
+    if not ((lat_arr >= -90.0) & (lat_arr <= 90.0)).all():
+        raise ValueError(
+            "geoid_height(): lat must be in [-90, 90]."
+        )
+
+    out = np.empty(lon_arr.shape[0], dtype=np.float64)
+    with _PARALLEL_KERNEL_LOCK:
+        _interp_geoid_batch(lon_arr, lat_arr, out, data, left, top,
+                            res_x, res_y, h, w)
+
+    return float(out[0]) if scalar else out.reshape(np.shape(lon))
+
+
+def geoid_height_raster(raster, model='EGM96'):
+    """Get geoid undulation for every pixel in a geographic raster.
+
+    Parameters
+    ----------
+    raster : xr.DataArray
+        Raster with y (latitude) and x (longitude) coordinates in degrees.
+        2D or 3D. For 3D inputs (e.g. ``(y, x, band)``), the band axis is
+        dropped because the geoid undulation depends only on position.
+    model : str
+        Geoid model name.
+
+    Returns
+    -------
+    xr.DataArray
+        Geoid undulation N in metres on the same y/x grid as the input.
+        Output is always 2D. Input ``attrs`` (``crs``, ``res``,
+        ``transform``, ``_FillValue``, ``long_name``, etc.) are carried
+        forward; ``units`` and ``model`` are added on top.
+    """
+    import xarray as xr
+
+    from xrspatial.utils import _validate_raster
+
+    _validate_raster(raster, func_name='geoid_height_raster',
+                     name='raster', ndim=(2, 3))
+
+    # Locate the y/x dims regardless of the band layout. Resolved here so
+    # 3D inputs ((y, x, band) or (band, y, x)) produce a correct 2D result.
+    from . import _find_spatial_dims
+    ydim, xdim = _find_spatial_dims(raster)
+
+    data, left, top, res_x, res_y, h, w = _load_geoid(model)
+
+    y = raster.coords[ydim].values.astype(np.float64)
+    x = raster.coords[xdim].values.astype(np.float64)
+    xx, yy = np.meshgrid(x, y)
+
+    out = np.empty_like(xx)
+    with _PARALLEL_KERNEL_LOCK:
+        _interp_geoid_2d(xx, yy, out, data, left, top, res_x, res_y, h, w)
+
+    # Carry input attrs forward (crs, res, transform, _FillValue, etc.)
+    # and layer units / model on top. The output grid is identical to the
+    # input grid, so georeferencing metadata still applies.
+    out_attrs = {**raster.attrs}
+    out_attrs['units'] = 'metres'
+    out_attrs['model'] = model
+
+    return xr.DataArray(
+        out, dims=(ydim, xdim),
+        coords={ydim: raster.coords[ydim], xdim: raster.coords[xdim]},
+        name='geoid_undulation',
+        attrs=out_attrs,
+    )
+
+
+def ellipsoidal_to_orthometric(height, lon, lat, model='EGM96'):
+    """Convert ellipsoidal height to orthometric (mean-sea-level) height.
+
+    H = h - N
+
+    Parameters
+    ----------
+    height : float or array-like
+        Ellipsoidal height in metres (e.g. from GPS).
+    lon, lat : float or array-like
+        Geographic coordinates in degrees.
+    model : str
+        Geoid model name.
+
+    Returns
+    -------
+    H : numpy.ndarray or numpy scalar
+        Orthometric height in metres. The input is passed through
+        ``np.asarray``, so scalar input returns a numpy scalar and
+        array-like or ``xr.DataArray`` input returns a plain ndarray.
+    """
+    N = geoid_height(lon, lat, model)
+    return np.asarray(height) - N
+
+
+def orthometric_to_ellipsoidal(height, lon, lat, model='EGM96'):
+    """Convert orthometric (mean-sea-level) height to ellipsoidal height.
+
+    h = H + N
+
+    Parameters
+    ----------
+    height : float or array-like
+        Orthometric height in metres.
+    lon, lat : float or array-like
+        Geographic coordinates in degrees.
+    model : str
+        Geoid model name.
+
+    Returns
+    -------
+    h : numpy.ndarray or numpy scalar
+        Ellipsoidal height in metres. The input is passed through
+        ``np.asarray``, so scalar input returns a numpy scalar and
+        array-like or ``xr.DataArray`` input returns a plain ndarray.
+    """
+    N = geoid_height(lon, lat, model)
+    return np.asarray(height) + N
+
+
+def depth_to_ellipsoidal(depth, lon, lat, model='EGM96'):
+    """Convert depth below chart datum (positive downward) to ellipsoidal height.
+
+    Assumes chart datum is approximately mean sea level (the geoid).
+
+    h = -depth + N
+
+    Parameters
+    ----------
+    depth : float or array-like
+        Depth below chart datum in metres (positive downward).
+    lon, lat : float or array-like
+        Geographic coordinates in degrees.
+    model : str
+        Geoid model name.
+
+    Returns
+    -------
+    h : numpy.ndarray or numpy scalar
+        Ellipsoidal height in metres (negative below ellipsoid). The
+        input is passed through ``np.asarray``, so scalar input returns
+        a numpy scalar and array-like or ``xr.DataArray`` input returns
+        a plain ndarray.
+    """
+    N = geoid_height(lon, lat, model)
+    return -np.asarray(depth) + N
+
+
+def ellipsoidal_to_depth(height, lon, lat, model='EGM96'):
+    """Convert ellipsoidal height to depth below chart datum (positive downward).
+
+    Assumes chart datum is approximately mean sea level (the geoid).
+
+    depth = -(h - N) = N - h
+
+    Parameters
+    ----------
+    height : float or array-like
+        Ellipsoidal height in metres.
+    lon, lat : float or array-like
+        Geographic coordinates in degrees.
+    model : str
+        Geoid model name.
+
+    Returns
+    -------
+    depth : numpy.ndarray or numpy scalar
+        Depth below chart datum in metres (positive downward). The
+        input is passed through ``np.asarray``, so scalar input returns
+        a numpy scalar and array-like or ``xr.DataArray`` input returns
+        a plain ndarray.
+    """
+    N = geoid_height(lon, lat, model)
+    return N - np.asarray(height)

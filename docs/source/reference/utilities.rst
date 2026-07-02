@@ -1,0 +1,98 @@
+..  _reference.utilities:
+
+*********
+Utilities
+*********
+
+Mahalanobis Distance
+====================
+.. autosummary::
+    :toctree: _autosummary
+
+    xrspatial.mahalanobis.mahalanobis
+
+Emerging Hotspots
+=================
+.. autosummary::
+    :toctree: _autosummary
+
+    xrspatial.emerging_hotspots.emerging_hotspots
+
+Polygonize
+==========
+.. autosummary::
+    :toctree: _autosummary
+
+    xrspatial.polygonize.polygonize
+
+Rasterize
+=========
+.. autosummary::
+    :toctree: _autosummary
+
+    xrspatial.rasterize.rasterize
+
+.. note::
+
+   ``rasterize`` is also on the ``.xrs`` accessor, where the caller raster
+   supplies the output grid, chunks, and CRS (the ``like`` template)::
+
+       dem.xrs.rasterize(geometries_gdf, column="value")
+       dem.xrs.rasterize(geometries_gdf, column="value", coregister=True)
+
+   ``coregister=True`` reprojects a GeoDataFrame's geometries from their CRS
+   into the caller's CRS before rasterizing.
+
+Contours
+========
+.. autosummary::
+    :toctree: _autosummary
+
+    xrspatial.contour.contours
+
+Preview
+=======
+.. autosummary::
+    :toctree: _autosummary
+
+    xrspatial.preview.preview
+
+Normalization
+=============
+.. autosummary::
+    :toctree: _autosummary
+
+    xrspatial.normalize.rescale
+    xrspatial.normalize.standardize
+
+Overlap Fusion
+==============
+.. autosummary::
+    :toctree: _autosummary
+
+    xrspatial.utils.fused_overlap
+    xrspatial.utils.multi_overlap
+
+Rechunking
+==========
+.. autosummary::
+    :toctree: _autosummary
+
+    xrspatial.utils.rechunk_no_shuffle
+
+Diagnostics
+===========
+.. autosummary::
+    :toctree: _autosummary
+
+    xrspatial.diagnostics.diagnose
+
+Validation
+==========
+Check a raster against the xarray-spatial input contract. Also available
+on the accessor as ``da.xrs.validate()`` and ``ds.xrs.validate()``.
+
+.. autosummary::
+    :toctree: _autosummary
+
+    xrspatial.validate.validate

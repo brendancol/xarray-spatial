@@ -1,0 +1,827 @@
+"""Tests for GeoTIFF tag interpretation."""
+from __future__ import annotations
+
+import struct
+
+import numpy as np
+import pytest
+
+from xrspatial.geotiff import GeoTIFFAmbiguousMetadataError, InconsistentGeoKeysError, open_geotiff
+from xrspatial.geotiff._errors import RotatedTransformError
+from xrspatial.geotiff._geotags import (GEOKEY_GEOGRAPHIC_TYPE, GEOKEY_PROJECTED_CS_TYPE,
+                                        MODEL_TYPE_GEOGRAPHIC, MODEL_TYPE_PROJECTED,
+                                        TAG_GDAL_NODATA, TAG_GEO_KEY_DIRECTORY,
+                                        TAG_MODEL_PIXEL_SCALE, TAG_MODEL_TIEPOINT, GeoTransform,
+                                        build_geo_tags, extract_geo_info)
+from xrspatial.geotiff._header import parse_all_ifds, parse_header
+from xrspatial.geotiff._validation import (_check_read_inconsistent_geokeys,
+                                           _registered_read_metadata_checks, validate_read_metadata)
+
+from .._geotiff_fixtures import write_minimal_tiff
+from ..conftest import make_minimal_tiff
+
+
+class TestGeoTransform:
+    def test_defaults(self):
+        gt = GeoTransform()
+        assert gt.origin_x == 0.0
+        assert gt.origin_y == 0.0
+        assert gt.pixel_width == 1.0
+        assert gt.pixel_height == -1.0
+
+
+class TestExtractGeoInfo:
+    def test_with_tiepoint_and_scale(self):
+        data = make_minimal_tiff(
+            4, 4, np.dtype('float32'),
+            geo_transform=(-120.0, 45.0, 0.001, -0.001),
+            epsg=4326,
+        )
+        header = parse_header(data)
+        ifds = parse_all_ifds(data, header)
+        assert len(ifds) == 1
+
+        geo = extract_geo_info(ifds[0], data, header.byte_order)
+        assert geo.transform.origin_x == pytest.approx(-120.0)
+        assert geo.transform.origin_y == pytest.approx(45.0)
+        assert geo.transform.pixel_width == pytest.approx(0.001)
+        assert geo.transform.pixel_height == pytest.approx(-0.001)
+        assert geo.crs_epsg == 4326
+        assert geo.model_type == MODEL_TYPE_GEOGRAPHIC
+
+    def test_projected_crs(self):
+        data = make_minimal_tiff(
+            4, 4, np.dtype('float32'),
+            geo_transform=(500000.0, 4500000.0, 30.0, -30.0),
+            epsg=32610,
+        )
+        header = parse_header(data)
+        ifds = parse_all_ifds(data, header)
+        geo = extract_geo_info(ifds[0], data, header.byte_order)
+        assert geo.crs_epsg == 32610
+        assert geo.model_type == MODEL_TYPE_PROJECTED
+
+    def test_no_geo_tags(self):
+        data = make_minimal_tiff(4, 4, np.dtype('float32'))
+        header = parse_header(data)
+        ifds = parse_all_ifds(data, header)
+        geo = extract_geo_info(ifds[0], data, header.byte_order)
+        assert geo.crs_epsg is None
+        # Default transform
+        assert geo.transform.pixel_width == 1.0
+
+
+class TestBuildGeoTags:
+    def test_basic(self):
+        gt = GeoTransform(-120.0, 45.0, 0.001, -0.001)
+        tags = build_geo_tags(gt, crs_epsg=4326, nodata=-9999.0)
+
+        assert TAG_MODEL_PIXEL_SCALE in tags
+        scale = tags[TAG_MODEL_PIXEL_SCALE]
+        assert scale[0] == pytest.approx(0.001)
+        assert scale[1] == pytest.approx(0.001)
+
+        assert TAG_MODEL_TIEPOINT in tags
+        tp = tags[TAG_MODEL_TIEPOINT]
+        assert tp[3] == pytest.approx(-120.0)
+        assert tp[4] == pytest.approx(45.0)
+
+        assert TAG_GEO_KEY_DIRECTORY in tags
+        assert TAG_GDAL_NODATA in tags
+        assert tags[TAG_GDAL_NODATA] == '-9999.0'
+
+    def test_no_crs(self):
+        gt = GeoTransform(0.0, 0.0, 1.0, -1.0)
+        tags = build_geo_tags(gt, crs_epsg=None, nodata=None)
+        assert TAG_MODEL_PIXEL_SCALE in tags
+        assert TAG_GEO_KEY_DIRECTORY in tags
+        assert TAG_GDAL_NODATA not in tags
+
+    def test_projected_crs_geokey(self):
+        gt = GeoTransform(500000.0, 4500000.0, 30.0, -30.0)
+        tags = build_geo_tags(gt, crs_epsg=32610)
+        geokeys = tags[TAG_GEO_KEY_DIRECTORY]
+        # Flatten and check that ProjectedCSType is present
+        assert 3072 in geokeys  # GEOKEY_PROJECTED_CS_TYPE
+
+
+class TestModelTypeFromEPSG:
+    """Model type must be classified from CRS metadata, not EPSG range.
+
+    The legacy heuristic at build_geo_tags decided geographic-vs-projected
+    from the EPSG number range (4326 plus 4000-4999). That silently
+    mis-tagged geographic CRSes registered outside the 4000-4999 block
+    (NAD83(2011) = 6318, GDA2020 = 7844, WGS 84 (G2139) = 9057, etc.) as
+    projected, AND mis-tagged projected codes inside the block (4087 /
+    4088 / 4499 etc.) as geographic. Both directions corrupt the CRS at
+    write time.
+
+    The fix consults pyproj when available; when pyproj can't classify
+    a code (uninstalled, or installed but DB lookup fails), anything
+    outside a small vetted geographic allowlist raises rather than
+    guessing.
+    """
+
+    @pytest.mark.parametrize("epsg", [4326, 4269, 4267, 4258, 4283])
+    def test_geographic_allowlist(self, epsg):
+        # Codes the hard-coded fallback set covers explicitly.
+        gt = GeoTransform(-120.0, 45.0, 0.001, -0.001)
+        tags = build_geo_tags(gt, crs_epsg=epsg)
+        geokeys = tags[TAG_GEO_KEY_DIRECTORY]
+        assert GEOKEY_GEOGRAPHIC_TYPE in geokeys
+        assert GEOKEY_PROJECTED_CS_TYPE not in geokeys
+
+    @pytest.mark.parametrize("epsg", [6318, 7844, 9057, 8252])
+    def test_geographic_outside_legacy_range(self, epsg):
+        # The bug: pre-fix, these wrote ProjectedCSTypeGeoKey.
+        # pyproj.CRS.from_epsg(...).is_geographic is True for all four.
+        pytest.importorskip("pyproj")
+        gt = GeoTransform(-120.0, 45.0, 0.001, -0.001)
+        tags = build_geo_tags(gt, crs_epsg=epsg)
+        geokeys = tags[TAG_GEO_KEY_DIRECTORY]
+        assert GEOKEY_GEOGRAPHIC_TYPE in geokeys, (
+            f"EPSG:{epsg} is geographic per pyproj but was written as "
+            f"projected -- regression of issue #2277"
+        )
+        assert GEOKEY_PROJECTED_CS_TYPE not in geokeys
+
+    @pytest.mark.parametrize("epsg", [4087, 4088, 4499])
+    def test_projected_inside_legacy_range(self, epsg):
+        # The other direction of the legacy bug: codes in 4000-4999 that
+        # are actually projected (World Equidistant Cylindrical at 4087 /
+        # 4088, CGCS2000 Gauss-Kruger zone 21 at 4499). The fix routes
+        # these through pyproj, which classifies them correctly.
+        pytest.importorskip("pyproj")
+        gt = GeoTransform(500000.0, 4500000.0, 30.0, -30.0)
+        tags = build_geo_tags(gt, crs_epsg=epsg)
+        geokeys = tags[TAG_GEO_KEY_DIRECTORY]
+        assert GEOKEY_PROJECTED_CS_TYPE in geokeys, (
+            f"EPSG:{epsg} is projected per pyproj but was written as "
+            f"geographic -- regression of issue #2277"
+        )
+        assert GEOKEY_GEOGRAPHIC_TYPE not in geokeys
+
+    @pytest.mark.parametrize("epsg", [32610, 3857, 2193])
+    def test_projected_dispatch(self, epsg):
+        pytest.importorskip("pyproj")
+        gt = GeoTransform(500000.0, 4500000.0, 30.0, -30.0)
+        tags = build_geo_tags(gt, crs_epsg=epsg)
+        geokeys = tags[TAG_GEO_KEY_DIRECTORY]
+        assert GEOKEY_PROJECTED_CS_TYPE in geokeys
+        assert GEOKEY_GEOGRAPHIC_TYPE not in geokeys
+
+    def test_unknown_epsg_without_pyproj_raises(self, monkeypatch):
+        """Fail closed when pyproj is unavailable and the code is unknown.
+
+        Mocks `pyproj` import failure to exercise the fallback path.
+        EPSG 7844 (GDA2020 geographic) is outside the hard-coded
+        allowlist, so without pyproj the writer cannot tell geographic
+        from projected and must raise -- silent corruption is worse
+        than an explicit error.
+        """
+        import builtins
+
+        from xrspatial.geotiff._errors import UnknownCRSModelTypeError
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "pyproj" or name.startswith("pyproj."):
+                raise ImportError("simulated: pyproj not installed")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        gt = GeoTransform(-120.0, 45.0, 0.001, -0.001)
+        with pytest.raises(UnknownCRSModelTypeError, match="pyproj"):
+            build_geo_tags(gt, crs_epsg=7844)
+
+    def test_known_geographic_without_pyproj_still_works(self, monkeypatch):
+        """The hard-coded allowlist keeps working when pyproj is gone.
+
+        EPSG 4326 (and the rest of the vetted allowlist) lets common
+        geographic rasters round-trip without a pyproj dependency.
+        """
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "pyproj" or name.startswith("pyproj."):
+                raise ImportError("simulated: pyproj not installed")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+        gt = GeoTransform(-120.0, 45.0, 0.001, -0.001)
+        tags = build_geo_tags(gt, crs_epsg=4326)
+        geokeys = tags[TAG_GEO_KEY_DIRECTORY]
+        assert GEOKEY_GEOGRAPHIC_TYPE in geokeys
+        assert GEOKEY_PROJECTED_CS_TYPE not in geokeys
+
+    def test_unknown_epsg_with_pyproj_raises(self, monkeypatch):
+        """pyproj raises on an unknown EPSG -> writer raises too.
+
+        Simulates the case where pyproj is installed but the EPSG code
+        isn't in its database (e.g. the local PROJ database is out of
+        date). The fallback set covers a small vetted allowlist;
+        anything else should raise rather than guess.
+        """
+        # Patch CRS.from_epsg to simulate a missing DB entry.
+        import pyproj
+
+        from xrspatial.geotiff._errors import UnknownCRSModelTypeError
+
+        def boom(code):
+            raise pyproj.exceptions.CRSError(f"simulated unknown code {code}")
+
+        monkeypatch.setattr(pyproj.CRS, "from_epsg", staticmethod(boom))
+
+        gt = GeoTransform(0.0, 0.0, 30.0, -30.0)
+        # 9999999 is outside the hard-coded allowlist.
+        with pytest.raises(UnknownCRSModelTypeError):
+            build_geo_tags(gt, crs_epsg=9999999)
+
+        # And the allowlist still rescues EPSG 4326 even when pyproj fails.
+        tags = build_geo_tags(gt, crs_epsg=4326)
+        assert GEOKEY_GEOGRAPHIC_TYPE in tags[TAG_GEO_KEY_DIRECTORY]
+
+
+def _build_tiff_with_transformation_tag(matrix_16: tuple) -> bytes:
+    """Build a tiny single-strip TIFF carrying a 4x4 ModelTransformationTag.
+
+    No ModelPixelScale or ModelTiepoint -- the reader has to use the
+    transformation tag.
+    """
+    bo = '<'
+    width, height = 2, 2
+    pixels = np.zeros((height, width), dtype=np.uint8)
+
+    tag_list = []
+
+    def add_short(tag, val):
+        tag_list.append((tag, 3, 1, struct.pack(f'{bo}H', val)))
+
+    def add_long(tag, val):
+        tag_list.append((tag, 4, 1, struct.pack(f'{bo}I', val)))
+
+    def add_doubles(tag, vals):
+        tag_list.append(
+            (tag, 12, len(vals), struct.pack(f'{bo}{len(vals)}d', *vals)))
+
+    add_short(256, width)            # ImageWidth
+    add_short(257, height)           # ImageLength
+    add_short(258, 8)                # BitsPerSample
+    add_short(259, 1)                # Compression: none
+    add_short(262, 1)                # PhotometricInterpretation: BlackIsZero
+    add_short(277, 1)                # SamplesPerPixel
+    add_short(278, height)           # RowsPerStrip
+    add_long(273, 0)                 # StripOffsets (placeholder)
+    add_long(279, len(pixels.tobytes()))  # StripByteCounts
+    add_short(339, 1)                # SampleFormat
+    # ModelTransformationTag (34264): 16 doubles, row-major 4x4.
+    add_doubles(34264, list(matrix_16))
+
+    tag_list.sort(key=lambda t: t[0])
+
+    num_entries = len(tag_list)
+    ifd_start = 8
+    ifd_size = 2 + 12 * num_entries + 4
+
+    # Build overflow buffer for tags whose value exceeds 4 bytes.
+    overflow = bytearray()
+    overflow_offsets = {}
+    for tag, _typ, _count, raw in tag_list:
+        if len(raw) > 4:
+            overflow_offsets[tag] = ifd_start + ifd_size + len(overflow)
+            overflow.extend(raw)
+            if len(overflow) % 2:
+                overflow.append(0)
+
+    pixel_start = ifd_start + ifd_size + len(overflow)
+
+    # Patch StripOffsets
+    patched = []
+    for tag, typ, count, raw in tag_list:
+        if tag == 273:
+            patched.append((tag, typ, count, struct.pack(f'{bo}I', pixel_start)))
+        else:
+            patched.append((tag, typ, count, raw))
+    tag_list = patched
+
+    out = bytearray()
+    out.extend(b'II')
+    out.extend(struct.pack(f'{bo}H', 42))
+    out.extend(struct.pack(f'{bo}I', ifd_start))
+    out.extend(struct.pack(f'{bo}H', num_entries))
+    for tag, typ, count, raw in tag_list:
+        out.extend(struct.pack(f'{bo}HHI', tag, typ, count))
+        if len(raw) <= 4:
+            out.extend(raw.ljust(4, b'\x00'))
+        else:
+            out.extend(struct.pack(f'{bo}I', overflow_offsets[tag]))
+    out.extend(struct.pack(f'{bo}I', 0))
+    out.extend(overflow)
+    out.extend(pixels.tobytes())
+    return bytes(out)
+
+
+class TestModelTransformationTag_1486:
+    """Handle ModelTransformationTag (34264) explicitly.
+
+    The reader previously read the matrix but silently discarded any
+    rotation, skew, or z-coupling.  The fix raises NotImplementedError
+    instead of returning a corrupted transform.
+    """
+
+    def test_axis_aligned_extracts_correctly(self, tmp_path):
+        # M = [[sx, 0, 0, ox], [0, sy, 0, oy], [0, 0, 1, 0], [0, 0, 0, 1]]
+        # Note pixel_height is M[5] verbatim -- the writer encodes a negative
+        # value here so it stays negative in the read transform.
+        ox, oy, sx, sy = 500000.0, 4500000.0, 30.0, -30.0
+        matrix = (
+            sx, 0.0, 0.0, ox,
+            0.0, sy, 0.0, oy,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+        data = _build_tiff_with_transformation_tag(matrix)
+        path = tmp_path / 'transform_axis_aligned_1486.tif'
+        path.write_bytes(data)
+
+        from xrspatial.geotiff._reader import read_to_array
+        _, geo_info = read_to_array(str(path))
+        assert geo_info.transform.origin_x == pytest.approx(ox)
+        assert geo_info.transform.origin_y == pytest.approx(oy)
+        assert geo_info.transform.pixel_width == pytest.approx(sx)
+        assert geo_info.transform.pixel_height == pytest.approx(sy)
+
+    def test_rotation_raises(self, tmp_path):
+        # Non-zero rotation in M[1] / M[4]
+        matrix = (
+            30.0, 5.0, 0.0, 500000.0,
+            5.0, -30.0, 0.0, 4500000.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+        data = _build_tiff_with_transformation_tag(matrix)
+        path = tmp_path / 'transform_rotated_1486.tif'
+        path.write_bytes(data)
+
+        from xrspatial.geotiff._reader import read_to_array
+        with pytest.raises(RotatedTransformError) as exc:
+            read_to_array(str(path))
+        assert 'ModelTransformationTag' in str(exc.value)
+        assert 'rotation' in str(exc.value).lower() or 'skew' in str(exc.value).lower()
+
+    def test_z_coupling_raises(self, tmp_path):
+        # Non-zero z-coupling in M[2] / M[6]
+        matrix = (
+            30.0, 0.0, 0.5, 500000.0,
+            0.0, -30.0, 0.5, 4500000.0,
+            0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 1.0,
+        )
+        data = _build_tiff_with_transformation_tag(matrix)
+        path = tmp_path / 'transform_z_coupled_1486.tif'
+        path.write_bytes(data)
+
+        from xrspatial.geotiff._reader import read_to_array
+        with pytest.raises(RotatedTransformError):
+            read_to_array(str(path))
+
+
+def _build_tiff_with_tiepoint_only(tiepoint_6: tuple) -> bytes:
+    """Build a tiny single-strip TIFF carrying ModelTiepointTag but
+    no ModelPixelScaleTag or ModelTransformationTag.
+
+    The GeoTIFF spec permits this configuration; the tiepoint encodes a
+    real-world (X, Y) origin for pixel (I, J).  When ModelPixelScaleTag
+    is absent the spec-level unit pixel scale is (sx, sy) = (1.0, 1.0)
+    (sy is a positive magnitude in spec terms).  The reader translates
+    that into the GeoTransform sign convention used in this repo, where
+    pixel_height is stored as -sy, so the resulting transform has
+    pixel_width == 1.0 and pixel_height == -1.0.
+    """
+    bo = '<'
+    width, height = 2, 2
+    pixels = np.zeros((height, width), dtype=np.uint8)
+
+    tag_list = []
+
+    def add_short(tag, val):
+        tag_list.append((tag, 3, 1, struct.pack(f'{bo}H', val)))
+
+    def add_long(tag, val):
+        tag_list.append((tag, 4, 1, struct.pack(f'{bo}I', val)))
+
+    def add_doubles(tag, vals):
+        tag_list.append(
+            (tag, 12, len(vals), struct.pack(f'{bo}{len(vals)}d', *vals)))
+
+    add_short(256, width)            # ImageWidth
+    add_short(257, height)           # ImageLength
+    add_short(258, 8)                # BitsPerSample
+    add_short(259, 1)                # Compression: none
+    add_short(262, 1)                # PhotometricInterpretation
+    add_short(277, 1)                # SamplesPerPixel
+    add_short(278, height)           # RowsPerStrip
+    add_long(273, 0)                 # StripOffsets (placeholder)
+    add_long(279, len(pixels.tobytes()))  # StripByteCounts
+    add_short(339, 1)                # SampleFormat
+    # ModelTiepointTag (33922): 6 doubles (I, J, K, X, Y, Z).
+    # Deliberately no ModelPixelScaleTag (33550).
+    add_doubles(33922, list(tiepoint_6))
+
+    tag_list.sort(key=lambda t: t[0])
+
+    num_entries = len(tag_list)
+    ifd_start = 8
+    ifd_size = 2 + 12 * num_entries + 4
+
+    overflow = bytearray()
+    overflow_offsets = {}
+    for tag, _typ, _count, raw in tag_list:
+        if len(raw) > 4:
+            overflow_offsets[tag] = ifd_start + ifd_size + len(overflow)
+            overflow.extend(raw)
+            if len(overflow) % 2:
+                overflow.append(0)
+
+    pixel_start = ifd_start + ifd_size + len(overflow)
+
+    patched = []
+    for tag, typ, count, raw in tag_list:
+        if tag == 273:
+            patched.append((tag, typ, count, struct.pack(f'{bo}I', pixel_start)))
+        else:
+            patched.append((tag, typ, count, raw))
+    tag_list = patched
+
+    out = bytearray()
+    out.extend(b'II')
+    out.extend(struct.pack(f'{bo}H', 42))
+    out.extend(struct.pack(f'{bo}I', ifd_start))
+    out.extend(struct.pack(f'{bo}H', num_entries))
+    for tag, typ, count, raw in tag_list:
+        out.extend(struct.pack(f'{bo}HHI', tag, typ, count))
+        if len(raw) <= 4:
+            out.extend(raw.ljust(4, b'\x00'))
+        else:
+            out.extend(struct.pack(f'{bo}I', overflow_offsets[tag]))
+    out.extend(struct.pack(f'{bo}I', 0))
+    out.extend(overflow)
+    out.extend(pixels.tobytes())
+    return bytes(out)
+
+
+class TestTiepointWithoutScale_1750:
+    """ModelTiepointTag present, ModelPixelScaleTag absent.
+
+    Previously the reader returned a default GeoTransform with origin (0, 0)
+    while still flagging the raster as georeferenced, silently relocating it.
+    The fix honours the tiepoint's X/Y and falls back to unit pixel scale
+    (the GeoTIFF spec convention when ModelPixelScale is absent).
+    """
+
+    def test_tiepoint_origin_preserved(self, tmp_path):
+        # I=0, J=0 maps to (X=500000, Y=4500000)
+        tiepoint = (0.0, 0.0, 0.0, 500000.0, 4500000.0, 0.0)
+        data = _build_tiff_with_tiepoint_only(tiepoint)
+        path = tmp_path / 'tiepoint_no_scale_1750.tif'
+        path.write_bytes(data)
+
+        header = parse_header(data)
+        ifds = parse_all_ifds(data, header)
+        from xrspatial.geotiff._geotags import _extract_transform
+        transform, has_georef = _extract_transform(ifds[0])
+
+        assert has_georef is True
+        assert transform.origin_x == pytest.approx(500000.0)
+        assert transform.origin_y == pytest.approx(4500000.0)
+        # Unit pixel scale fallback per GeoTIFF spec
+        assert transform.pixel_width == pytest.approx(1.0)
+        assert transform.pixel_height == pytest.approx(-1.0)
+
+    def test_tiepoint_with_nonzero_ij(self, tmp_path):
+        # I=2, J=3 maps to (X=100, Y=200) -- origin shifts to (98, 203)
+        tiepoint = (2.0, 3.0, 0.0, 100.0, 200.0, 0.0)
+        data = _build_tiff_with_tiepoint_only(tiepoint)
+        path = tmp_path / 'tiepoint_no_scale_ij_1750.tif'
+        path.write_bytes(data)
+
+        header = parse_header(data)
+        ifds = parse_all_ifds(data, header)
+        from xrspatial.geotiff._geotags import _extract_transform
+        transform, has_georef = _extract_transform(ifds[0])
+
+        assert has_georef is True
+        # origin_x = tp_x - tp_i * 1.0 = 100 - 2 = 98
+        # origin_y = tp_y + tp_j * 1.0 = 200 + 3 = 203
+        assert transform.origin_x == pytest.approx(98.0)
+        assert transform.origin_y == pytest.approx(203.0)
+        assert transform.pixel_width == pytest.approx(1.0)
+        assert transform.pixel_height == pytest.approx(-1.0)
+
+# ===========================================================================
+# Inconsistent geokeys fail-closed (#2417)
+# Source: test_inconsistent_geokeys_2417.py
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# Registry sanity.
+# ---------------------------------------------------------------------------
+
+
+def test_inconsistent_geokeys_check_registered():
+    names = {c.__name__ for c in _registered_read_metadata_checks()}
+    assert _check_read_inconsistent_geokeys.__name__ in names
+
+
+def test_error_class_hierarchy():
+    assert issubclass(InconsistentGeoKeysError, GeoTIFFAmbiguousMetadataError)
+    assert issubclass(InconsistentGeoKeysError, ValueError)
+
+
+# ---------------------------------------------------------------------------
+# Unit-level checks driven through ``validate_read_metadata``.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_rejects_model_geographic_with_projected_key():
+    """The exact scenario from issue #2417: ModelType=geographic but
+    ProjectedCSTypeGeoKey=4326 set, GeographicTypeGeoKey absent."""
+    with pytest.raises(InconsistentGeoKeysError) as excinfo:
+        validate_read_metadata({
+            'model_type': 2,
+            'projected_cs_type': 4326,
+            'geographic_type': None,
+        })
+    msg = str(excinfo.value)
+    assert 'ModelTypeGeoKey=geographic' in msg
+    assert '4326' in msg
+    assert '#2417' in msg
+
+
+def test_validate_rejects_model_projected_with_only_geographic_key():
+    """ModelType=projected but only GeographicTypeGeoKey is populated."""
+    with pytest.raises(InconsistentGeoKeysError) as excinfo:
+        validate_read_metadata({
+            'model_type': 1,
+            'projected_cs_type': None,
+            'geographic_type': 4326,
+        })
+    msg = str(excinfo.value)
+    assert 'ModelTypeGeoKey=projected' in msg
+    assert '4326' in msg
+
+
+def test_validate_accepts_both_type_keys_with_different_epsg():
+    """Both ProjectedCSTypeGeoKey and GeographicTypeGeoKey populated with
+    different EPSG codes is the normal projected GeoTIFF shape (#2602):
+    the geographic key names the base geographic CRS and the projected
+    key the CRS the coordinates live in. The validator must not reject
+    it."""
+    validate_read_metadata({
+        'model_type': 1,
+        'projected_cs_type': 32633,
+        'geographic_type': 4326,
+    })
+
+
+def test_validate_accepts_projected_with_unexpected_base_geographic():
+    """Acceptance does not cross-validate the projected code against the
+    declared base geographic key (#2602). A projected model that names a
+    base geographic CRS the projection was not actually built on (here
+    UTM 32633 over NAD27 4267 instead of WGS84) still passes: the reader
+    takes the projected code as the file's CRS and treats the geographic
+    key as the base, by design. This is the one shape the old Case 3
+    rejected; the silent-accept is deliberate, not an oversight."""
+    validate_read_metadata({
+        'model_type': 1,
+        'projected_cs_type': 32633,
+        'geographic_type': 4267,
+    })
+
+
+def test_validate_passes_consistent_projected():
+    """ModelType=projected with a projected EPSG and no geographic key."""
+    validate_read_metadata({
+        'model_type': 1,
+        'projected_cs_type': 32633,
+        'geographic_type': None,
+    })
+
+
+def test_validate_passes_consistent_geographic():
+    """ModelType=geographic with a geographic EPSG and no projected key."""
+    validate_read_metadata({
+        'model_type': 2,
+        'projected_cs_type': None,
+        'geographic_type': 4326,
+    })
+
+
+def test_validate_passes_both_keys_with_same_epsg():
+    """Some legitimate writers stash the same code under both slots; the
+    check only rejects when the codes disagree."""
+    validate_read_metadata({
+        'model_type': 1,
+        'projected_cs_type': 32633,
+        'geographic_type': 32633,
+    })
+
+
+def test_validate_passes_user_defined_projected_with_geographic():
+    """``32767`` (user-defined) under the projected slot means the
+    projected code is not actually resolved -- the geographic key is
+    then the only resolved CRS source, which is not a contradiction."""
+    validate_read_metadata({
+        'model_type': 2,
+        'projected_cs_type': 32767,
+        'geographic_type': 4326,
+    })
+
+
+def test_validate_passes_user_defined_geographic_with_projected():
+    validate_read_metadata({
+        'model_type': 1,
+        'projected_cs_type': 32633,
+        'geographic_type': 32767,
+    })
+
+
+def test_validate_passes_no_geokey_context():
+    """A caller without any GeoKey context (e.g. VRT) short-circuits.
+    The check is opt-in to the context it consumes."""
+    validate_read_metadata({})
+
+
+def test_validate_passes_when_model_type_undefined():
+    """Some legitimate writers omit ModelTypeGeoKey entirely. The check
+    is not strict about that on its own; only the explicit conflicts
+    above raise."""
+    validate_read_metadata({
+        'model_type': 0,
+        'projected_cs_type': 4326,
+        'geographic_type': None,
+    })
+
+
+def test_validate_tolerates_float_geokey_values():
+    """``_parse_geokeys`` can stash float values for keys whose entries
+    point at the doubles section; the check coerces to int."""
+    with pytest.raises(InconsistentGeoKeysError):
+        validate_read_metadata({
+            'model_type': 2.0,
+            'projected_cs_type': 4326.0,
+            'geographic_type': None,
+        })
+
+
+def test_validate_ignores_non_numeric_geokey_values():
+    """A string value in the model_type slot (e.g. a corrupt parse) is
+    treated as 'not declared' rather than crashing the validator."""
+    # Should not raise even though projected_cs_type is set.
+    validate_read_metadata({
+        'model_type': 'garbage',
+        'projected_cs_type': 4326,
+        'geographic_type': None,
+    })
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        float('nan'),
+        float('inf'),
+        float('-inf'),
+    ],
+    ids=["nan", "inf", "-inf"],
+)
+def test_validate_tolerates_nan_or_inf_geokey_values(bad_value):
+    """Hand-built context dicts with NaN / inf floats in a GeoKey slot
+    must not crash the validator. ``int(float('nan'))`` raises
+    ValueError and ``int(float('inf'))`` raises OverflowError; the
+    check catches both and treats the slot as 'not declared'.
+
+    The reader never produces these for type-code GeoKeys (those parse
+    as TIFF SHORT ints), but ``validate_read_metadata`` is a public-ish
+    helper that takes an arbitrary dict, so the validator stays robust
+    against garbage callers. See PR review follow-up on issue #2417.
+    """
+    # bad model_type with an otherwise-conflict-looking projected slot.
+    validate_read_metadata({
+        'model_type': bad_value,
+        'projected_cs_type': 4326,
+        'geographic_type': None,
+    })
+    # bad projected_cs_type alongside a valid geographic slot.
+    validate_read_metadata({
+        'model_type': 2,
+        'projected_cs_type': bad_value,
+        'geographic_type': 4326,
+    })
+    # bad geographic_type.
+    validate_read_metadata({
+        'model_type': 1,
+        'projected_cs_type': 32633,
+        'geographic_type': bad_value,
+    })
+
+
+# ---------------------------------------------------------------------------
+# Full-stack integration: the bug's exact reproducer through open_geotiff().
+# ---------------------------------------------------------------------------
+
+
+def _write_tiff_with_geokeys(
+    path: str,
+    *,
+    model_type: int,
+    projected_cs_type: int | None,
+    geographic_type: int | None,
+) -> None:
+    n_keys = 1 + int(projected_cs_type is not None) + int(geographic_type is not None)
+    gkd = [1, 1, 0, n_keys]
+    gkd.extend([1024, 0, 1, model_type])
+    if projected_cs_type is not None:
+        gkd.extend([3072, 0, 1, projected_cs_type])
+    if geographic_type is not None:
+        gkd.extend([2048, 0, 1, geographic_type])
+    write_minimal_tiff(path, geokeys=gkd)
+
+
+def test_open_geotiff_rejects_model_geographic_with_projected_key(tmp_path):
+    """The exact reproducer from issue #2417. A TIFF declaring
+    ``ModelTypeGeoKey=geographic`` with ``ProjectedCSTypeGeoKey=4326``
+    used to surface ``attrs['crs']=4326`` silently; now it raises."""
+    path = tmp_path / "tmp_2417_model_geographic.tif"
+    _write_tiff_with_geokeys(
+        str(path),
+        model_type=2,            # geographic
+        projected_cs_type=4326,  # but projected key populated
+        geographic_type=None,
+    )
+    with pytest.raises(InconsistentGeoKeysError):
+        open_geotiff(str(path))
+
+
+def test_open_geotiff_rejects_model_projected_with_only_geographic_key(tmp_path):
+    path = tmp_path / "tmp_2417_model_projected.tif"
+    _write_tiff_with_geokeys(
+        str(path),
+        model_type=1,            # projected
+        projected_cs_type=None,  # but only geographic key populated
+        geographic_type=4326,
+    )
+    with pytest.raises(InconsistentGeoKeysError):
+        open_geotiff(str(path))
+
+
+def test_open_geotiff_accepts_both_keys_with_different_epsg(tmp_path):
+    """A projected GeoTIFF that also carries its base geographic CRS
+    (e.g. UTM 32633 over WGS84 4326) must read, with the projected code
+    surfacing in ``attrs['crs']`` (#2602). Both keys populated with
+    different EPSG codes is the normal shape, not a contradiction."""
+    path = tmp_path / "tmp_2602_both_keys_projected_over_geographic.tif"
+    _write_tiff_with_geokeys(
+        str(path),
+        model_type=1,
+        projected_cs_type=32633,
+        geographic_type=4326,
+    )
+    da = open_geotiff(str(path))
+    assert da.shape == (4, 4)
+    # Projected code wins; the geographic key is the base geographic CRS.
+    assert da.attrs.get('crs') == 32633
+
+
+def test_open_geotiff_accepts_consistent_projected(tmp_path):
+    """Control: a TIFF with a consistent projected ModelType + projected
+    EPSG should still read cleanly."""
+    path = tmp_path / "tmp_2417_consistent_projected.tif"
+    _write_tiff_with_geokeys(
+        str(path),
+        model_type=1,
+        projected_cs_type=32633,
+        geographic_type=None,
+    )
+    da = open_geotiff(str(path))
+    assert da.shape == (4, 4)
+    # The reader publishes the projected EPSG verbatim.
+    assert da.attrs.get('crs') == 32633
+
+
+def test_open_geotiff_accepts_consistent_geographic(tmp_path):
+    path = tmp_path / "tmp_2417_consistent_geographic.tif"
+    _write_tiff_with_geokeys(
+        str(path),
+        model_type=2,
+        projected_cs_type=None,
+        geographic_type=4326,
+    )
+    da = open_geotiff(str(path))
+    assert da.shape == (4, 4)
+    assert da.attrs.get('crs') == 4326

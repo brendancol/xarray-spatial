@@ -4,9 +4,46 @@ import numpy as np
 import xarray as xr
 from xarray import DataArray
 
-from xrspatial.utils import ngjit
+try:
+    import cupy
+except ImportError:
+    class cupy(object):
+        ndarray = False
 
-# TODO: change parameters to take agg instead of height / width
+try:
+    import dask.array as da
+except ImportError:
+    da = None
+
+from xrspatial.utils import (
+    ArrayTypeFunctionMapping,
+    _validate_scalar,
+    has_cuda_and_cupy,
+    is_cupy_array,
+    ngjit,
+)
+
+# Upper bound on bump count to prevent accidental OOM from the default
+# w*h//10 heuristic.  16 bytes per bump (int32 loc pair + float64 height),
+# so 10M bumps ~ 160 MB.
+_MAX_DEFAULT_COUNT = 10_000_000
+
+
+def _available_memory_bytes():
+    """Best-effort estimate of available memory in bytes."""
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        import psutil
+        return psutil.virtual_memory().available
+    except (ImportError, AttributeError):
+        pass
+    return 2 * 1024 ** 3
 
 
 @ngjit
@@ -20,19 +57,119 @@ def _finish_bump(width, height, locs, heights, spread):
         z = heights[i]
         out[y, x] = out[y, x] + z
         if s > 0:
-            for nx in range(max(x - spread, 0), min(x + spread, width)):
-                for ny in range(max(y - spread, 0), min(y + spread, height)):
+            # Capture the deposited centre height once.  Reading the mutable
+            # out[y, x] inside the loop (and letting the d2==0 term double it)
+            # made the spread order-dependent and left a single bump lopsided
+            # toward +x/+y.  Skip the centre and use the fixed amplitude so the
+            # decay is radially symmetric.
+            base = out[y, x]
+            for nx in range(max(x - spread, 0), min(x + spread + 1, width)):
+                for ny in range(max(y - spread, 0), min(y + spread + 1, height)):
                     d2 = (nx - x) * (nx - x) + (ny - y) * (ny - y)
-                    if d2 <= s:
-                        out[ny, nx] = out[ny, nx] + (out[y, x] * (d2 / s))
+                    if 0 < d2 <= s:
+                        out[ny, nx] = out[ny, nx] + (base * ((s - d2) / s))
     return out
 
 
-def bump(width: int,
-         height: int,
+def _bump_numpy(data, width, height, locs, heights, spread):
+    return _finish_bump(width, height, locs, heights, spread)
+
+
+def _bump_cupy(data, width, height, locs, heights, spread):
+    return cupy.asarray(_finish_bump(width, height, locs, heights, spread))
+
+
+def _partition_bumps(data, locs, heights, spread):
+    """Split bumps into per-chunk subsets so closures stay small.
+
+    Returns a dict mapping ``(yi, xi)`` chunk indices to
+    ``(local_locs, local_heights)`` pairs (or *None* when a chunk has
+    no bumps).  Coordinates in *local_locs* are relative to the chunk
+    origin.  Bumps whose spread overlaps a chunk boundary are assigned
+    to the chunk that contains their centre pixel.
+    """
+    y_offsets = np.concatenate([[0], np.cumsum(data.chunks[0])])
+    x_offsets = np.concatenate([[0], np.cumsum(data.chunks[1])])
+    ny = len(data.chunks[0])
+    nx = len(data.chunks[1])
+
+    partitions = {}
+    for yi in range(ny):
+        y0, y1 = int(y_offsets[yi]), int(y_offsets[yi + 1])
+        for xi in range(nx):
+            x0, x1 = int(x_offsets[xi]), int(x_offsets[xi + 1])
+            mask = ((locs[:, 0] >= x0) & (locs[:, 0] < x1) &
+                    (locs[:, 1] >= y0) & (locs[:, 1] < y1))
+            if np.any(mask):
+                local_locs = locs[mask].copy()
+                local_locs[:, 0] -= x0
+                local_locs[:, 1] -= y0
+                partitions[(yi, xi)] = (local_locs, heights[mask].copy())
+            else:
+                partitions[(yi, xi)] = None
+    return partitions
+
+
+def _bump_dask_numpy(data, width, height, locs, heights, spread):
+    import dask
+
+    partitions = _partition_bumps(data, locs, heights, spread)
+    rows = []
+    for yi, ch in enumerate(data.chunks[0]):
+        row = []
+        for xi, cw in enumerate(data.chunks[1]):
+            ch_int, cw_int = int(ch), int(cw)
+            part = partitions[(yi, xi)]
+            if part is None:
+                row.append(da.zeros((ch_int, cw_int),
+                                    chunks=(ch_int, cw_int),
+                                    dtype=np.float64))
+            else:
+                p_locs, p_heights = part
+                delayed = dask.delayed(_finish_bump)(
+                    cw_int, ch_int, p_locs, p_heights, spread)
+                row.append(da.from_delayed(delayed,
+                                           shape=(ch_int, cw_int),
+                                           dtype=np.float64))
+        rows.append(row)
+    return da.block(rows)
+
+
+def _bump_dask_cupy(data, width, height, locs, heights, spread):
+    import dask
+
+    def _finish_bump_cupy(cw, ch, p_locs, p_heights, spread):
+        return cupy.asarray(_finish_bump(cw, ch, p_locs, p_heights, spread))
+
+    partitions = _partition_bumps(data, locs, heights, spread)
+    rows = []
+    for yi, ch in enumerate(data.chunks[0]):
+        row = []
+        for xi, cw in enumerate(data.chunks[1]):
+            ch_int, cw_int = int(ch), int(cw)
+            part = partitions[(yi, xi)]
+            if part is None:
+                row.append(da.zeros((ch_int, cw_int),
+                                    chunks=(ch_int, cw_int),
+                                    dtype=np.float64))
+            else:
+                p_locs, p_heights = part
+                delayed = dask.delayed(_finish_bump_cupy)(
+                    cw_int, ch_int, p_locs, p_heights, spread)
+                row.append(da.from_delayed(delayed,
+                                           shape=(ch_int, cw_int),
+                                           dtype=np.float64))
+        rows.append(row)
+    return da.block(rows)
+
+
+def bump(width: int = None,
+         height: int = None,
          count: Optional[int] = None,
          height_func=None,
-         spread: int = 1) -> xr.DataArray:
+         spread: int = 1,
+         *,
+         agg: xr.DataArray = None) -> xr.DataArray:
     """
     Generate a simple bump map to simulate the appearance of land
     features.
@@ -43,10 +180,12 @@ def bump(width: int,
 
     Parameters
     ----------
-    width : int
+    width : int, optional
         Total width, in pixels, of the image.
-    height : int
+        Not required when ``agg`` is provided.
+    height : int, optional
         Total height, in pixels, of the image.
+        Not required when ``agg`` is provided.
     count : int
         Number of bumps to generate.
     height_func : function which takes x, y and returns a height value
@@ -54,6 +193,10 @@ def bump(width: int,
         elevations.
     spread : int, default=1
         Number of pixels to spread on all sides.
+    agg : xarray.DataArray, optional
+        Template raster whose shape, chunks, and backend (NumPy, CuPy,
+        Dask, Dask+CuPy) determine the output type.  When provided,
+        ``width`` and ``height`` are inferred from ``agg.shape``.
 
     Returns
     -------
@@ -194,21 +337,77 @@ def bump(width: int,
             Description:  Example Bump Map
             units:        km
     """
-    linx = range(width)
-    liny = range(height)
+    if agg is not None:
+        h, w = agg.shape
+    else:
+        _validate_scalar(width, func_name='bump', name='width',
+                         dtype=int, min_val=1)
+        _validate_scalar(height, func_name='bump', name='height',
+                         dtype=int, min_val=1)
+        w, h = width, height
+
+    linx = range(w)
+    liny = range(h)
 
     if count is None:
-        count = width * height // 10
+        count = min(w * h // 10, _MAX_DEFAULT_COUNT)
+
+    # The dask backends build the output lazily per-chunk, so the full
+    # raster never lives in memory at once.  Only guard against raster
+    # size when we will actually materialize it.
+    materializes_raster = (
+        agg is None
+        or isinstance(agg.data, np.ndarray)
+        or (has_cuda_and_cupy() and is_cupy_array(agg.data))
+    )
+
+    # Budget: 16 bytes per bump (2 x int32 coord + float64 height) plus
+    # the full output raster at 8 bytes/cell (float64) when the backend
+    # will materialize it.  Guard both so a huge w*h cannot allocate
+    # multi-TB arrays silently.
+    bump_bytes = count * 16
+    raster_bytes = w * h * 8 if materializes_raster else 0
+    required_bytes = bump_bytes + raster_bytes
+    available = _available_memory_bytes()
+    if required_bytes > 0.5 * available:
+        if raster_bytes > 0:
+            detail = (
+                f"({raster_bytes / 1e9:.1f} GB for the output raster plus "
+                f"{bump_bytes / 1e9:.1f} GB for location/height arrays)"
+            )
+            hint = "Use a smaller raster or pass a dask-backed agg."
+        else:
+            detail = "for location/height arrays"
+            hint = "Pass a smaller count explicitly."
+        raise MemoryError(
+            f"bump() with width={w:,}, height={h:,}, count={count:,} "
+            f"requires ~{required_bytes / 1e9:.1f} GB {detail}, "
+            f"but only {available / 1e9:.1f} GB is available.  "
+            f"{hint}"
+        )
 
     if height_func is None:
-        height_func = lambda bumps: np.ones(len(bumps)) # noqa
+        height_func = lambda bumps: np.ones(len(bumps))  # noqa
 
     # create 2d array of random x, y for bump locations
-    locs = np.empty((count, 2), dtype=np.uint16)
+    locs = np.empty((count, 2), dtype=np.int32)
     locs[:, 0] = np.random.choice(linx, count)
     locs[:, 1] = np.random.choice(liny, count)
 
     heights = height_func(locs)
 
-    bumps = _finish_bump(width, height, locs, heights, spread)
-    return DataArray(bumps, dims=['y', 'x'], attrs=dict(res=1))
+    if agg is not None:
+        mapper = ArrayTypeFunctionMapping(
+            numpy_func=_bump_numpy,
+            cupy_func=_bump_cupy,
+            dask_func=_bump_dask_numpy,
+            dask_cupy_func=_bump_dask_cupy,
+        )
+        out = mapper(agg)(agg.data, w, h, locs, heights, spread)
+        return DataArray(out,
+                         coords=agg.coords,
+                         dims=agg.dims,
+                         attrs=dict(res=1))
+    else:
+        bumps = _finish_bump(w, h, locs, heights, spread)
+        return DataArray(bumps, dims=['y', 'x'], attrs=dict(res=1))

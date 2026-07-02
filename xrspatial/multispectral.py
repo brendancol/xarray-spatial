@@ -9,8 +9,9 @@ import xarray as xr
 from numba import cuda
 from xarray import DataArray
 
-from xrspatial.utils import (ArrayTypeFunctionMapping, cuda_args, ngjit, not_implemented_func,
-                             validate_arrays)
+from xrspatial.dataset_support import supports_dataset_bands
+from xrspatial.utils import (ArrayTypeFunctionMapping, _dask_task_name_kwargs, _validate_raster,
+                             cuda_args, ngjit, validate_arrays)
 
 # 3rd-party
 try:
@@ -23,6 +24,79 @@ try:
     import dask.array as da
 except ImportError:
     da = None
+
+
+# Memory guard for the eager true_color() backends.
+# _true_color_numpy / _true_color_cupy materialize an (H, W, 4) uint8 cube
+# plus three (H, W) float32 normalize buffers and one (H, W) alpha buffer
+# from np.where -- roughly 17 bytes per input pixel at peak.  Round up to
+# a comfortable budget that also covers the temporaries inside
+# _normalize_data_cpu (val - min_val, exp(...), etc.).  Dask paths build
+# the cube lazily via da.stack and don't need the guard.
+_TRUE_COLOR_BYTES_PER_PIXEL = 24
+
+
+def _available_memory_bytes():
+    """Best-effort estimate of available host memory in bytes."""
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024  # kB -> bytes
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        import psutil
+        return psutil.virtual_memory().available
+    except (ImportError, AttributeError):
+        pass
+    return 2 * 1024 ** 3  # 2 GB fallback
+
+
+def _available_gpu_memory_bytes():
+    """Best-effort estimate of free GPU memory in bytes.
+
+    Returns 0 when the query fails -- callers treat that as a sentinel
+    meaning "no GPU info, skip the guard".
+    """
+    try:
+        import cupy as _cp
+        free, _total = _cp.cuda.runtime.memGetInfo()
+        return int(free)
+    except Exception:
+        return 0
+
+
+def _check_true_color_memory(rows, cols):
+    """Raise MemoryError if the numpy true_color buffers exceed 50% of RAM."""
+    required = int(rows) * int(cols) * _TRUE_COLOR_BYTES_PER_PIXEL
+    available = _available_memory_bytes()
+    if required > 0.5 * available:
+        raise MemoryError(
+            f"true_color() on a {rows}x{cols} raster needs "
+            f"~{required / 1e9:.1f} GB of working memory, but only "
+            f"~{available / 1e9:.1f} GB is available. "
+            f"Use a smaller raster or a dask-backed DataArray."
+        )
+
+
+def _check_true_color_gpu_memory(rows, cols):
+    """Raise MemoryError if the cupy true_color buffers exceed 50% of free VRAM.
+
+    Skipped silently when the free-memory query fails -- the cupy
+    allocator will surface its own error in that case.
+    """
+    available = _available_gpu_memory_bytes()
+    if available <= 0:
+        return
+    required = int(rows) * int(cols) * _TRUE_COLOR_BYTES_PER_PIXEL
+    if required > 0.5 * available:
+        raise MemoryError(
+            f"true_color() on a {rows}x{cols} raster needs "
+            f"~{required / 1e9:.1f} GB of GPU working memory, but only "
+            f"~{available / 1e9:.1f} GB is free on the active device. "
+            f"Use a smaller raster or a dask+cupy DataArray."
+        )
 
 
 @ngjit
@@ -57,7 +131,8 @@ def _arvi_gpu(nir_data, red_data, blue_data, out):
 
 def _arvi_dask(nir_data, red_data, blue_data):
     out = da.map_blocks(_arvi_cpu, nir_data, red_data, blue_data,
-                        meta=np.array(()))
+                        meta=np.array(()),
+                        **_dask_task_name_kwargs('xrspatial.arvi'))
     return out
 
 
@@ -71,10 +146,12 @@ def _arvi_cupy(nir_data, red_data, blue_data):
 
 def _arvi_dask_cupy(nir_data, red_data, blue_data):
     out = da.map_blocks(_arvi_cupy, nir_data, red_data, blue_data,
-                        dtype=cupy.float32, meta=cupy.array(()))
+                        dtype=cupy.float32, meta=cupy.array(()),
+                        **_dask_task_name_kwargs('xrspatial.arvi'))
     return out
 
 
+@supports_dataset_bands(nir='nir_agg', red='red_agg', blue='blue_agg')
 def arvi(nir_agg: xr.DataArray,
          red_agg: xr.DataArray,
          blue_agg: xr.DataArray,
@@ -94,6 +171,12 @@ def arvi(nir_agg: xr.DataArray,
         2D array of blue band data.
     name : str, default='arvi'
         Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        arvi(ds, nir='B8', red='B4', blue='B2')
 
     Returns
     -------
@@ -145,6 +228,10 @@ def arvi(nir_agg: xr.DataArray,
          [ 0.02488688  0.00816024  0.00068681  0.02650602]]
     """
 
+    _validate_raster(nir_agg, func_name='arvi', name='nir_agg')
+    _validate_raster(red_agg, func_name='arvi', name='red_agg')
+    _validate_raster(blue_agg, func_name='arvi', name='blue_agg')
+
     validate_arrays(red_agg, nir_agg, blue_agg)
 
     mapper = ArrayTypeFunctionMapping(numpy_func=_arvi_cpu,
@@ -195,7 +282,8 @@ def _evi_gpu(nir_data, red_data, blue_data, c1, c2, soil_factor, gain, out):
 
 def _evi_dask(nir_data, red_data, blue_data, c1, c2, soil_factor, gain):
     out = da.map_blocks(_evi_cpu, nir_data, red_data, blue_data,
-                        c1, c2, soil_factor, gain, meta=np.array(()))
+                        c1, c2, soil_factor, gain, meta=np.array(()),
+                        **_dask_task_name_kwargs('xrspatial.evi'))
     return out
 
 
@@ -211,10 +299,12 @@ def _evi_cupy(nir_data, red_data, blue_data, c1, c2, soil_factor, gain):
 def _evi_dask_cupy(nir_data, red_data, blue_data, c1, c2, soil_factor, gain):
     out = da.map_blocks(_evi_cupy, nir_data, red_data, blue_data,
                         c1, c2, soil_factor, gain,
-                        dtype=cupy.float32, meta=cupy.array(()))
+                        dtype=cupy.float32, meta=cupy.array(()),
+                        **_dask_task_name_kwargs('xrspatial.evi'))
     return out
 
 
+@supports_dataset_bands(nir='nir_agg', red='red_agg', blue='blue_agg')
 def evi(nir_agg: xr.DataArray,
         red_agg: xr.DataArray,
         blue_agg: xr.DataArray,
@@ -246,6 +336,12 @@ def evi(nir_agg: xr.DataArray,
         Amplitude adjustment factor.
     name : str, default='evi'
         Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        evi(ds, nir='B8', red='B4', blue='B2')
 
     Returns
     -------
@@ -296,6 +392,10 @@ def evi(nir_agg: xr.DataArray,
          [11.818182   3.837838   0.6185031  1.3744428]
          [-8.53211    5.486726   0.8394608  3.5043988]]
     """
+
+    _validate_raster(nir_agg, func_name='evi', name='nir_agg')
+    _validate_raster(red_agg, func_name='evi', name='red_agg')
+    _validate_raster(blue_agg, func_name='evi', name='blue_agg')
 
     if not red_agg.shape == nir_agg.shape == blue_agg.shape:
         raise ValueError("input layers expected to have equal shapes")
@@ -356,7 +456,8 @@ def _gci_gpu(nir_data, green_data, out):
 
 
 def _gci_dask(nir_data, green_data):
-    out = da.map_blocks(_gci_cpu, nir_data, green_data, meta=np.array(()))
+    out = da.map_blocks(_gci_cpu, nir_data, green_data, meta=np.array(()),
+                        **_dask_task_name_kwargs('xrspatial.gci'))
     return out
 
 
@@ -370,10 +471,12 @@ def _gci_cupy(nir_data, green_data):
 
 def _gci_dask_cupy(nir_data, green_data):
     out = da.map_blocks(_gci_cupy, nir_data, green_data,
-                        dtype=cupy.float32, meta=cupy.array(()))
+                        dtype=cupy.float32, meta=cupy.array(()),
+                        **_dask_task_name_kwargs('xrspatial.gci'))
     return out
 
 
+@supports_dataset_bands(nir='nir_agg', green='green_agg')
 def gci(nir_agg: xr.DataArray,
         green_agg: xr.DataArray,
         name='gci'):
@@ -390,6 +493,12 @@ def gci(nir_agg: xr.DataArray,
         2D array of green band data.
     name : str, default='gci'
         Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        gci(ds, nir='B8', green='B3')
 
     Returns
     -------
@@ -434,6 +543,9 @@ def gci(nir_agg: xr.DataArray,
          [0.34822243 0.28270411 0.29641694 0.359375  ]]
     """
 
+    _validate_raster(nir_agg, func_name='gci', name='nir_agg')
+    _validate_raster(green_agg, func_name='gci', name='green_agg')
+
     validate_arrays(nir_agg, green_agg)
 
     mapper = ArrayTypeFunctionMapping(numpy_func=_gci_cpu,
@@ -451,6 +563,7 @@ def gci(nir_agg: xr.DataArray,
 
 
 # NBR ----------
+@supports_dataset_bands(nir='nir_agg', swir2='swir2_agg')
 def nbr(nir_agg: xr.DataArray,
         swir2_agg: xr.DataArray,
         name='nbr'):
@@ -462,12 +575,18 @@ def nbr(nir_agg: xr.DataArray,
     ----------
     nir_agg : xr.DataArray
         2D array of near-infrared band.
-    swir_agg : xr.DataArray
+    swir2_agg : xr.DataArray
         2D array of shortwave infrared band.
         (Landsat 4-7: Band 6)
         (Landsat 8: Band 7)
     name : str, default='nbr'
         Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        nbr(ds, nir='B8', swir2='B12')
 
     Returns
     -------
@@ -511,6 +630,9 @@ def nbr(nir_agg: xr.DataArray,
          [-0.10823033 -0.14486392 -0.12981689 -0.12121212]]
     """
 
+    _validate_raster(nir_agg, func_name='nbr', name='nir_agg')
+    _validate_raster(swir2_agg, func_name='nbr', name='swir2_agg')
+
     validate_arrays(nir_agg, swir2_agg)
 
     mapper = ArrayTypeFunctionMapping(
@@ -529,6 +651,7 @@ def nbr(nir_agg: xr.DataArray,
                      attrs=nir_agg.attrs)
 
 
+@supports_dataset_bands(swir1='swir1_agg', swir2='swir2_agg')
 def nbr2(swir1_agg: xr.DataArray,
          swir2_agg: xr.DataArray,
          name='nbr2'):
@@ -551,6 +674,12 @@ def nbr2(swir1_agg: xr.DataArray,
         (Landsat 8: Band 7)
     name : str default='nbr2'
         Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        nbr2(ds, swir1='B11', swir2='B12')
 
     Returns
     -------
@@ -595,6 +724,9 @@ def nbr2(swir1_agg: xr.DataArray,
          [0.07218576 0.06857143 0.067659   0.07520281]]
     """
 
+    _validate_raster(swir1_agg, func_name='nbr2', name='swir1_agg')
+    _validate_raster(swir2_agg, func_name='nbr2', name='swir2_agg')
+
     validate_arrays(swir1_agg, swir2_agg)
 
     mapper = ArrayTypeFunctionMapping(
@@ -614,6 +746,7 @@ def nbr2(swir1_agg: xr.DataArray,
 
 
 # NDVI ----------
+@supports_dataset_bands(nir='nir_agg', red='red_agg')
 def ndvi(nir_agg: xr.DataArray,
          red_agg: xr.DataArray,
          name='ndvi'):
@@ -630,6 +763,12 @@ def ndvi(nir_agg: xr.DataArray,
     name : str default='ndvi'
         Name of output DataArray.
 
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        ndvi(ds, nir='B8', red='B4')
+
     Returns
     -------
     ndvi_agg : xarray.DataArray of same type as inputs
@@ -644,16 +783,17 @@ def ndvi(nir_agg: xr.DataArray,
     --------
     .. plot::
        :include-source:
-        >>> from xrspatial.datasets import get_data
-        >>> data = get_data('sentinel-2')  # Open Example Data
-        >>> nir = data['NIR']
-        >>> red = data['Red']
-        >>> from xrspatial.multispectral import ndvi
-        >>> # Generate NDVI Aggregate Array
-        >>> ndvi_agg = ndvi(nir_agg=nir, red_agg=red)
-        >>> nir.plot(aspect=2, size=4)
-        >>> red.plot(aspect=2, size=4)
-        >>> ndvi_agg.plot(aspect=2, size=4)
+
+       >>> from xrspatial.datasets import get_data
+       >>> data = get_data('sentinel-2')  # Open Example Data
+       >>> nir = data['NIR']
+       >>> red = data['Red']
+       >>> from xrspatial.multispectral import ndvi
+       >>> # Generate NDVI Aggregate Array
+       >>> ndvi_agg = ndvi(nir_agg=nir, red_agg=red)
+       >>> nir.plot(aspect=2, size=4)
+       >>> red.plot(aspect=2, size=4)
+       >>> ndvi_agg.plot(aspect=2, size=4)
 
     .. sourcecode:: python
 
@@ -671,6 +811,9 @@ def ndvi(nir_agg: xr.DataArray,
          [0.065      0.05064194 0.04013491 0.06099571]
          [0.06709956 0.04431737 0.04496226 0.07792632]]
     """
+
+    _validate_raster(nir_agg, func_name='ndvi', name='nir_agg')
+    _validate_raster(red_agg, func_name='ndvi', name='red_agg')
 
     validate_arrays(nir_agg, red_agg)
 
@@ -691,6 +834,7 @@ def ndvi(nir_agg: xr.DataArray,
 
 
 # NDMI ----------
+@supports_dataset_bands(nir='nir_agg', swir1='swir1_agg')
 def ndmi(nir_agg: xr.DataArray,
          swir1_agg: xr.DataArray,
          name='ndmi'):
@@ -710,6 +854,12 @@ def ndmi(nir_agg: xr.DataArray,
         (Landsat 8: Band 6)
     name: str, default='ndmi'
         Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        ndmi(ds, nir='B8', swir1='B11')
 
     Returns
     -------
@@ -754,6 +904,9 @@ def ndmi(nir_agg: xr.DataArray,
          [-0.17901748 -0.21133603 -0.19575651 -0.19464068]]
     """
 
+    _validate_raster(nir_agg, func_name='ndmi', name='nir_agg')
+    _validate_raster(swir1_agg, func_name='ndmi', name='swir1_agg')
+
     validate_arrays(nir_agg, swir1_agg)
 
     mapper = ArrayTypeFunctionMapping(
@@ -770,6 +923,161 @@ def ndmi(nir_agg: xr.DataArray,
                      coords=nir_agg.coords,
                      dims=nir_agg.dims,
                      attrs=nir_agg.attrs)
+
+
+# NDWI ----------
+@supports_dataset_bands(green='green_agg', nir='nir_agg')
+def ndwi(green_agg: xr.DataArray,
+         nir_agg: xr.DataArray,
+         name='ndwi'):
+    """
+    Computes Normalized Difference Water Index (NDWI).
+
+    NDWI highlights open water features while suppressing vegetation
+    and soil signal.
+
+    Parameters
+    ----------
+    green_agg : xr.DataArray
+        2D array of green band data.
+        (Landsat 8: Band 3)
+        (Sentinel-2: Band 3)
+    nir_agg : xr.DataArray
+        2D array of near-infrared band data.
+        (Landsat 8: Band 5)
+        (Sentinel-2: Band 8)
+    name : str, default='ndwi'
+        Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        ndwi(ds, green='B3', nir='B8')
+
+    Returns
+    -------
+    ndwi_agg : xr.DataArray of same type as inputs
+        2D array of ndwi values in the range [-1, 1].
+        All other input attributes are preserved.
+
+    References
+    ----------
+        - McFeeters, S.K., 1996. The use of the Normalized Difference
+          Water Index (NDWI) in the delineation of open water features.
+          International Journal of Remote Sensing, 17(7), pp.1425-1432.
+
+    Examples
+    --------
+    .. sourcecode:: python
+
+        >>> import numpy as np
+        >>> import xarray as xr
+        >>> from xrspatial.multispectral import ndwi
+        >>> green = xr.DataArray(np.array([[600., 500.], [400., 300.]]))
+        >>> nir = xr.DataArray(np.array([[300., 400.], [500., 600.]]))
+        >>> ndwi(green, nir).values
+        array([[ 0.33333334,  0.11111111],
+               [-0.11111111, -0.33333334]], dtype=float32)
+    """
+
+    _validate_raster(green_agg, func_name='ndwi', name='green_agg')
+    _validate_raster(nir_agg, func_name='ndwi', name='nir_agg')
+
+    validate_arrays(green_agg, nir_agg)
+
+    mapper = ArrayTypeFunctionMapping(
+        numpy_func=_normalized_ratio_cpu,
+        dask_func=_run_normalized_ratio_dask,
+        cupy_func=_run_normalized_ratio_cupy,
+        dask_cupy_func=_run_normalized_ratio_dask_cupy,
+    )
+
+    out = mapper(green_agg)(green_agg.data.astype('f4'), nir_agg.data.astype('f4'))
+
+    return DataArray(out,
+                     name=name,
+                     coords=green_agg.coords,
+                     dims=green_agg.dims,
+                     attrs=green_agg.attrs)
+
+
+# MNDWI ----------
+@supports_dataset_bands(green='green_agg', swir='swir_agg')
+def mndwi(green_agg: xr.DataArray,
+          swir_agg: xr.DataArray,
+          name='mndwi'):
+    """
+    Computes Modified Normalized Difference Water Index (MNDWI).
+
+    MNDWI improves on NDWI for urban areas by substituting SWIR for
+    NIR, which reduces false positives from built-up surfaces.
+
+    Parameters
+    ----------
+    green_agg : xr.DataArray
+        2D array of green band data.
+        (Landsat 8: Band 3)
+        (Sentinel-2: Band 3)
+    swir_agg : xr.DataArray
+        2D array of shortwave infrared band data.
+        (Landsat 8: Band 6)
+        (Sentinel-2: Band 11)
+    name : str, default='mndwi'
+        Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        mndwi(ds, green='B3', swir='B11')
+
+    Returns
+    -------
+    mndwi_agg : xr.DataArray of same type as inputs
+        2D array of mndwi values in the range [-1, 1].
+        All other input attributes are preserved.
+
+    References
+    ----------
+        - Xu, H., 2006. Modification of normalised difference water
+          index (NDWI) to enhance open water features in remotely
+          sensed imagery. International Journal of Remote Sensing,
+          27(14), pp.3025-3033.
+
+    Examples
+    --------
+    .. sourcecode:: python
+
+        >>> import numpy as np
+        >>> import xarray as xr
+        >>> from xrspatial.multispectral import mndwi
+        >>> green = xr.DataArray(np.array([[600., 500.], [400., 300.]]))
+        >>> swir = xr.DataArray(np.array([[300., 400.], [500., 600.]]))
+        >>> mndwi(green, swir).values
+        array([[ 0.33333334,  0.11111111],
+               [-0.11111111, -0.33333334]], dtype=float32)
+    """
+
+    _validate_raster(green_agg, func_name='mndwi', name='green_agg')
+    _validate_raster(swir_agg, func_name='mndwi', name='swir_agg')
+
+    validate_arrays(green_agg, swir_agg)
+
+    mapper = ArrayTypeFunctionMapping(
+        numpy_func=_normalized_ratio_cpu,
+        dask_func=_run_normalized_ratio_dask,
+        cupy_func=_run_normalized_ratio_cupy,
+        dask_cupy_func=_run_normalized_ratio_dask_cupy,
+    )
+
+    out = mapper(green_agg)(green_agg.data.astype('f4'), swir_agg.data.astype('f4'))
+
+    return DataArray(out,
+                     name=name,
+                     coords=green_agg.coords,
+                     dims=green_agg.dims,
+                     attrs=green_agg.attrs)
 
 
 @ngjit
@@ -793,7 +1101,8 @@ def _normalized_ratio_cpu(arr1, arr2):
 
 def _run_normalized_ratio_dask(arr1, arr2):
     out = da.map_blocks(_normalized_ratio_cpu, arr1, arr2,
-                        meta=np.array(()))
+                        meta=np.array(()),
+                        **_dask_task_name_kwargs('xrspatial.normalized_ratio'))
     return out
 
 
@@ -819,7 +1128,8 @@ def _run_normalized_ratio_cupy(arr1, arr2):
 
 def _run_normalized_ratio_dask_cupy(arr1, arr2):
     out = da.map_blocks(_run_normalized_ratio_cupy, arr1, arr2,
-                        dtype=cupy.float32, meta=cupy.array(()))
+                        dtype=cupy.float32, meta=cupy.array(()),
+                        **_dask_task_name_kwargs('xrspatial.normalized_ratio'))
     return out
 
 
@@ -833,9 +1143,8 @@ def _savi_cpu(nir_data, red_data, soil_factor):
             red = red_data[y, x]
             numerator = nir - red
             soma = nir + red + soil_factor
-            denominator = soma * (1.0 + soil_factor)
-            if denominator != 0.0:
-                out[y, x] = numerator / denominator
+            if soma != 0.0:
+                out[y, x] = (numerator / soma) * (1.0 + soil_factor)
 
     return out
 
@@ -848,14 +1157,14 @@ def _savi_gpu(nir_data, red_data, soil_factor, out):
         red = red_data[y, x]
         numerator = nir - red
         soma = nir + red + soil_factor
-        denominator = soma * (nb.float32(1.0) + soil_factor)
-        if denominator != 0.0:
-            out[y, x] = numerator / denominator
+        if soma != 0.0:
+            out[y, x] = (numerator / soma) * (1.0 + soil_factor)
 
 
 def _savi_dask(nir_data, red_data, soil_factor):
     out = da.map_blocks(_savi_cpu, nir_data, red_data, soil_factor,
-                        meta=np.array(()))
+                        meta=np.array(()),
+                        **_dask_task_name_kwargs('xrspatial.savi'))
     return out
 
 
@@ -869,11 +1178,13 @@ def _savi_cupy(nir_data, red_data, soil_factor):
 
 def _savi_dask_cupy(nir_data, red_data, soil_factor):
     out = da.map_blocks(_savi_cupy, nir_data, red_data, soil_factor,
-                        dtype=cupy.float32, meta=cupy.array(()))
+                        dtype=cupy.float32, meta=cupy.array(()),
+                        **_dask_task_name_kwargs('xrspatial.savi'))
     return out
 
 
 # SAVI ----------
+@supports_dataset_bands(nir='nir_agg', red='red_agg')
 def savi(nir_agg: xr.DataArray,
          red_agg: xr.DataArray,
          soil_factor: float = 1.0,
@@ -894,6 +1205,12 @@ def savi(nir_agg: xr.DataArray,
         When set to zero, savi will return the same as ndvi.
     name : str, default='savi'
         Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        savi(ds, nir='B8', red='B4')
 
     Returns
     -------
@@ -936,6 +1253,9 @@ def savi(nir_agg: xr.DataArray,
          [0.0324884  0.02531194 0.02006069 0.03048781]
          [0.03353769 0.02215077 0.02247375 0.03895046]]
     """
+
+    _validate_raster(nir_agg, func_name='savi', name='nir_agg')
+    _validate_raster(red_agg, func_name='savi', name='red_agg')
 
     validate_arrays(red_agg, nir_agg)
 
@@ -988,7 +1308,8 @@ def _sipi_gpu(nir_data, red_data, blue_data, out):
 
 def _sipi_dask(nir_data, red_data, blue_data):
     out = da.map_blocks(_sipi_cpu, nir_data, red_data, blue_data,
-                        meta=np.array(()))
+                        meta=np.array(()),
+                        **_dask_task_name_kwargs('xrspatial.sipi'))
     return out
 
 
@@ -1002,10 +1323,12 @@ def _sipi_cupy(nir_data, red_data, blue_data):
 
 def _sipi_dask_cupy(nir_data, red_data, blue_data):
     out = da.map_blocks(_sipi_cupy, nir_data, red_data, blue_data,
-                        dtype=cupy.float32, meta=cupy.array(()))
+                        dtype=cupy.float32, meta=cupy.array(()),
+                        **_dask_task_name_kwargs('xrspatial.sipi'))
     return out
 
 
+@supports_dataset_bands(nir='nir_agg', red='red_agg', blue='blue_agg')
 def sipi(nir_agg: xr.DataArray,
          red_agg: xr.DataArray,
          blue_agg: xr.DataArray,
@@ -1024,6 +1347,12 @@ def sipi(nir_agg: xr.DataArray,
         2D array of blue band data.
     name: str, default='sipi'
         Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        sipi(ds, nir='B8', red='B4', blue='B2')
 
     Returns
     -------
@@ -1074,6 +1403,10 @@ def sipi(nir_agg: xr.DataArray,
          [1.2903225 1.6451613 1.9708029 1.3556485]]
     """
 
+    _validate_raster(nir_agg, func_name='sipi', name='nir_agg')
+    _validate_raster(red_agg, func_name='sipi', name='red_agg')
+    _validate_raster(blue_agg, func_name='sipi', name='blue_agg')
+
     validate_arrays(red_agg, nir_agg, blue_agg)
 
     mapper = ArrayTypeFunctionMapping(numpy_func=_sipi_cpu,
@@ -1117,14 +1450,15 @@ def _ebbi_gpu(red_data, swir_data, tir_data, out):
         swir = swir_data[y, x]
         tir = tir_data[y, x]
         numerator = swir - red
-        denominator = nb.int64(10) * sqrt(swir + tir)
+        denominator = 10.0 * sqrt(swir + tir)
         if denominator != 0.0:
             out[y, x] = numerator / denominator
 
 
 def _ebbi_dask(red_data, swir_data, tir_data):
     out = da.map_blocks(_ebbi_cpu, red_data, swir_data, tir_data,
-                        meta=np.array(()))
+                        meta=np.array(()),
+                        **_dask_task_name_kwargs('xrspatial.ebbi'))
     return out
 
 
@@ -1138,10 +1472,12 @@ def _ebbi_cupy(red_data, swir_data, tir_data):
 
 def _ebbi_dask_cupy(red_data, swir_data, tir_data):
     out = da.map_blocks(_ebbi_cupy, red_data, swir_data, tir_data,
-                        dtype=cupy.float32, meta=cupy.array(()))
+                        dtype=cupy.float32, meta=cupy.array(()),
+                        **_dask_task_name_kwargs('xrspatial.ebbi'))
     return out
 
 
+@supports_dataset_bands(red='red_agg', swir='swir_agg', tir='tir_agg')
 def ebbi(red_agg: xr.DataArray,
          swir_agg: xr.DataArray,
          tir_agg: xr.DataArray,
@@ -1160,6 +1496,12 @@ def ebbi(red_agg: xr.DataArray,
         2D array of thermal infrared band data.
     name: str, default='ebbi'
         Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        ebbi(ds, red='B4', swir='B11', tir='B10')
 
     Returns
     -------
@@ -1243,6 +1585,10 @@ def ebbi(red_agg: xr.DataArray,
             * lon      (lon) float64 0.0 1.0 2.0 3.0
     """
 
+    _validate_raster(red_agg, func_name='ebbi', name='red_agg')
+    _validate_raster(swir_agg, func_name='ebbi', name='swir_agg')
+    _validate_raster(tir_agg, func_name='ebbi', name='tir_agg')
+
     validate_arrays(red_agg, swir_agg, tir_agg)
 
     mapper = ArrayTypeFunctionMapping(numpy_func=_ebbi_cpu,
@@ -1294,17 +1640,43 @@ def _normalize_data_dask(data, pixel_max, c, th):
     max_val = da.nanmax(data)
     out = da.map_blocks(
         _normalize_data_cpu, data, min_val, max_val, pixel_max,
-        c, th, meta=np.array(())
+        c, th, meta=np.array(()),
+        **_dask_task_name_kwargs('xrspatial.true_color')
     )
     return out
 
 
 def _normalize_data_cupy(data, pixel_max, c, th):
-    raise NotImplementedError('Not Supported')
+    min_val = cupy.nanmin(data)
+    max_val = cupy.nanmax(data)
+    range_val = max_val - min_val
+    out = cupy.full(data.shape, cupy.nan, dtype=cupy.float32)
+    if range_val != 0:
+        norm = (data - min_val) / range_val
+        norm = 1 / (1 + cupy.exp(c * (th - norm)))
+        out = norm * pixel_max
+    return out
+
+
+def _normalize_data_cupy_block(data, min_val, max_val, pixel_max, c, th):
+    range_val = max_val - min_val
+    out = cupy.full(data.shape, cupy.nan, dtype=cupy.float32)
+    if range_val != 0:
+        norm = (data - min_val) / range_val
+        norm = 1 / (1 + cupy.exp(c * (th - norm)))
+        out = norm * pixel_max
+    return out
 
 
 def _normalize_data_dask_cupy(data, pixel_max, c, th):
-    raise NotImplementedError('Not Supported')
+    min_val = da.nanmin(data)
+    max_val = da.nanmax(data)
+    out = da.map_blocks(
+        _normalize_data_cupy_block, data, min_val, max_val, pixel_max,
+        c, th, meta=cupy.array(()),
+        **_dask_task_name_kwargs('xrspatial.true_color')
+    )
+    return out
 
 
 def _normalize_data(agg, pixel_max, c, th):
@@ -1317,9 +1689,11 @@ def _normalize_data(agg, pixel_max, c, th):
 
 
 def _true_color_numpy(r, g, b, nodata, c, th):
+    h, w = r.shape
+    _check_true_color_memory(h, w)
+
     a = np.where(np.logical_or(np.isnan(r), r <= nodata), 0, 255)
 
-    h, w = r.shape
     out = np.zeros((h, w, 4), dtype=np.uint8)
 
     pixel_max = 255
@@ -1341,6 +1715,35 @@ def _true_color_dask(r, g, b, nodata, c, th):
     green = (_normalize_data(g, pixel_max, c, th)).astype(np.uint8)
     blue = (_normalize_data(b, pixel_max, c, th)).astype(np.uint8)
 
+    out = da.stack([red, green, blue, alpha], axis=-1)
+    return out
+
+
+def _true_color_cupy(r, g, b, nodata, c, th):
+    h, w = r.shape
+    _check_true_color_gpu_memory(h, w)
+
+    pixel_max = 255
+    r_data = r.data
+    a = cupy.where(
+        cupy.logical_or(cupy.isnan(r_data), r_data <= nodata), 0, pixel_max
+    ).astype(cupy.uint8)
+    red = (_normalize_data(r, pixel_max, c, th)).astype(cupy.uint8)
+    green = (_normalize_data(g, pixel_max, c, th)).astype(cupy.uint8)
+    blue = (_normalize_data(b, pixel_max, c, th)).astype(cupy.uint8)
+    out = cupy.stack([red, green, blue, a], axis=-1)
+    return out
+
+
+def _true_color_dask_cupy(r, g, b, nodata, c, th):
+    pixel_max = 255
+    r_data = r.data
+    alpha = da.where(
+        da.logical_or(da.isnan(r_data), r_data <= nodata), 0, pixel_max
+    ).astype(cupy.uint8)
+    red = (_normalize_data(r, pixel_max, c, th)).astype(cupy.uint8)
+    green = (_normalize_data(g, pixel_max, c, th)).astype(cupy.uint8)
+    blue = (_normalize_data(b, pixel_max, c, th)).astype(cupy.uint8)
     out = da.stack([red, green, blue, alpha], axis=-1)
     return out
 
@@ -1378,6 +1781,14 @@ def true_color(r, g, b, nodata=1, c=10.0, th=0.125, name='true_color'):
         3D array true color image with dims of [y, x, band].
         All output attributes are copied from red band image.
 
+    Raises
+    ------
+    MemoryError
+        On the numpy and cupy backends, raised when the projected peak
+        working memory (about 24 bytes per input pixel) exceeds 50% of
+        available host RAM or free GPU VRAM.  Use a smaller raster or a
+        dask-backed DataArray for out-of-core processing.
+
     Examples
     --------
     .. plot::
@@ -1394,25 +1805,27 @@ def true_color(r, g, b, nodata=1, c=10.0, th=0.125, name='true_color'):
         >>> true_color_img.plot.imshow()
     """
 
+    _validate_raster(r, func_name='true_color', name='r')
+    _validate_raster(g, func_name='true_color', name='g')
+    _validate_raster(b, func_name='true_color', name='b')
+
+    validate_arrays(r, g, b)
+
     mapper = ArrayTypeFunctionMapping(
         numpy_func=_true_color_numpy,
         dask_func=_true_color_dask,
-        cupy_func=lambda *args: not_implemented_func(
-            *args, messages='true_color() does not support cupy backed DataArray',  # noqa
-        ),
-        dask_cupy_func=lambda *args: not_implemented_func(
-            *args, messages='true_color() does not support dask with cupy backed DataArray',  # noqa
-        ),
+        cupy_func=_true_color_cupy,
+        dask_cupy_func=_true_color_dask_cupy,
     )
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
         out = mapper(r)(r, g, b, nodata, c, th)
 
-    # TODO: output metadata: coords, dims, attrs
-    _dims = ['y', 'x', 'band']
-    _attrs = r.attrs
-    _coords = {'y': r['y'],
-               'x': r['x'],
+    # Preserve the input's spatial dims/coords instead of hardcoding y/x,
+    # then append the band dim.  Hardcoding raised KeyError on lat/lon
+    # rasters and dropped extra coords like spatial_ref (issue #3429).
+    _dims = [*r.dims, 'band']
+    _coords = {**{name: r[name] for name in r.coords},
                'band': [0, 1, 2, 3]}
 
     return DataArray(
@@ -1420,5 +1833,535 @@ def true_color(r, g, b, nodata=1, c=10.0, th=0.125, name='true_color'):
         name=name,
         dims=_dims,
         coords=_coords,
-        attrs=_attrs,
+        attrs=r.attrs,
     )
+
+
+# NDSI ----------
+@supports_dataset_bands(green='green_agg', swir1='swir1_agg')
+def ndsi(green_agg: xr.DataArray,
+         swir1_agg: xr.DataArray,
+         name='ndsi'):
+    """
+    Computes Normalized Difference Snow Index (NDSI).
+
+    NDSI separates snow and ice from clouds and other bright surfaces
+    by exploiting the high reflectance of snow in the green band and
+    low reflectance in the shortwave infrared.
+
+    Parameters
+    ----------
+    green_agg : xr.DataArray
+        2D array of green band data.
+        (Landsat 8: Band 3)
+        (Sentinel-2: Band 3)
+    swir1_agg : xr.DataArray
+        2D array of shortwave infrared band data.
+        (Landsat 8: Band 6)
+        (Sentinel-2: Band 11)
+    name : str, default='ndsi'
+        Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        ndsi(ds, green='B3', swir1='B11')
+
+    Returns
+    -------
+    ndsi_agg : xr.DataArray of same type as inputs
+        2D array of ndsi values in the range [-1, 1].
+        All other input attributes are preserved.
+
+    References
+    ----------
+        - Hall, D.K., Riggs, G.A. and Salomonson, V.V., 1995.
+          Development of methods for mapping global snow cover using
+          moderate resolution imaging spectroradiometer data.
+          Remote Sensing of Environment, 54(2), pp.127-140.
+
+    Examples
+    --------
+    .. sourcecode:: python
+
+        >>> import numpy as np
+        >>> import xarray as xr
+        >>> from xrspatial.multispectral import ndsi
+        >>> green = xr.DataArray(np.array([[600., 500.], [400., 300.]]))
+        >>> swir1 = xr.DataArray(np.array([[100., 200.], [300., 400.]]))
+        >>> ndsi(green, swir1).values
+        array([[ 0.71428573,  0.42857143],
+               [ 0.14285715, -0.14285715]], dtype=float32)
+    """
+
+    _validate_raster(green_agg, func_name='ndsi', name='green_agg')
+    _validate_raster(swir1_agg, func_name='ndsi', name='swir1_agg')
+
+    validate_arrays(green_agg, swir1_agg)
+
+    mapper = ArrayTypeFunctionMapping(
+        numpy_func=_normalized_ratio_cpu,
+        dask_func=_run_normalized_ratio_dask,
+        cupy_func=_run_normalized_ratio_cupy,
+        dask_cupy_func=_run_normalized_ratio_dask_cupy,
+    )
+
+    out = mapper(green_agg)(green_agg.data.astype('f4'), swir1_agg.data.astype('f4'))
+
+    return DataArray(out,
+                     name=name,
+                     coords=green_agg.coords,
+                     dims=green_agg.dims,
+                     attrs=green_agg.attrs)
+
+
+# NDBI ----------
+@supports_dataset_bands(swir1='swir1_agg', nir='nir_agg')
+def ndbi(swir1_agg: xr.DataArray,
+         nir_agg: xr.DataArray,
+         name='ndbi'):
+    """
+    Computes Normalized Difference Built-up Index (NDBI).
+
+    NDBI picks out built-up and urban areas by exploiting the higher
+    reflectance of impervious surfaces in SWIR relative to NIR.
+
+    Parameters
+    ----------
+    swir1_agg : xr.DataArray
+        2D array of shortwave infrared band data.
+        (Landsat 8: Band 6)
+        (Sentinel-2: Band 11)
+    nir_agg : xr.DataArray
+        2D array of near-infrared band data.
+        (Landsat 8: Band 5)
+        (Sentinel-2: Band 8)
+    name : str, default='ndbi'
+        Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        ndbi(ds, swir1='B11', nir='B8')
+
+    Returns
+    -------
+    ndbi_agg : xr.DataArray of same type as inputs
+        2D array of ndbi values in the range [-1, 1].
+        All other input attributes are preserved.
+
+    References
+    ----------
+        - Zha, Y., Gao, J. and Ni, S., 2003. Use of normalized
+          difference built-up index in automatically mapping urban
+          areas from TM imagery. International Journal of Remote
+          Sensing, 24(3), pp.583-594.
+
+    Examples
+    --------
+    .. sourcecode:: python
+
+        >>> import numpy as np
+        >>> import xarray as xr
+        >>> from xrspatial.multispectral import ndbi
+        >>> swir1 = xr.DataArray(np.array([[600., 500.], [400., 300.]]))
+        >>> nir = xr.DataArray(np.array([[300., 400.], [500., 600.]]))
+        >>> ndbi(swir1, nir).values
+        array([[ 0.33333334,  0.11111111],
+               [-0.11111111, -0.33333334]], dtype=float32)
+    """
+
+    _validate_raster(swir1_agg, func_name='ndbi', name='swir1_agg')
+    _validate_raster(nir_agg, func_name='ndbi', name='nir_agg')
+
+    validate_arrays(swir1_agg, nir_agg)
+
+    mapper = ArrayTypeFunctionMapping(
+        numpy_func=_normalized_ratio_cpu,
+        dask_func=_run_normalized_ratio_dask,
+        cupy_func=_run_normalized_ratio_cupy,
+        dask_cupy_func=_run_normalized_ratio_dask_cupy,
+    )
+
+    out = mapper(swir1_agg)(swir1_agg.data.astype('f4'), nir_agg.data.astype('f4'))
+
+    return DataArray(out,
+                     name=name,
+                     coords=swir1_agg.coords,
+                     dims=swir1_agg.dims,
+                     attrs=swir1_agg.attrs)
+
+
+# BAI ----------
+@ngjit
+def _bai_cpu(red_data, nir_data):
+    out = np.full(red_data.shape, np.nan, dtype=np.float32)
+    rows, cols = red_data.shape
+    for y in range(0, rows):
+        for x in range(0, cols):
+            red = red_data[y, x]
+            nir = nir_data[y, x]
+            dr = np.float32(0.1) - red
+            dn = np.float32(0.06) - nir
+            denominator = dr * dr + dn * dn
+            if denominator != 0.0:
+                out[y, x] = np.float32(1.0) / denominator
+    return out
+
+
+@cuda.jit
+def _bai_gpu(red_data, nir_data, out):
+    y, x = cuda.grid(2)
+    if y < out.shape[0] and x < out.shape[1]:
+        red = red_data[y, x]
+        nir = nir_data[y, x]
+        dr = nb.float32(0.1) - red
+        dn = nb.float32(0.06) - nir
+        denominator = dr * dr + dn * dn
+        if denominator != 0.0:
+            out[y, x] = nb.float32(1.0) / denominator
+
+
+def _bai_dask(red_data, nir_data):
+    out = da.map_blocks(_bai_cpu, red_data, nir_data,
+                        meta=np.array(()),
+                        **_dask_task_name_kwargs('xrspatial.bai'))
+    return out
+
+
+def _bai_cupy(red_data, nir_data):
+    griddim, blockdim = cuda_args(red_data.shape)
+    out = cupy.empty(red_data.shape, dtype='f4')
+    out[:] = cupy.nan
+    _bai_gpu[griddim, blockdim](red_data, nir_data, out)
+    return out
+
+
+def _bai_dask_cupy(red_data, nir_data):
+    out = da.map_blocks(_bai_cupy, red_data, nir_data,
+                        dtype=cupy.float32, meta=cupy.array(()),
+                        **_dask_task_name_kwargs('xrspatial.bai'))
+    return out
+
+
+@supports_dataset_bands(red='red_agg', nir='nir_agg')
+def bai(red_agg: xr.DataArray,
+        nir_agg: xr.DataArray,
+        name='bai'):
+    """
+    Computes Burn Area Index (BAI).
+
+    BAI measures the spectral distance of each pixel to a charcoal
+    reflectance point (red=0.1, NIR=0.06). Higher values indicate
+    recently burned areas. Unlike NBR, BAI works on the raw
+    reflectance values rather than a normalized difference.
+
+    Input bands should be in reflectance units (0-1 range). If your
+    data is in DN or scaled integers, divide by the appropriate scale
+    factor first.
+
+    Parameters
+    ----------
+    red_agg : xr.DataArray
+        2D array of red band reflectance data (0-1 range).
+    nir_agg : xr.DataArray
+        2D array of near-infrared band reflectance data (0-1 range).
+    name : str, default='bai'
+        Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        bai(ds, red='B4', nir='B8')
+
+    Returns
+    -------
+    bai_agg : xr.DataArray of same type as inputs
+        2D array of bai values. Higher values indicate burned areas.
+        All other input attributes are preserved.
+
+    References
+    ----------
+        - Chuvieco, E., Martin, M.P. and Palacios, A., 2002.
+          Assessment of different spectral conditions for the
+          detection of burned areas with Landsat TM data.
+          International Journal of Remote Sensing, 23(1), pp.71-85.
+
+    Examples
+    --------
+    .. sourcecode:: python
+
+        >>> import numpy as np
+        >>> import xarray as xr
+        >>> from xrspatial.multispectral import bai
+        >>> red = xr.DataArray(np.array([[0.1, 0.2], [0.3, 0.05]]))
+        >>> nir = xr.DataArray(np.array([[0.06, 0.3], [0.4, 0.02]]))
+        >>> bai(red, nir).values  # pixel (0,0) is at charcoal point
+        array([[       inf, 0.01686341, 0.00858369, 1111.1111  ]],
+              dtype=float32)
+    """
+
+    _validate_raster(red_agg, func_name='bai', name='red_agg')
+    _validate_raster(nir_agg, func_name='bai', name='nir_agg')
+
+    validate_arrays(red_agg, nir_agg)
+
+    mapper = ArrayTypeFunctionMapping(numpy_func=_bai_cpu,
+                                      dask_func=_bai_dask,
+                                      cupy_func=_bai_cupy,
+                                      dask_cupy_func=_bai_dask_cupy)
+
+    out = mapper(red_agg)(red_agg.data.astype('f4'), nir_agg.data.astype('f4'))
+
+    return DataArray(out,
+                     name=name,
+                     coords=red_agg.coords,
+                     dims=red_agg.dims,
+                     attrs=red_agg.attrs)
+
+
+# MSAVI2 ----------
+@ngjit
+def _msavi2_cpu(nir_data, red_data):
+    out = np.full(nir_data.shape, np.nan, dtype=np.float32)
+    rows, cols = nir_data.shape
+    for y in range(0, rows):
+        for x in range(0, cols):
+            nir = nir_data[y, x]
+            red = red_data[y, x]
+            term = (np.float32(2.0) * nir + np.float32(1.0))
+            discriminant = term * term - np.float32(8.0) * (nir - red)
+            if discriminant >= 0.0:
+                out[y, x] = (term - np.sqrt(discriminant)) / np.float32(2.0)
+    return out
+
+
+@cuda.jit
+def _msavi2_gpu(nir_data, red_data, out):
+    y, x = cuda.grid(2)
+    if y < out.shape[0] and x < out.shape[1]:
+        nir = nir_data[y, x]
+        red = red_data[y, x]
+        term = nb.float32(2.0) * nir + nb.float32(1.0)
+        discriminant = term * term - nb.float32(8.0) * (nir - red)
+        if discriminant >= nb.float32(0.0):
+            out[y, x] = (term - sqrt(discriminant)) / nb.float32(2.0)
+
+
+def _msavi2_dask(nir_data, red_data):
+    out = da.map_blocks(_msavi2_cpu, nir_data, red_data,
+                        meta=np.array(()),
+                        **_dask_task_name_kwargs('xrspatial.msavi2'))
+    return out
+
+
+def _msavi2_cupy(nir_data, red_data):
+    griddim, blockdim = cuda_args(nir_data.shape)
+    out = cupy.empty(nir_data.shape, dtype='f4')
+    out[:] = cupy.nan
+    _msavi2_gpu[griddim, blockdim](nir_data, red_data, out)
+    return out
+
+
+def _msavi2_dask_cupy(nir_data, red_data):
+    out = da.map_blocks(_msavi2_cupy, nir_data, red_data,
+                        dtype=cupy.float32, meta=cupy.array(()),
+                        **_dask_task_name_kwargs('xrspatial.msavi2'))
+    return out
+
+
+@supports_dataset_bands(nir='nir_agg', red='red_agg')
+def msavi2(nir_agg: xr.DataArray,
+           red_agg: xr.DataArray,
+           name='msavi2'):
+    """
+    Computes Modified Soil Adjusted Vegetation Index (MSAVI2).
+
+    MSAVI2 is a self-adjusting vegetation index that does not require
+    an empirical soil-brightness correction factor (L). It produces
+    less noisy results than SAVI in areas with sparse vegetation and
+    exposed soil.
+
+    Parameters
+    ----------
+    nir_agg : xr.DataArray
+        2D array of near-infrared band data.
+    red_agg : xr.DataArray
+        2D array of red band data.
+    name : str, default='msavi2'
+        Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        msavi2(ds, nir='B8', red='B4')
+
+    Returns
+    -------
+    msavi2_agg : xr.DataArray of same type as inputs
+        2D array of msavi2 values.
+        All other input attributes are preserved.
+
+    References
+    ----------
+        - Qi, J., Chehbouni, A., Huete, A.R., Kerr, Y.H. and
+          Sorooshian, S., 1994. A modified soil adjusted vegetation
+          index. Remote Sensing of Environment, 48(2), pp.119-126.
+
+    Examples
+    --------
+    .. sourcecode:: python
+
+        >>> import numpy as np
+        >>> import xarray as xr
+        >>> from xrspatial.multispectral import msavi2
+        >>> nir = xr.DataArray(np.array([[0.5, 0.3], [0.1, 0.4]]))
+        >>> red = xr.DataArray(np.array([[0.1, 0.2], [0.05, 0.3]]))
+        >>> msavi2(nir, red).values
+        array([[0.38729835, 0.08284271, 0.0248457 , 0.08284271]],
+              dtype=float32)
+    """
+
+    _validate_raster(nir_agg, func_name='msavi2', name='nir_agg')
+    _validate_raster(red_agg, func_name='msavi2', name='red_agg')
+
+    validate_arrays(nir_agg, red_agg)
+
+    mapper = ArrayTypeFunctionMapping(numpy_func=_msavi2_cpu,
+                                      dask_func=_msavi2_dask,
+                                      cupy_func=_msavi2_cupy,
+                                      dask_cupy_func=_msavi2_dask_cupy)
+
+    out = mapper(nir_agg)(nir_agg.data.astype('f4'), red_agg.data.astype('f4'))
+
+    return DataArray(out,
+                     name=name,
+                     coords=nir_agg.coords,
+                     dims=nir_agg.dims,
+                     attrs=nir_agg.attrs)
+
+
+# OSAVI ----------
+@ngjit
+def _osavi_cpu(nir_data, red_data):
+    out = np.full(nir_data.shape, np.nan, dtype=np.float32)
+    rows, cols = nir_data.shape
+    for y in range(0, rows):
+        for x in range(0, cols):
+            nir = nir_data[y, x]
+            red = red_data[y, x]
+            numerator = nir - red
+            denominator = nir + red + np.float32(0.16)
+            if denominator != 0.0:
+                out[y, x] = numerator / denominator
+    return out
+
+
+@cuda.jit
+def _osavi_gpu(nir_data, red_data, out):
+    y, x = cuda.grid(2)
+    if y < out.shape[0] and x < out.shape[1]:
+        nir = nir_data[y, x]
+        red = red_data[y, x]
+        numerator = nir - red
+        denominator = nir + red + nb.float32(0.16)
+        if denominator != 0.0:
+            out[y, x] = numerator / denominator
+
+
+def _osavi_dask(nir_data, red_data):
+    out = da.map_blocks(_osavi_cpu, nir_data, red_data,
+                        meta=np.array(()),
+                        **_dask_task_name_kwargs('xrspatial.osavi'))
+    return out
+
+
+def _osavi_cupy(nir_data, red_data):
+    griddim, blockdim = cuda_args(nir_data.shape)
+    out = cupy.empty(nir_data.shape, dtype='f4')
+    out[:] = cupy.nan
+    _osavi_gpu[griddim, blockdim](nir_data, red_data, out)
+    return out
+
+
+def _osavi_dask_cupy(nir_data, red_data):
+    out = da.map_blocks(_osavi_cupy, nir_data, red_data,
+                        dtype=cupy.float32, meta=cupy.array(()),
+                        **_dask_task_name_kwargs('xrspatial.osavi'))
+    return out
+
+
+@supports_dataset_bands(nir='nir_agg', red='red_agg')
+def osavi(nir_agg: xr.DataArray,
+          red_agg: xr.DataArray,
+          name='osavi'):
+    """
+    Computes Optimized Soil Adjusted Vegetation Index (OSAVI).
+
+    OSAVI uses a fixed soil-brightness correction factor of L=0.16,
+    chosen to work well across a range of soil conditions without
+    requiring per-scene tuning. It performs best in areas with sparse
+    to moderate vegetation cover.
+
+    Parameters
+    ----------
+    nir_agg : xr.DataArray
+        2D array of near-infrared band data.
+    red_agg : xr.DataArray
+        2D array of red band data.
+    name : str, default='osavi'
+        Name of output DataArray.
+
+    Alternatively, a single ``xr.Dataset`` may be passed as the first
+    argument with keyword arguments mapping band names to Dataset
+    variables. For example::
+
+        osavi(ds, nir='B8', red='B4')
+
+    Returns
+    -------
+    osavi_agg : xr.DataArray of same type as inputs
+        2D array of osavi values.
+        All other input attributes are preserved.
+
+    References
+    ----------
+        - Rondeaux, G., Steven, M. and Baret, F., 1996.
+          Optimization of soil-adjusted vegetation indices.
+          Remote Sensing of Environment, 55(2), pp.95-107.
+
+    Examples
+    --------
+    .. sourcecode:: python
+
+        >>> import numpy as np
+        >>> import xarray as xr
+        >>> from xrspatial.multispectral import osavi
+        >>> nir = xr.DataArray(np.array([[0.5, 0.3], [0.1, 0.4]]))
+        >>> red = xr.DataArray(np.array([[0.1, 0.2], [0.05, 0.3]]))
+        >>> osavi(nir, red).values
+        array([[0.5263158 , 0.15151516, 0.16129032, 0.11627907]],
+              dtype=float32)
+    """
+
+    _validate_raster(nir_agg, func_name='osavi', name='nir_agg')
+    _validate_raster(red_agg, func_name='osavi', name='red_agg')
+
+    validate_arrays(nir_agg, red_agg)
+
+    mapper = ArrayTypeFunctionMapping(numpy_func=_osavi_cpu,
+                                      dask_func=_osavi_dask,
+                                      cupy_func=_osavi_cupy,
+                                      dask_cupy_func=_osavi_dask_cupy)
+
+    out = mapper(nir_agg)(nir_agg.data.astype('f4'), red_agg.data.astype('f4'))
+
+    return DataArray(out,
+                     name=name,
+                     coords=nir_agg.coords,
+                     dims=nir_agg.dims,
+                     attrs=nir_agg.attrs)

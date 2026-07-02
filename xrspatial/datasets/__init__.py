@@ -5,10 +5,7 @@ try:
 except ImportError:
     da = None
 
-import datashader as ds
-import noise
 import numpy as np
-import pandas as pd
 import xarray as xr
 
 __all__ = [
@@ -81,6 +78,13 @@ def make_terrain(
         2D array of generated terrain values.
     """
 
+    try:
+        import noise
+    except ImportError:
+        raise ImportError(
+            "make_terrain requires the 'noise' package: pip install noise"
+        )
+
     if da is None:
         raise Exception("make terrain requires dask.Array (pip install dask)")
 
@@ -107,20 +111,19 @@ def make_terrain(
         .map_blocks(_func, dtype=np.float32)
     )
 
-    cvs = ds.Canvas(
-        x_range=(0, 500),
-        y_range=(0, 500),
-        plot_width=shape[1],
-        plot_height=shape[0],
-    )
-
-    hack_agg = cvs.points(pd.DataFrame({'x': [], 'y': []}), 'x', 'y')
+    # Build pixel-center coordinates
+    x_range = (0, 500)
+    y_range = (0, 500)
+    dx = (x_range[1] - x_range[0]) / shape[1]
+    dy = (y_range[1] - y_range[0]) / shape[0]
+    xs = np.linspace(x_range[0] + dx / 2, x_range[1] - dx / 2, shape[1])
+    ys = np.linspace(y_range[0] + dy / 2, y_range[1] - dy / 2, shape[0])
 
     agg = xr.DataArray(
         data,
         name='terrain',
-        coords=hack_agg.coords,
-        dims=hack_agg.dims,
+        coords={'y': ys, 'x': xs},
+        dims=['y', 'x'],
         attrs={'res': 1},
     )
 

@@ -1,0 +1,924 @@
+"""TIFF/BigTIFF header and IFD parsing."""
+from __future__ import annotations
+
+import math
+import struct
+from dataclasses import dataclass, field
+from typing import Any
+
+from ._dtypes import ASCII, RATIONAL, SRATIONAL, TIFF_TYPE_SIZES, TIFF_TYPE_STRUCT_CODES, UNDEFINED
+from ._errors import DuplicateIFDTagError
+
+# Caps for IFD entries that aren't pixel-data offset or byte-count
+# arrays. Pixel-data arrays (TileOffsets, StripOffsets, etc.) scale with
+# image dimensions and are exempt; metadata tags (DateTime, Software,
+# ImageDescription, GeoKeys, ColorMap when treated as pixel data, etc.)
+# should never come close to either bound. Two caps are enforced:
+#
+# - MAX_IFD_ENTRY_COUNT bounds the *number of elements* the parser will
+#   allocate as a Python tuple. struct.unpack_from of N items produces a
+#   tuple of N PyLong objects; even at small per-element byte sizes,
+#   the heap cost is dominated by the tuple, not the bytes.
+# - MAX_IFD_ENTRY_BYTES bounds the *value range read from the file*.
+#   This catches large-itemsize tags (DOUBLE = 8 bytes) where the count
+#   alone is misleading.
+#
+# Together they bound a single malformed entry's worst-case heap impact
+# to the lower of (~tens of MB tuple) and (1 MB raw bytes read).
+MAX_IFD_ENTRY_COUNT = 100_000
+MAX_IFD_ENTRY_BYTES = 1 << 18  # 256 KiB
+
+# Absolute ceiling for pixel-array tag (StripOffsets, StripByteCounts,
+# TileOffsets, TileByteCounts, ColorMap) `count` values. These tags scale
+# with image size and aren't subject to MAX_IFD_ENTRY_COUNT, but `count`
+# still drives a Python tuple allocation of `count` PyLong objects in
+# `_read_value`. Each PyLong is ~28 bytes, so 100M elements is ~3 GiB of
+# heap before any layout validation runs. Real-world COGs sit well below
+# this: a 1M x 1M image at 256-pixel tiles has ~16M tile entries.
+MAX_PIXEL_ARRAY_COUNT = 100_000_000
+
+# Maximum number of IFDs we walk in `parse_all_ifds` before giving up.
+# Real-world COGs carry the full-resolution IFD plus a handful of overview
+# levels and (optionally) per-band masks, so they sit comfortably below 64
+# even for deep pyramids. A crafted TIFF can chain millions of distinct
+# IFD offsets via `next_ifd_offset`; the cycle-detection `seen` set won't
+# catch those because every offset is unique. 256 is a generous ceiling
+# that bounds memory while leaving plenty of headroom for any legitimate
+# pyramid layout.
+MAX_IFDS = 256
+
+# Well-known TIFF tag IDs
+TAG_NEW_SUBFILE_TYPE = 254
+TAG_IMAGE_WIDTH = 256
+TAG_IMAGE_LENGTH = 257
+TAG_BITS_PER_SAMPLE = 258
+TAG_COMPRESSION = 259
+TAG_PHOTOMETRIC = 262
+TAG_STRIP_OFFSETS = 273
+TAG_ORIENTATION = 274
+TAG_SAMPLES_PER_PIXEL = 277
+TAG_ROWS_PER_STRIP = 278
+TAG_STRIP_BYTE_COUNTS = 279
+TAG_X_RESOLUTION = 282
+TAG_Y_RESOLUTION = 283
+TAG_PLANAR_CONFIG = 284
+TAG_RESOLUTION_UNIT = 296
+TAG_PREDICTOR = 317
+TAG_TILE_WIDTH = 322
+TAG_TILE_LENGTH = 323
+TAG_TILE_OFFSETS = 324
+TAG_TILE_BYTE_COUNTS = 325
+TAG_COLORMAP = 320
+TAG_SUB_IFDS = 330
+TAG_EXTRA_SAMPLES = 338
+TAG_SAMPLE_FORMAT = 339
+TAG_JPEG_TABLES = 347
+TAG_GDAL_METADATA = 42112
+TAG_GDAL_NODATA = 42113
+
+# GeoTIFF tags
+TAG_MODEL_PIXEL_SCALE = 33550
+TAG_MODEL_TIEPOINT = 33922
+TAG_MODEL_TRANSFORMATION = 34264
+TAG_GEO_KEY_DIRECTORY = 34735
+TAG_GEO_DOUBLE_PARAMS = 34736
+TAG_GEO_ASCII_PARAMS = 34737
+
+
+# Human-readable names for tags that turn up in error messages. Only
+# tags that legitimately use RATIONAL / SRATIONAL are interesting here;
+# anything else gets formatted as the bare numeric id.
+_TAG_NAMES = {
+    TAG_X_RESOLUTION: "XResolution",
+    TAG_Y_RESOLUTION: "YResolution",
+    TAG_RESOLUTION_UNIT: "ResolutionUnit",
+}
+
+
+def _tag_label(tag: int | None) -> str:
+    """Format a tag id for error messages."""
+    if tag is None:
+        return "<unknown>"
+    name = _TAG_NAMES.get(tag)
+    if name is not None:
+        return f"{name} (tag={tag})"
+    return f"tag={tag}"
+
+
+@dataclass
+class TIFFHeader:
+    """Parsed TIFF file header."""
+    byte_order: str  # '<' or '>'
+    is_bigtiff: bool
+    first_ifd_offset: int
+
+
+@dataclass
+class IFDEntry:
+    """A single IFD entry with its resolved value."""
+    tag: int
+    type_id: int
+    count: int
+    value: Any  # resolved: int, float, tuple, bytes, or str
+
+
+@dataclass
+class IFD:
+    """Parsed Image File Directory."""
+    entries: dict[int, IFDEntry] = field(default_factory=dict)
+    next_ifd_offset: int = 0
+
+    def get_value(self, tag: int, default: Any = None) -> Any:
+        """Get the resolved value for a tag, or default if absent."""
+        entry = self.entries.get(tag)
+        if entry is None:
+            return default
+        return entry.value
+
+    def get_values(self, tag: int) -> tuple | None:
+        """Get a tag's value as a tuple (even if scalar)."""
+        entry = self.entries.get(tag)
+        if entry is None:
+            return None
+        v = entry.value
+        if isinstance(v, tuple):
+            return v
+        return (v,)
+
+    # Convenience properties
+    @property
+    def subfile_type(self) -> int:
+        """NewSubfileType (tag 254) bit flags. 0 if absent.
+
+        Bit flags (TIFF 6.0 spec):
+            bit 0 (& 1) - reduced-resolution overview
+            bit 1 (& 2) - page of multi-page document
+            bit 2 (& 4) - transparency mask
+        """
+        v = self.get_value(TAG_NEW_SUBFILE_TYPE, 0)
+        if isinstance(v, tuple):
+            v = v[0] if v else 0
+        return int(v)
+
+    @property
+    def is_mask(self) -> bool:
+        """True if this IFD's NewSubfileType marks it as a transparency mask."""
+        return bool(self.subfile_type & 4)
+
+    @property
+    def width(self) -> int:
+        return self.get_value(TAG_IMAGE_WIDTH, 0)
+
+    @property
+    def height(self) -> int:
+        return self.get_value(TAG_IMAGE_LENGTH, 0)
+
+    @property
+    def bits_per_sample(self) -> int | tuple:
+        v = self.get_value(TAG_BITS_PER_SAMPLE, 8)
+        if isinstance(v, tuple):
+            return v[0] if len(v) == 1 else v
+        return v
+
+    @property
+    def samples_per_pixel(self) -> int:
+        return self.get_value(TAG_SAMPLES_PER_PIXEL, 1)
+
+    @property
+    def sample_format(self) -> int:
+        # resolve_sample_format keeps the empty-tuple fallback exercised by
+        # tests/test_fuzz_hypothesis.py and raises ValueError on
+        # mixed per-band values so we don't silently decode the rest of the
+        # IFD with the first band's dtype.
+        from ._dtypes import resolve_sample_format
+        return resolve_sample_format(self.get_value(TAG_SAMPLE_FORMAT, 1))
+
+    @property
+    def compression(self) -> int:
+        return self.get_value(TAG_COMPRESSION, 1)
+
+    @property
+    def predictor(self) -> int:
+        return self.get_value(TAG_PREDICTOR, 1)
+
+    @property
+    def is_tiled(self) -> bool:
+        return TAG_TILE_WIDTH in self.entries
+
+    @property
+    def tile_width(self) -> int:
+        return self.get_value(TAG_TILE_WIDTH, 0)
+
+    @property
+    def tile_height(self) -> int:
+        return self.get_value(TAG_TILE_LENGTH, 0)
+
+    @property
+    def rows_per_strip(self) -> int:
+        # Default: entire image in one strip
+        return self.get_value(TAG_ROWS_PER_STRIP, self.height)
+
+    @property
+    def strip_offsets(self) -> tuple | None:
+        return self.get_values(TAG_STRIP_OFFSETS)
+
+    @property
+    def strip_byte_counts(self) -> tuple | None:
+        return self.get_values(TAG_STRIP_BYTE_COUNTS)
+
+    @property
+    def tile_offsets(self) -> tuple | None:
+        return self.get_values(TAG_TILE_OFFSETS)
+
+    @property
+    def tile_byte_counts(self) -> tuple | None:
+        return self.get_values(TAG_TILE_BYTE_COUNTS)
+
+    @property
+    def photometric(self) -> int:
+        return self.get_value(TAG_PHOTOMETRIC, 1)
+
+    @property
+    def orientation(self) -> int:
+        """Orientation tag (274). Default 1 = top-left (no transform).
+
+        Per TIFF 6.0 the eight valid values are:
+        1=top-left, 2=top-right, 3=bottom-right, 4=bottom-left,
+        5=left-top, 6=right-top, 7=right-bottom, 8=left-bottom.
+        Values 5-8 swap rows and columns relative to the stored layout.
+        """
+        v = self.get_value(TAG_ORIENTATION, 1)
+        if isinstance(v, tuple):
+            v = v[0]
+        return int(v)
+
+    @property
+    def planar_config(self) -> int:
+        # TIFF 6.0 defines only 1 (Chunky) and 2 (Planar). Treating any
+        # other value as chunky would silently decode a malformed file
+        # under an assumed layout. Missing tag defaults to 1 per spec.
+        # PlanarConfiguration is type SHORT (uint16) in well-formed
+        # TIFFs; rejecting non-integer values up front catches malformed
+        # files that declare it as FLOAT/RATIONAL, where a naive int()
+        # cast would round (e.g. 1.5 -> 1) and accept the file as chunky.
+        v = self.get_value(TAG_PLANAR_CONFIG, 1)
+        if isinstance(v, tuple):
+            v = v[0] if v else 1
+        if isinstance(v, bool) or not isinstance(v, int) or v not in (1, 2):
+            raise ValueError(
+                f"Invalid PlanarConfiguration: {v!r}. TIFF 6.0 allows "
+                f"only 1 (Chunky) or 2 (Planar)."
+            )
+        return v
+
+    @property
+    def jpeg_tables(self) -> bytes | None:
+        """JPEGTables tag (347): shared DQT/DHT segments for tiled JPEG.
+
+        GDAL-tiled ``compress=JPEG`` TIFFs store the quantization and
+        Huffman tables once in this tag; each tile's payload is a JPEG
+        fragment that needs the tables spliced in before libjpeg can
+        decode it. Returns the raw bytes of the abbreviated JPEG stream
+        (SOI ... DQT/DHT ... EOI), or None if absent.
+        """
+        v = self.get_value(TAG_JPEG_TABLES)
+        if v is None:
+            return None
+        if isinstance(v, (bytes, bytearray)):
+            return bytes(v)
+        # BYTE arrays may surface as a tuple/list of ints
+        if isinstance(v, (tuple, list)):
+            return bytes(v)
+        # A single-byte tag value comes back as an int; wrap it in a
+        # one-element bytes object. Plain ``bytes(v)`` would (incorrectly)
+        # allocate v zero bytes -- a malformed file with a huge int here
+        # could otherwise blow up memory.
+        if isinstance(v, int):
+            return bytes([v & 0xFF])
+        raise TypeError(
+            f"unexpected JPEGTables tag value type: {type(v).__name__}"
+        )
+
+    @property
+    def x_resolution(self) -> float | None:
+        """XResolution tag (282), or None if absent."""
+        v = self.get_value(TAG_X_RESOLUTION)
+        return float(v) if v is not None else None
+
+    @property
+    def y_resolution(self) -> float | None:
+        """YResolution tag (283), or None if absent."""
+        v = self.get_value(TAG_Y_RESOLUTION)
+        return float(v) if v is not None else None
+
+    @property
+    def resolution_unit(self) -> int | None:
+        """ResolutionUnit tag (296): 1=none, 2=inch, 3=cm. None if absent."""
+        return self.get_value(TAG_RESOLUTION_UNIT)
+
+    @property
+    def colormap(self) -> tuple | None:
+        """ColorMap tag (320) values, or None if absent."""
+        return self.get_values(TAG_COLORMAP)
+
+    @property
+    def gdal_metadata(self) -> str | None:
+        """GDALMetadata XML string (tag 42112), or None if absent."""
+        v = self.get_value(TAG_GDAL_METADATA)
+        if v is None:
+            return None
+        if isinstance(v, bytes):
+            return v.rstrip(b'\x00').decode('ascii', errors='replace')
+        return str(v).rstrip('\x00')
+
+    @property
+    def nodata_str(self) -> str | None:
+        """GDAL_NODATA tag value as string, or None."""
+        v = self.get_value(TAG_GDAL_NODATA)
+        if v is None:
+            return None
+        if isinstance(v, bytes):
+            return v.rstrip(b'\x00').decode('ascii', errors='replace')
+        return str(v).rstrip('\x00')
+
+
+def validate_tile_layout(ifd: IFD) -> None:
+    """Validate that a tiled IFD's TileOffsets covers the declared tile grid.
+
+    A well-formed tiled TIFF must supply at least `tiles_across * tiles_down`
+    TileOffsets entries (times samples_per_pixel for planar config 2). An
+    adversarial or malformed file can declare larger image dimensions than
+    its offsets array covers, which causes out-of-bounds reads in
+    downstream decoders (notably the GPU tile-assembly kernel).
+
+    Parameters
+    ----------
+    ifd : IFD
+        Parsed IFD. Must be tiled.
+
+    Raises
+    ------
+    ValueError
+        If TileOffsets or TileByteCounts is missing, if tile width/height
+        is zero, or if the declared grid exceeds the offsets array length.
+    """
+    if not ifd.is_tiled:
+        return
+
+    offsets = ifd.tile_offsets
+    byte_counts = ifd.tile_byte_counts
+    if offsets is None or byte_counts is None:
+        raise ValueError("Tiled TIFF is missing TileOffsets or TileByteCounts")
+
+    tw = ifd.tile_width
+    th = ifd.tile_height
+    if tw <= 0 or th <= 0:
+        raise ValueError(
+            f"Invalid tile dimensions: tile_width={tw}, tile_height={th}")
+
+    width = ifd.width
+    height = ifd.height
+    if width <= 0 or height <= 0:
+        raise ValueError(
+            f"Invalid image dimensions: width={width}, height={height}")
+
+    tiles_across = math.ceil(width / tw)
+    tiles_down = math.ceil(height / th)
+    planar = ifd.planar_config
+    samples = ifd.samples_per_pixel
+    bands = samples if (planar == 2 and samples > 1) else 1
+    expected = tiles_across * tiles_down * bands
+
+    if len(offsets) < expected:
+        raise ValueError(
+            f"Malformed TIFF: declared tile grid requires {expected} tile "
+            f"offsets ({tiles_across} x {tiles_down}"
+            f"{f' x {bands} bands' if bands > 1 else ''}), "
+            f"but TileOffsets has only {len(offsets)} entries"
+        )
+    if len(byte_counts) < expected:
+        raise ValueError(
+            f"Malformed TIFF: declared tile grid requires {expected} tile "
+            f"byte counts, but TileByteCounts has only {len(byte_counts)} "
+            f"entries"
+        )
+
+
+def parse_header(data: bytes | memoryview) -> TIFFHeader:
+    """Parse a TIFF/BigTIFF file header.
+
+    Parameters
+    ----------
+    data : bytes
+        At least the first 16 bytes of the file.
+
+    Returns
+    -------
+    TIFFHeader
+    """
+    if len(data) < 8:
+        raise ValueError("Not enough data for TIFF header")
+
+    bom = data[0:2]
+    if bom == b'II':
+        bo = '<'
+    elif bom == b'MM':
+        bo = '>'
+    else:
+        raise ValueError(f"Invalid TIFF byte order marker: {bom!r}")
+
+    magic = struct.unpack_from(f'{bo}H', data, 2)[0]
+
+    if magic == 42:
+        # Standard TIFF
+        offset = struct.unpack_from(f'{bo}I', data, 4)[0]
+        return TIFFHeader(byte_order=bo, is_bigtiff=False, first_ifd_offset=offset)
+    elif magic == 43:
+        # BigTIFF
+        if len(data) < 16:
+            raise ValueError("Not enough data for BigTIFF header")
+        offset_size = struct.unpack_from(f'{bo}H', data, 4)[0]
+        if offset_size != 8:
+            raise ValueError(f"Unexpected BigTIFF offset size: {offset_size}")
+        # skip 2 bytes padding
+        offset = struct.unpack_from(f'{bo}Q', data, 8)[0]
+        return TIFFHeader(byte_order=bo, is_bigtiff=True, first_ifd_offset=offset)
+    else:
+        raise ValueError(f"Invalid TIFF magic number: {magic}")
+
+
+def _read_value(data: bytes | memoryview, offset: int, type_id: int,
+                count: int, bo: str, tag: int | None = None) -> Any:
+    """Read a typed value array from data at the given offset.
+
+    A zero-denominator RATIONAL or SRATIONAL is rejected with a
+    `ValueError` rather than silently coerced to 0.0. The TIFF spec
+    treats denominator-zero rationals as malformed, and quietly mapping
+    them to 0.0 lets corrupted `XResolution` / `YResolution` metadata
+    round-trip through the reader as if the file were valid.
+    """
+    type_size = TIFF_TYPE_SIZES.get(type_id, 1)
+
+    if type_id == ASCII:
+        raw = bytes(data[offset:offset + count])
+        # Strip trailing null
+        return raw.rstrip(b'\x00').decode('ascii', errors='replace')
+
+    if type_id == UNDEFINED:
+        return bytes(data[offset:offset + count])
+
+    if type_id == RATIONAL:
+        values = []
+        for i in range(count):
+            off = offset + i * 8
+            num = struct.unpack_from(f'{bo}I', data, off)[0]
+            den = struct.unpack_from(f'{bo}I', data, off + 4)[0]
+            if den == 0:
+                raise ValueError(
+                    f"Malformed RATIONAL on {_tag_label(tag)}: "
+                    f"numerator={num} denominator={den} at element {i}; "
+                    f"refusing to parse possibly malformed TIFF"
+                )
+            values.append(num / den)
+        return tuple(values) if count > 1 else values[0]
+
+    if type_id == SRATIONAL:
+        values = []
+        for i in range(count):
+            off = offset + i * 8
+            num = struct.unpack_from(f'{bo}i', data, off)[0]
+            den = struct.unpack_from(f'{bo}i', data, off + 4)[0]
+            if den == 0:
+                raise ValueError(
+                    f"Malformed SRATIONAL on {_tag_label(tag)}: "
+                    f"numerator={num} denominator={den} at element {i}; "
+                    f"refusing to parse possibly malformed TIFF"
+                )
+            values.append(num / den)
+        return tuple(values) if count > 1 else values[0]
+
+    fmt_char = TIFF_TYPE_STRUCT_CODES.get(type_id)
+    if fmt_char is None:
+        return bytes(data[offset:offset + count * type_size])
+
+    if count == 1:
+        return struct.unpack_from(f'{bo}{fmt_char}', data, offset)[0]
+
+    # Batch unpack: single call for all elements
+    return struct.unpack_from(f'{bo}{count}{fmt_char}', data, offset)
+
+
+# Tags that pre-scan reads so pixel-array counts can be validated against
+# the IFD's declared geometry. Keep this in sync with
+# _expected_pixel_array_count below.
+_DIMENSION_TAGS = frozenset({
+    TAG_IMAGE_WIDTH,
+    TAG_IMAGE_LENGTH,
+    TAG_TILE_WIDTH,
+    TAG_TILE_LENGTH,
+    TAG_ROWS_PER_STRIP,
+    TAG_SAMPLES_PER_PIXEL,
+    TAG_PLANAR_CONFIG,
+    TAG_BITS_PER_SAMPLE,
+})
+
+# Pixel-array tags exempt from MAX_IFD_ENTRY_COUNT; each gets its own
+# count cap derived from the IFD's dimensions.
+_PIXEL_ARRAY_TAGS = frozenset({
+    TAG_STRIP_OFFSETS,
+    TAG_STRIP_BYTE_COUNTS,
+    TAG_TILE_OFFSETS,
+    TAG_TILE_BYTE_COUNTS,
+    TAG_COLORMAP,
+})
+
+
+def _scalar(v: Any) -> Any:
+    """Unwrap a single-element tuple, leave everything else alone."""
+    if isinstance(v, tuple):
+        return v[0] if v else None
+    return v
+
+
+def _expected_pixel_array_count(tag: int, dims: dict[int, Any]) -> int | None:
+    """Maximum legitimate count for a pixel-array tag given the IFD's
+    declared dimensions. Returns None when the geometry tags needed for
+    the calculation are missing or unusable; callers must still apply
+    the absolute MAX_PIXEL_ARRAY_COUNT cap in that case."""
+    width = _scalar(dims.get(TAG_IMAGE_WIDTH))
+    height = _scalar(dims.get(TAG_IMAGE_LENGTH))
+    samples = _scalar(dims.get(TAG_SAMPLES_PER_PIXEL)) or 1
+    planar = _scalar(dims.get(TAG_PLANAR_CONFIG)) or 1
+    if not isinstance(samples, int) or samples < 1:
+        samples = 1
+    if planar not in (1, 2):
+        planar = 1
+
+    if tag == TAG_COLORMAP:
+        bps = _scalar(dims.get(TAG_BITS_PER_SAMPLE))
+        if not isinstance(bps, int) or bps <= 0 or bps > 16:
+            # TIFF 6.0 caps palette BitsPerSample at 8 (officially); 16
+            # is the widest reasonable upper bound we'll accept.
+            bps = 16
+        return 3 * (1 << bps)
+
+    if tag in (TAG_TILE_OFFSETS, TAG_TILE_BYTE_COUNTS):
+        tw = _scalar(dims.get(TAG_TILE_WIDTH))
+        th = _scalar(dims.get(TAG_TILE_LENGTH))
+        if not (isinstance(tw, int) and isinstance(th, int)
+                and isinstance(width, int) and isinstance(height, int)
+                and tw > 0 and th > 0 and width > 0 and height > 0):
+            return None
+        tiles = math.ceil(width / tw) * math.ceil(height / th)
+        if planar == 2:
+            tiles *= samples
+        return tiles
+
+    if tag in (TAG_STRIP_OFFSETS, TAG_STRIP_BYTE_COUNTS):
+        if not (isinstance(height, int) and height > 0):
+            return None
+        rps = _scalar(dims.get(TAG_ROWS_PER_STRIP))
+        if not isinstance(rps, int) or rps <= 0:
+            rps = height
+        strips = math.ceil(height / rps)
+        if planar == 2:
+            strips *= samples
+        return strips
+
+    return None
+
+
+def parse_ifd(data: bytes | memoryview, offset: int,
+              header: TIFFHeader) -> IFD:
+    """Parse a single IFD at the given offset.
+
+    Parameters
+    ----------
+    data : bytes
+        Full file data (or at least enough of it).
+    offset : int
+        Byte offset of this IFD.
+    header : TIFFHeader
+        Parsed file header.
+
+    Returns
+    -------
+    IFD
+    """
+    bo = header.byte_order
+    is_big = header.is_bigtiff
+    data_len = len(data)
+
+    # Bounds-check the num_entries field before unpacking. A truncated
+    # or crafted file used to escape as `struct.error` here, which is
+    # outside the documented ValueError contract. Negative offsets must
+    # also be rejected because `struct.unpack_from` interprets them with
+    # Python's negative-index semantics (reading from the buffer end).
+    num_entries_size = 8 if is_big else 2
+    if offset < 0 or offset + num_entries_size > data_len:
+        raise ValueError(
+            f"IFD num_entries at offset {offset} needs "
+            f"{num_entries_size} bytes but file length is {data_len}"
+        )
+
+    if is_big:
+        num_entries = struct.unpack_from(f'{bo}Q', data, offset)[0]
+        entry_offset = offset + 8
+        entry_size = 20
+    else:
+        num_entries = struct.unpack_from(f'{bo}H', data, offset)[0]
+        entry_offset = offset + 2
+        entry_size = 12
+
+    # Bounds-check the entry table itself. Each entry is `entry_size`
+    # bytes; without this guard a short buffer would hit `struct.error`
+    # on the first unpack inside the loop below. `entry_offset` is
+    # derived from `offset` and inherits its sign; reject negatives so
+    # `struct.unpack_from` cannot index from the buffer end.
+    entry_table_end = entry_offset + num_entries * entry_size
+    if entry_offset < 0 or entry_table_end > data_len:
+        raise ValueError(
+            f"IFD entry table [{entry_offset}, {entry_table_end}) for "
+            f"num_entries={num_entries} exceeds file length {data_len}"
+        )
+
+    inline_max = 8 if is_big else 4
+    entries = {}
+
+    # Pre-scan: walk the entry table and (a) reject duplicate tag ids
+    # and (b) read inline values for the geometry tags we need to
+    # validate pixel-array counts. This pass only touches the
+    # fixed-size entry table; no pointer follows. A malformed file with
+    # a huge `count` on a pixel-array tag is caught by
+    # _expected_pixel_array_count below before the main loop reaches
+    # the actual unpack.
+    #
+    # Duplicate detection (issue #2483): TIFF 6.0 section 2 requires
+    # IFD entries to be sorted in ascending order by tag id with no
+    # duplicates. The legacy parser stored entries in a dict keyed by
+    # tag id and let the last write win, so a file with two ImageWidth
+    # entries silently parsed to whichever value came second. The same
+    # ambiguity applied to every tag, including the ones that control
+    # CRS, transform, compression, pixel offsets, and nodata. Walking
+    # the entry table here, before any value bytes are read, lets us
+    # fail closed at the parse boundary instead of guessing.
+    seen_tag_offsets: dict[int, int] = {}
+    dims: dict[int, Any] = {}
+    for i in range(num_entries):
+        eo = entry_offset + i * entry_size
+        # Tag id is a 2-byte unsigned at the start of every entry in
+        # both classic TIFF and BigTIFF, so we can do the duplicate
+        # check before reading type / count and skip those reads on a
+        # rejection.
+        tag = struct.unpack_from(f'{bo}H', data, eo)[0]
+        prior_eo = seen_tag_offsets.get(tag)
+        if prior_eo is not None:
+            raise DuplicateIFDTagError(
+                f"IFD at offset {offset} declares tag {tag} twice "
+                f"(prior entry at byte offset {prior_eo}, duplicate "
+                f"entry at byte offset {eo}); TIFF 6.0 requires each "
+                f"tag id to appear at most once per IFD"
+            )
+        seen_tag_offsets[tag] = eo
+        if is_big:
+            type_id = struct.unpack_from(f'{bo}H', data, eo + 2)[0]
+            count = struct.unpack_from(f'{bo}Q', data, eo + 4)[0]
+            value_area_offset = eo + 12
+        else:
+            type_id = struct.unpack_from(f'{bo}H', data, eo + 2)[0]
+            count = struct.unpack_from(f'{bo}I', data, eo + 4)[0]
+            value_area_offset = eo + 8
+        if tag not in _DIMENSION_TAGS:
+            continue
+        type_size = TIFF_TYPE_SIZES.get(type_id, 1)
+        if count == 0 or count * type_size > inline_max:
+            # Out-of-line dimension values would require following a
+            # pointer we haven't validated. Skip; the absolute pixel
+            # cap still fires.
+            continue
+        try:
+            dims[tag] = _read_value(data, value_area_offset, type_id, count, bo, tag=tag)
+        except (struct.error, ValueError):
+            continue
+
+    for i in range(num_entries):
+        eo = entry_offset + i * entry_size
+
+        if is_big:
+            tag = struct.unpack_from(f'{bo}H', data, eo)[0]
+            type_id = struct.unpack_from(f'{bo}H', data, eo + 2)[0]
+            count = struct.unpack_from(f'{bo}Q', data, eo + 4)[0]
+            value_area_offset = eo + 12
+        else:
+            tag = struct.unpack_from(f'{bo}H', data, eo)[0]
+            type_id = struct.unpack_from(f'{bo}H', data, eo + 2)[0]
+            count = struct.unpack_from(f'{bo}I', data, eo + 4)[0]
+            value_area_offset = eo + 8
+
+        type_size = TIFF_TYPE_SIZES.get(type_id, 1)
+        total_size = count * type_size
+
+        # Reject absurd counts/sizes on non-pixel tags before any
+        # allocation. Pixel-data offset/byte-count and colormap arrays
+        # are bounded separately against the IFD's geometry below.
+        if tag in _PIXEL_ARRAY_TAGS:
+            if count > MAX_PIXEL_ARRAY_COUNT:
+                raise ValueError(
+                    f"IFD entry tag={tag} count={count} exceeds "
+                    f"MAX_PIXEL_ARRAY_COUNT={MAX_PIXEL_ARRAY_COUNT}; refusing "
+                    f"to parse possibly malformed TIFF"
+                )
+            expected = _expected_pixel_array_count(tag, dims)
+            if expected is not None and count > expected:
+                raise ValueError(
+                    f"IFD entry tag={tag} count={count} exceeds expected "
+                    f"value {expected} derived from IFD dimensions; refusing "
+                    f"to parse possibly malformed TIFF"
+                )
+        else:
+            if count > MAX_IFD_ENTRY_COUNT:
+                raise ValueError(
+                    f"IFD entry tag={tag} count={count} exceeds "
+                    f"MAX_IFD_ENTRY_COUNT={MAX_IFD_ENTRY_COUNT}; refusing "
+                    f"to parse possibly malformed TIFF"
+                )
+            if total_size > MAX_IFD_ENTRY_BYTES:
+                raise ValueError(
+                    f"IFD entry tag={tag} value size {total_size} bytes "
+                    f"exceeds MAX_IFD_ENTRY_BYTES={MAX_IFD_ENTRY_BYTES}; "
+                    f"refusing to parse possibly malformed TIFF"
+                )
+
+        if total_size <= inline_max:
+            value = _read_value(data, value_area_offset, type_id, count, bo, tag=tag)
+        else:
+            if is_big:
+                ptr = struct.unpack_from(f'{bo}Q', data, value_area_offset)[0]
+            else:
+                ptr = struct.unpack_from(f'{bo}I', data, value_area_offset)[0]
+            # Bound-check the value range against file length before
+            # _read_value runs. ptr and total_size are both >= 0 (ptr is
+            # an unsigned uint32/uint64, total_size is count*type_size),
+            # so we only need the upper bound.
+            if ptr + total_size > data_len:
+                raise ValueError(
+                    f"IFD entry tag={tag} value range "
+                    f"[{ptr}, {ptr + total_size}) exceeds file length "
+                    f"{data_len}"
+                )
+            value = _read_value(data, ptr, type_id, count, bo, tag=tag)
+
+        entries[tag] = IFDEntry(tag=tag, type_id=type_id, count=count, value=value)
+
+    # Next IFD offset. Bounds-check before unpack so a truncated file
+    # raises ValueError rather than struct.error. `next_offset_pos`
+    # inherits sign from `offset` via `entry_table_end`, so reject any
+    # negative position before `struct.unpack_from` can wrap around.
+    next_offset_pos = entry_table_end
+    next_offset_size = 8 if is_big else 4
+    if next_offset_pos < 0 or next_offset_pos + next_offset_size > data_len:
+        raise ValueError(
+            f"IFD next-IFD pointer at offset {next_offset_pos} needs "
+            f"{next_offset_size} bytes but file length is {data_len}"
+        )
+    if is_big:
+        next_ifd = struct.unpack_from(f'{bo}Q', data, next_offset_pos)[0]
+    else:
+        next_ifd = struct.unpack_from(f'{bo}I', data, next_offset_pos)[0]
+
+    return IFD(entries=entries, next_ifd_offset=next_ifd)
+
+
+def _is_overview_or_full_res(ifd: IFD) -> bool:
+    """Return True if *ifd* is the full-resolution image or an overview.
+
+    NewSubfileType (tag 254) is a bit field per TIFF 6.0:
+
+    * bit 0 (value 1) -- reduced-resolution version of another image (overview)
+    * bit 1 (value 2) -- single page of a multi-page document
+    * bit 2 (value 4) -- transparency mask
+
+    The full-resolution IFD has ``NewSubfileType=0``. We accept it plus
+    any IFD that is an overview *and* not a mask. Pages and any future
+    flag combinations get filtered out so ``overview_level`` indexes the
+    pyramid only.
+    """
+    st = ifd.subfile_type
+    if st & 4:
+        return False  # transparency mask (or overview-of-mask, st=5)
+    return st == 0 or (st & 1) != 0
+
+
+def select_overview_ifd(ifds: list[IFD], overview_level: int | None) -> IFD:
+    """Pick the IFD for a requested overview level, skipping non-pyramid IFDs.
+
+    Some COG variants (notably GDAL with internal masks) interleave
+    transparency-mask IFDs (NewSubfileType bit 2 set) with overview IFDs.
+    Multi-page TIFFs additionally carry page IFDs (bit 1 set). Indexing the
+    raw IFD list by ``overview_level`` returns the wrong layer in either
+    case. This helper builds a filtered list of full-resolution and
+    overview IFDs only, and indexes into that.
+
+    ``overview_level=0`` (or ``None``) returns the full-resolution IFD;
+    ``overview_level=1`` returns the first overview, and so on.
+
+    Parameters
+    ----------
+    ifds : list[IFD]
+        All IFDs as parsed from the file.
+    overview_level : int or None
+        Which overview to return. ``None`` is treated as ``0``.
+
+    Returns
+    -------
+    IFD
+
+    Raises
+    ------
+    ValueError
+        If ``ifds`` is empty, or if ``overview_level`` exceeds the number
+        of pyramid IFDs in the file.
+    """
+    if not ifds:
+        raise ValueError("No IFDs found in TIFF file")
+
+    # Defense in depth. ``open_geotiff`` already type-checks
+    # ``overview_level``, but this selector is also reachable from the dask,
+    # GPU, and accessor readers that forward the kwarg without going through
+    # the public entry point.
+    from ._validation import _validate_overview_level_arg
+    _validate_overview_level_arg(overview_level)
+
+    filtered = [ifd for ifd in ifds if _is_overview_or_full_res(ifd)]
+    if not filtered:
+        raise ValueError(
+            "TIFF file contains no full-resolution or overview IFDs "
+            "(every IFD is a mask, page, or other non-pyramid layer)")
+
+    level = 0 if overview_level is None else overview_level
+    if level < 0:
+        raise ValueError(f"overview_level must be >= 0, got {level}")
+    if level >= len(filtered):
+        n_overviews = len(filtered) - 1
+        n_skipped = len(ifds) - len(filtered)
+        raise ValueError(
+            f"overview_level={level} is out of range: TIFF has "
+            f"{len(filtered)} pyramid IFDs (1 full-resolution + "
+            f"{n_overviews} overview{'s' if n_overviews != 1 else ''}"
+            f"{f', plus {n_skipped} non-pyramid IFD' if n_skipped else ''}"
+            f"{'s' if n_skipped > 1 else ''}). Valid overview_level values "
+            f"are 0..{len(filtered) - 1}.")
+
+    return filtered[level]
+
+
+def parse_all_ifds(data: bytes | memoryview,
+                   header: TIFFHeader) -> list[IFD]:
+    """Parse all IFDs in a TIFF file.
+
+    Parameters
+    ----------
+    data : bytes
+        Full file data.
+    header : TIFFHeader
+        Parsed file header.
+
+    Returns
+    -------
+    list[IFD]
+    """
+    ifds = []
+    offset = header.first_ifd_offset
+    seen = set()
+
+    while offset != 0:
+        # Cycles in the IFD chain mean a file is malformed: a downstream
+        # caller silently receiving a truncated overview/mask chain is
+        # worse than a clear error. Raise to stay consistent with the
+        # past-EOF and MAX_IFDS branches below.
+        if offset in seen:
+            raise ValueError(
+                f"TIFF IFD chain has a cycle at offset {offset}; "
+                f"file is malformed"
+            )
+        seen.add(offset)
+        if offset >= len(data):
+            raise ValueError(
+                f"TIFF IFD chain offset {offset} points past end of file "
+                f"({len(data)} bytes); file is malformed"
+            )
+        ifd = parse_ifd(data, offset, header)
+        ifds.append(ifd)
+        # The `seen` set catches cycles, but a crafted file can chain a
+        # very long list of distinct offsets, each pointing at a small
+        # valid IFD. Cap the chain at MAX_IFDS to bound memory. A chain
+        # of exactly MAX_IFDS is allowed; only MAX_IFDS + 1 raises (same
+        # convention as MAX_IFD_ENTRY_COUNT).
+        if len(ifds) > MAX_IFDS:
+            raise ValueError(
+                f"TIFF IFD chain exceeds limit (MAX_IFDS={MAX_IFDS}); "
+                f"file is malformed or attempting denial-of-service"
+            )
+        offset = ifd.next_ifd_offset
+
+    return ifds

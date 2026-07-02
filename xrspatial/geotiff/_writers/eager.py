@@ -1,0 +1,1757 @@
+"""Eager (CPU) writer entry point and helpers.
+
+Holds ``to_geotiff`` (the public eager writer),
+``_write_single_tile`` (per-tile worker used by ``_write_vrt_tiled``),
+and ``_write_vrt_tiled`` (the deprecated ``vrt_tiled=True`` path on
+``to_geotiff``). Companion modules ``_writers/gpu.py`` and
+``_writers/vrt.py`` hold the GPU writer and the internal ``_build_vrt``
+VRT-index emitter; ``to_geotiff`` dispatches to them when the caller
+asks for a GPU output or a ``.vrt`` path.
+"""
+from __future__ import annotations
+
+import numbers
+import os
+import shutil
+import uuid
+import warnings
+from typing import TYPE_CHECKING
+
+import numpy as np
+import xarray as xr
+
+if TYPE_CHECKING:
+    from typing import BinaryIO
+
+from .._attrs import (_EXPERIMENTAL_CODECS, _LEVEL_RANGES, _VALID_COMPRESSIONS, _extract_rich_tags,
+                      _pack, _resolve_nodata_attr, _should_restore_nan_sentinel)
+from .._backends._gpu_helpers import _is_gpu_data
+from .._coords import _BAND_DIM_NAMES, ROTATION_SHEAR_TOL, _has_no_georef_marker
+from .._coords import require_transform_for_georeferenced as _require_transform_for_georeferenced
+from .._coords import resolve_georef as _resolve_georef
+from .._crs import _validate_crs_arg, _validate_crs_fallback, _wkt_to_epsg
+from .._geotags import RASTER_PIXEL_IS_AREA, GeoTransform
+from .._nodata import NodataLifecycle as _NL
+from .._runtime import (GeoTIFFFallbackWarning, _geotiff_strict_mode, _gpu_fallback_warning_message,
+                        _resolve_spatial_coords)
+from .._validation import (_validate_3d_writer_dims, _validate_compression_level_arg,
+                           _validate_gpu_arg, _validate_no_rotated_affine, _validate_nodata_arg,
+                           _validate_tile_size_arg, _validate_writer_spatial_shape,
+                           validate_write_metadata)
+from .._writer import _COG_REQUIRES_TILED_MSG, write
+from .gpu import _write_geotiff_gpu
+
+
+def to_geotiff(data: xr.DataArray | np.ndarray,
+               path: str | BinaryIO, *,
+               crs: int | str | None = None,
+               nodata: float | int | None = None,
+               compression: str = 'zstd',
+               compression_level: int | None = None,
+               tiled: bool = True,
+               tile_size: int = 256,
+               predictor: bool | int = False,
+               cog: bool = False,
+               overview_levels: list[int] | None = None,
+               overview_resampling: str = 'mean',
+               bigtiff: bool | None = None,
+               gpu: bool | None = None,
+               streaming_buffer_bytes: int = 256 * 1024 * 1024,
+               max_z_error: float = 0.0,
+               photometric: str | int = 'auto',
+               allow_internal_only_jpeg: bool = False,
+               allow_experimental_codecs: bool = False,
+               allow_unparseable_crs: bool = False,
+               drop_rotation: bool = False,
+               pack: bool = False,
+               color_ramp: str | bool | None = None,
+               color_ramp_range: tuple[float, float] | None = None,
+               ) -> str | BinaryIO:
+    """Write data as a GeoTIFF or Cloud Optimized GeoTIFF.
+
+    Release-contract tier (see
+    ``docs/source/reference/release_gate_geotiff.rst`` and
+    ``docs/source/reference/geotiff_release_contract.rst``):
+
+    * [stable] Local-file output on an axis-aligned grid with
+      ``compression`` in ``{'none', 'deflate', 'lzw', 'packbits',
+      'zstd'}``; CRS / transform / nodata attrs round-trip; ``bigtiff``
+      auto-promotion; ``cog=True`` (the IFD-first tiled COG layout with
+      a stable codec, covered by ``SUPPORTED_FEATURES['writer.cog']``).
+    * [advanced] Internal overview pyramid generation
+      (``SUPPORTED_FEATURES['writer.overviews']``): the
+      ``overview_levels`` and ``overview_resampling`` knobs and the
+      pyramid bytes themselves. Also explicit ``bigtiff=True``;
+      ``photometric=`` overrides.
+    * [experimental] GPU dispatch via ``gpu=True``;
+      ``compression`` in ``{'lerc', 'jpeg2000', 'j2k', 'lz4'}`` behind
+      the explicit ``allow_experimental_codecs=True`` opt-in;
+      ``allow_unparseable_crs=True``; ``attrs['extra_tags']`` /
+      ``attrs['gdal_metadata_xml']`` pass-through
+      (``SUPPORTED_FEATURES['writer.extra_tags']`` /
+      ``['writer.gdal_metadata_xml']``), gated behind the same
+      ``allow_experimental_codecs=True`` opt-in -- except for attrs
+      that came from an xrspatial read, whose round-trip stays
+      flag-free.
+    * [internal-only] ``compression='jpeg'`` behind
+      ``allow_internal_only_jpeg=True``. The produced files do not
+      round-trip through libtiff / GDAL / rasterio; the path exists for
+      xrspatial's own use and is not part of the externally
+      interoperable surface.
+    * Out of scope for this release (allowed to raise): rotated /
+      sheared write support (no ``ModelTransformationTag`` emit path);
+      silent mixed-metadata flattening.
+
+    See :data:`xrspatial.geotiff.SUPPORTED_FEATURES` for the full tier
+    map. Per-parameter tier markers below describe the
+    tier the parameter itself carries; a parameter's effective tier
+    is bounded by the function-level surface above (e.g. ``[stable]``
+    ``nodata`` is still only stable when combined with a ``[stable]``
+    codec and options).
+
+    Dask-backed DataArrays on the CPU path are written in streaming
+    mode: one tile-row at a time, without materialising the full array
+    into RAM. The per-compute budget is sized from the source chunk
+    geometry, so a ``map_overlap`` source (e.g. ``slope`` / ``aspect``)
+    chunked taller than the tile stays within
+    ``streaming_buffer_bytes`` instead of pulling several source
+    chunk-rows at once (#3007). COG output (``cog=True``) still
+    materialises because overviews need the full array.
+
+    Dask input routed to the GPU writer (auto-detected dask+cupy, or
+    ``gpu=True`` with any dask backing) also streams: each tile-row
+    band is computed onto the device, compressed, and released before
+    the next, with the per-compute budget capped by
+    ``streaming_buffer_bytes`` (issue #3166). The bound is on device
+    memory only: the GPU writer still assembles the compressed file
+    in host RAM before writing it out, unlike the CPU streaming path,
+    which writes incrementally to disk. The exception is ``cog=True``,
+    which materialises the full array on device because overview
+    generation needs it, and emits a ``GeoTIFFFallbackWarning`` when
+    it does.
+
+    Automatically dispatches to GPU compression when:
+    - ``gpu=True`` is passed, or
+    - The input data is CuPy-backed (auto-detected)
+
+    GPU write uses nvCOMP batch compression (deflate/ZSTD) and keeps
+    the array on device. Falls back to CPU if nvCOMP is not available.
+
+    Styling sidecars for QGIS/GDAL land next to the file, not inside
+    it. A DataArray carrying ``attrs['category_names']`` (for example a
+    categorical ``rasterize`` result) gets a PAM ``<path>.aux.xml``
+    sidecar with the class labels and, when
+    ``attrs['category_colors']`` is present, an RGBA column per class.
+    No kwarg is involved; the attrs alone trigger the write, on every
+    dispatch path (eager, dask, GPU, and ``.vrt``). Continuous rasters
+    opt in through ``color_ramp``, which writes a QGIS ``.qml`` style
+    plus PAM statistics instead; the categorical sidecar wins when both
+    apply. File-like destinations skip sidecars (no path to anchor
+    them). ``open_geotiff`` merges the categorical attrs back on read,
+    so the labels round-trip; see
+    ``docs/source/user_guide/attrs_contract.rst`` for the key
+    definitions.
+
+    Every successful write to a string path also refreshes the PAM
+    ``<path>.aux.xml`` sidecar: a sidecar already at that path (from a
+    previous write, or a foreign tool) is removed and re-created only
+    when this write carries its own categories or statistics (#3595).
+    This matches GDAL's behaviour when creating a dataset over an
+    existing path. A ``.qml`` style file is never removed; see
+    ``color_ramp``.
+
+    Parameters
+    ----------
+    data : xr.DataArray or np.ndarray
+        [stable] 2D raster data.
+    path : str or binary file-like
+        [stable for local file paths; advanced for ``io.BytesIO`` and
+        other in-memory file-likes] Output file path, or any object
+        exposing a ``write`` method (e.g. ``io.BytesIO``). When a
+        file-like is passed, the encoded TIFF bytes are written to
+        that object once assembly completes. ``cog=True`` and ``.vrt``
+        outputs require a string path.
+    crs : int, numpy.integer, str, or None
+        [stable for int EPSG codes; advanced for WKT/PROJ strings]
+        EPSG code (int or numpy integer scalar), WKT string, or PROJ
+        string. If None and data is a DataArray, tries to read from
+        attrs ('crs' for EPSG, 'crs_wkt' for WKT).
+
+        EPSG codes are strongly preferred for interop. The WKT-only
+        path writes ``ProjectedCSType`` / ``GeographicType`` = 32767
+        with the WKT stored in ``GTCitationGeoKey`` -- libgeotiff and
+        GDAL can round-trip this but many other GeoTIFF readers treat
+        the citation as a free-form name and lose the CRS. A
+        ``UserWarning`` is emitted when the WKT-only path is taken.
+    nodata : float, int, or None
+        [stable] NoData value.
+    compression : str
+        [stable for ``{'none', 'deflate', 'lzw', 'packbits', 'zstd'}``;
+        experimental for ``{'lerc', 'jpeg2000', 'j2k', 'lz4'}`` behind
+        ``allow_experimental_codecs=True``; internal-only for
+        ``'jpeg'`` behind ``allow_internal_only_jpeg=True``] Codec
+        name. One of ``'none'``, ``'deflate'``, ``'lzw'``, ``'jpeg'``,
+        ``'packbits'``, ``'zstd'``, ``'lz4'``, ``'jpeg2000'`` (alias
+        ``'j2k'``), or ``'lerc'``.
+
+        Stable codecs (Tier 1, lossless, byte-for-byte round-trip):
+        ``'none'``, ``'deflate'``, ``'lzw'``, ``'packbits'``,
+        ``'zstd'``.
+
+        Experimental codecs (Tier 3): ``'lerc'``, ``'jpeg2000'`` /
+        ``'j2k'``, ``'lz4'``. Rejected by default; pass
+        ``allow_experimental_codecs=True`` to opt in. The opt-in emits
+        ``GeoTIFFFallbackWarning`` once per call so the caller knows
+        the chosen codec carries no cross-backend numerical parity
+        claim and uneven reader support across GDAL versions. ``'lerc'``
+        accepts ``max_z_error`` for lossy compression with a bounded
+        per-pixel error.
+
+        Internal-only codec (Tier 4): ``'jpeg'``. Rejected on write by
+        default because the encoder omits the JPEGTables tag and the
+        produced files do not round-trip through libtiff / GDAL /
+        rasterio. Pass ``allow_internal_only_jpeg=True`` to opt in to
+        the internal-reader-only path (see that parameter for details).
+        ``allow_experimental_codecs=True`` does NOT cover ``'jpeg'``:
+        internal-only is a stricter tier than experimental, and the two
+        flags do not collapse into one switch.
+    compression_level : int or None
+        [stable] Compression effort level. None uses each codec's
+        default (6 for deflate/zstd). Valid ranges: deflate 1-9,
+        zstd 1-22, lz4 0-16. Codecs without a level concept (lzw,
+        packbits, jpeg) accept any value and ignore it.
+
+        Out-of-range levels raise ``ValueError`` on every backend,
+        including GPU dispatch. On the GPU path the nvCOMP encoder
+        (deflate/zstd tiles) does not expose level control: an
+        explicit level is validated but then ignored, and a
+        ``UserWarning`` is emitted. Tiles the GPU writer compresses
+        through the CPU codecs honor the level. Pass ``gpu=False``
+        if the exact level matters.
+    tiled : bool
+        [stable] Use tiled layout (default True). Incompatible with
+        ``cog=True`` because the COG specification requires a tiled
+        internal layout; passing ``cog=True, tiled=False`` raises
+        ``ValueError``.
+    tile_size : int
+        [stable] Tile size in pixels (default 256). Must be a positive
+        multiple of 16 when ``tiled=True``; this is a TIFF 6 spec
+        requirement on TileWidth and TileLength for broad reader
+        compatibility. Ignored when ``tiled=False``; a warning is
+        emitted if a non-default value is passed alongside strip mode.
+    predictor : bool or int
+        [stable] TIFF predictor. Accepted values:
+
+        * ``False``, ``0``, or ``1`` -> no predictor.
+        * ``True`` or ``2`` -> horizontal differencing (good for integer
+          data; ``True`` and ``2`` are exactly equivalent).
+        * ``3`` -> floating-point predictor (float dtypes only; typically
+          gives better deflate/zstd ratios on float data than predictor 2).
+    cog : bool
+        [stable] Write as Cloud Optimized GeoTIFF. The CPU writer
+        emits the spec-conforming COG layout (IFD-first, tiled,
+        internal overviews, lossless codec) covered by
+        ``SUPPORTED_FEATURES['writer.cog']``. Requires ``tiled=True``
+        (the default): the COG specification mandates a tiled internal
+        layout, so ``cog=True, tiled=False`` raises ``ValueError``.
+        COG output also materialises the full array, because the
+        overview pyramid needs random access to every pixel; the
+        ``streaming_buffer_bytes`` kwarg is a no-op on this path.
+        Customisation of the overview pyramid itself
+        (``overview_levels``, ``overview_resampling``) is tracked
+        separately as advanced under
+        ``SUPPORTED_FEATURES['writer.overviews']``.
+    overview_levels : list[int] or None
+        [advanced] Overview pyramids are an optional COG feature; the
+        decimation factors and resampling choice affect downstream
+        analytics in ways that are not byte-for-byte reproducible
+        across backends. Overview decimation factors relative to full
+        resolution.
+        Each entry must be a power-of-two integer >= 2, and the list
+        must be strictly increasing (e.g. ``[2, 4, 8]`` writes
+        overviews at 1/2, 1/4 and 1/8 of the full resolution).
+        Invalid values raise ``ValueError``. Only used when ``cog=True``.
+        If None and ``cog=True``, levels auto-generate as
+        ``[2, 4, 8, ...]`` until the next halving would fall below
+        ``tile_size`` (capped at 8 levels).
+    overview_resampling : str
+        [advanced] Resampling method for overviews: 'mean' (default),
+        'nearest', 'min', 'max', 'median', 'mode', or 'cubic'.
+    bigtiff : bool or None
+        [advanced] BigTIFF uses 64-bit offsets; older readers that only
+        speak classic TIFF cannot open the output. Force BigTIFF
+        (64-bit offsets). None (default) auto-promotes when the
+        estimated file size would exceed the classic-TIFF 4 GB limit.
+        Matches the same kwarg on ``_write_geotiff_gpu``.
+    gpu : bool or None
+        [experimental] Requires cupy + numba CUDA, plus the optional
+        nvCOMP / nvJPEG / nvJPEG2K libraries for codec-specific
+        acceleration; backend parity with the CPU writer is tested for
+        the Tier 1 codec set only. Force GPU compression. None
+        (default) auto-detects CuPy data, including CuPy-backed dask
+        arrays. Dask-backed input routed to the GPU writer streams one
+        tile-row band at a time unless ``cog=True`` (see
+        ``streaming_buffer_bytes``).
+    streaming_buffer_bytes : int
+        [stable] Soft cap on bytes materialised per dask compute call
+        when streaming a dask-backed DataArray. Defaults to 256 MB.
+        Wide rasters whose tile-row exceeds this budget are split into
+        horizontal segments on the CPU path. On the GPU path the cap
+        bounds the device bytes computed per tile-row band, with a
+        floor of one full-width tile-row (issue #3166). The kwarg is a
+        no-op for in-memory (numpy / CuPy) input and for COG output,
+        which materialises the full array because the overview pyramid
+        needs it; a dask-backed ``cog=True`` GPU write emits a
+        ``GeoTIFFFallbackWarning`` when it materialises.
+    max_z_error : float
+        [experimental] Per-pixel error budget for LERC compression.
+        ``0.0`` (default) is lossless; larger values let the encoder
+        approximate values within the bound, producing smaller files
+        at the cost of accuracy bounded by
+        ``abs(decoded - original) <= max_z_error``. Only used when
+        ``compression='lerc'`` (which itself requires
+        ``allow_experimental_codecs=True``); passing a non-zero value
+        with any other codec raises ``ValueError``.
+    photometric : str or int
+        [advanced] Photometric interpretation for the TIFF Photometric
+        tag (262).
+
+        * ``'auto'`` (default) -- MinIsBlack (1) for any band count.
+          ExtraSamples for every band beyond the first is tagged ``0``
+          (unspecified). Multispectral rasters (e.g. R, G, B, NIR)
+          round-trip through this default without being silently
+          labelled as RGB+alpha. Prior versions treated any 3+ band
+          array as RGB and the 4th band as unassociated alpha -- the
+          behaviour change is intentional.
+        * ``'rgb'`` -- RGB (Photometric=2). Three colour bands; any
+          additional bands are tagged ``0`` (unspecified).
+        * ``'rgba'`` -- RGB with the 4th band tagged as unassociated
+          alpha (TIFF ExtraSamples=2). Requires at least 4 bands.
+        * ``'minisblack'`` or ``'miniswhite'`` -- grayscale; multi-band
+          extras tagged ``0``. Signed-integer pixel types with
+          ``'miniswhite'`` are rejected with ``NotImplementedError`` --
+          xrspatial has no semantically correct inversion for signed
+          MinIsWhite and the silent passthrough that used to happen
+          produced files that disagreed with the on-disk Photometric
+          tag against every standards-compliant TIFF reader. Cast to
+          an unsigned dtype or pass ``photometric='minisblack'``.
+        * An ``int`` -- written verbatim into Photometric for advanced
+          callers (e.g. ``3`` for Palette, ``5`` for CMYK).
+
+        A user-supplied ``attrs['extra_tags']`` entry of
+        ``(TAG_PHOTOMETRIC, ...)`` or ``(TAG_EXTRA_SAMPLES, ...)``
+        overrides the writer's chosen value (the pass-through itself
+        rides the experimental tier; see the tier list above); only
+        these two tag ids are overridable so other auto-emitted tags
+        such as ``ImageWidth`` or ``StripOffsets`` remain protected.
+    allow_experimental_codecs : bool
+        [experimental] Opt in to the Tier 3 experimental codecs
+        ``'lerc'``,
+        ``'jpeg2000'`` / ``'j2k'``, and ``'lz4'`` (default ``False``).
+        Setting ``compression=`` to one of those codecs without this
+        flag raises ``ValueError`` whose message names the flag. With
+        the flag set, the write proceeds and a
+        ``GeoTIFFFallbackWarning`` is emitted once per call so the
+        caller knows the chosen codec carries no cross-backend
+        numerical parity claim and uneven reader support across GDAL
+        versions. Does NOT cover ``compression='jpeg'``: the
+        internal-only JPEG path keeps its own dedicated
+        ``allow_internal_only_jpeg`` flag because internal-only is a
+        stricter tier than experimental. The kwarg is forwarded
+        unchanged to ``_write_geotiff_gpu`` on the GPU dispatch path.
+    allow_internal_only_jpeg : bool
+        [internal-only] Opt in to the ``compression='jpeg'`` encode
+        path (default ``False``). The encoder writes self-contained
+        JFIF tiles without the TIFF JPEGTables tag (347); the file
+        decodes through this library's reader but not through libtiff,
+        GDAL, or rasterio. This codec is internal-only for the release
+        contract: it is not externally interoperable and the path
+        exists so xrspatial can round-trip its own JPEG output. With
+        the flag set, the write proceeds and a
+        ``GeoTIFFFallbackWarning`` is emitted at call time. Without
+        the flag, ``compression='jpeg'`` raises ``ValueError``. The
+        kwarg is forwarded unchanged to ``_write_geotiff_gpu`` on the
+        GPU dispatch path so callers can reach the same experimental
+        encode via ``to_geotiff(..., gpu=True)``.
+    allow_unparseable_crs : bool
+        [experimental] Opt in to writing an unvalidatable CRS string
+        into ``GTCitationGeoKey`` (default ``False``). When ``False``
+        (the default), a ``crs=`` value that is neither an EPSG
+        int nor a string that pyproj can resolve and is not
+        structurally WKT (no ``PROJCS`` / ``GEOGCS`` / ``PROJCRS`` /
+        ``GEOGCRS`` root) raises ``ValueError`` instead of landing
+        verbatim in the citation field. Set to ``True`` to keep the
+        permissive behaviour. The fail-closed default protects against
+        files where a typo'd PROJ string or an ``"EPSG:4326"`` token on
+        a host without pyproj produces a citation that most readers
+        cannot interpret.
+    drop_rotation : bool, default False
+        [advanced] Opt in to writing a DataArray that carries
+        ``attrs['rotated_affine']``. The reader sets that attr when
+        called with ``allow_rotated=True`` on a file whose
+        ``ModelTransformationTag`` contains rotation, shear, or
+        z-coupling terms. The writer does not emit a
+        ``ModelTransformationTag``, so passing such a DataArray through
+        ``to_geotiff`` produces an identity-affine
+        output and loses the rotated mapping; a subsequent
+        ``open_geotiff`` round-trip cannot recover it. Default
+        ``False`` refuses the write with ``ValueError`` so the loss is
+        impossible without an explicit signal. ``drop_rotation=True``
+        accepts the loss and lets the write proceed; consumers reading
+        the output will see an axis-aligned, non-rotated TIFF.
+    pack : bool, default False
+        [experimental] Inverse of ``open_geotiff(unpack=True)``. Re-pack
+        a decoded float array before writing: reverse the scale / offset
+        recorded on ``attrs['scale_factor']`` / ``attrs['add_offset']``,
+        fill NaN back to the nodata sentinel, and cast to the source
+        dtype recorded on ``attrs['mask_and_scale_dtype']`` (contract v5;
+        the attr keeps its historical name). The recorded dtype is the
+        on-disk one, so an integer source gets its integer dtype back and
+        a float32 source stays float32 rather than widening to float64
+        (#3080). The output stores the raw packed values and keeps the
+        SCALE / OFFSET GDAL_METADATA, so reopening it with
+        ``unpack=True`` unpacks to the original values instead of scaling
+        a second time. Raises ``ValueError`` for a bare array (no attrs)
+        or one that never went through an ``unpack`` read. When the attr
+        is absent (arrays read before contract v5), the dtype falls back
+        to the width of an integer-typed ``attrs['nodata']``, or to the
+        buffer's own dtype when the sentinel is a float (a float sentinel
+        is stored as a plain Python float and carries no width
+        information). An explicit ``nodata=`` kwarg
+        overrides the attrs sentinel as the NaN fill value, so the filled
+        pixels always agree with the GDAL_NODATA tag the writer emits.
+        When NaN pixels exist with no sentinel to fill them and an
+        integer dtype must be restored, the ``ValueError`` is raised at
+        call time for numpy-backed data; for dask-backed data the check
+        runs per chunk inside the write's compute (issue #3235), so the
+        error surfaces during the write. The same timing applies to
+        pixels whose packed value is non-finite or falls outside the
+        packed integer dtype's range: the cast would silently wrap
+        them, so the write is refused with ``ValueError`` instead
+        (issue #3260). The write itself stays atomic
+        (temp file plus rename), so no partial output is left at the
+        destination path.
+    color_ramp : str, bool, or None, default None
+        [advanced] Write best-practice symbology sidecars so a continuous
+        single-band raster opens in QGIS with a color ramp instead of a flat
+        grayscale stretch. Pass a ramp name (``'viridis'`` -- the default --
+        ``'plasma'``, ``'magma'``, ``'inferno'``, ``'cividis'``, ``'greys'``,
+        ``'spectral'``, ``'terrain'``) or ``True`` for viridis; an unknown name
+        raises ``ValueError``. ``'greys'`` follows matplotlib's light-to-dark
+        orientation (low values render light). Two sidecars are written: a
+        QGIS ``.qml`` style (``<base>.qml``) with a ``singlebandpseudocolor``
+        renderer, and ``STATISTICS_MINIMUM/MAXIMUM/MEAN/STDDEV`` in the PAM
+        ``<file>.aux.xml``. No-op for a categorical raster (one with
+        ``attrs['category_names']`` -- those get the RAT sidecar instead), a
+        multiband array, a file-like destination, or data with no finite
+        values. Computing the statistics is an extra reduction pass over the
+        data. The streaming dask write accumulates them from the buffers it
+        materialises anyway, so the source graph still runs once; the GPU
+        (``gpu=True``) and VRT (``.vrt``) write paths execute a dask source
+        a second time for the statistics (see ``color_ramp_range`` to skip
+        that). Ignored when ``pack=True``, whose on-disk packed values would
+        not match a ramp built from the logical values. Every string-path
+        write refreshes the PAM ``.aux.xml``: a sidecar left by a previous
+        write at the same path is removed and re-created only when this
+        write carries its own categories or statistics (#3595). A
+        pre-existing ``.qml`` is kept unless ``color_ramp`` replaces it --
+        QGIS treats it as user styling that persists across data updates.
+    color_ramp_range : tuple of (float, float) or None, default None
+        [advanced] Explicit ``(min, max)`` for the ``color_ramp`` stretch.
+        Skips the statistics reduction -- useful for a dask source on the
+        GPU or VRT write paths, which would otherwise read the graph once
+        more -- so only ``STATISTICS_MINIMUM`` / ``STATISTICS_MAXIMUM`` are
+        written (mean/stddev need the pass it avoids). Ignored when
+        ``color_ramp`` is not set.
+
+    Returns
+    -------
+    str or binary file-like
+        The ``path`` argument (a string for filesystem paths, the
+        file-like object for BytesIO destinations). Returning the path
+        lines up with ``_build_vrt`` and lets callers chain a write into
+        a read without round-tripping through a variable; existing
+        callers that discarded the previous ``None`` return are
+        unaffected.
+
+    Raises
+    ------
+    ValueError
+        If ``data.attrs['transform']`` is a rotated or skewed affine
+        (``b != 0`` or ``d != 0`` in rasterio ``Affine`` ordering). The
+        on-disk GeoTIFF is axis-aligned; reproject onto an axis-aligned
+        grid first.
+    ValueError
+        If ``data.attrs['rotated_affine']`` is set and ``drop_rotation``
+        is False. The reader sets that attr on the ``allow_rotated=True``
+        path; the writer cannot emit a ``ModelTransformationTag`` so
+        writing would silently lose the rotation. Pass
+        ``drop_rotation=True`` to accept the loss explicitly.
+    ValueError
+        If ``data`` is a 3D DataArray whose ``dims`` is not
+        ``(band, y, x)`` or ``(y, x, band)`` (accepting the band-name
+        aliases ``bands`` / ``channel`` and spatial-name aliases
+        ``lat`` / ``lon`` / ``latitude`` / ``longitude`` / ``row`` /
+        ``col``). A leading non-band dim such as ``time`` is rejected
+        because the writer cannot infer the band axis from arbitrary
+        names and used to silently treat the leading axis as ``y``.
+
+    Examples
+    --------
+    Write a DataArray to a plain GeoTIFF and read it back:
+
+    >>> from xrspatial.geotiff import open_geotiff, to_geotiff
+    >>> to_geotiff(data, 'elevation.tif')  # doctest: +SKIP
+    >>> da = open_geotiff('elevation.tif')  # doctest: +SKIP
+
+    Write a Cloud Optimized GeoTIFF (tiled, with internal overviews):
+
+    >>> to_geotiff(data, 'elevation_cog.tif', cog=True)  # doctest: +SKIP
+
+    Write a VRT mosaic. A ``.vrt`` output path tiles the array and emits
+    the index that references the tiles:
+
+    >>> to_geotiff(data, 'mosaic.vrt')  # doctest: +SKIP
+    """
+    from .._reader import _coerce_path
+
+    path = _coerce_path(path)
+
+    # Categorical rasters carry their value->label map in attrs; continuous
+    # rasters opt into a color ramp via ``color_ramp``. QGIS/GDAL read both
+    # kinds of styling from sidecars next to the file (a PAM ``.aux.xml`` RAT
+    # for categories, a ``.qml`` style plus PAM statistics for a continuous
+    # ramp), so capture what we need now and emit the sidecars on the way out.
+    # Categorical wins when both are present, and the two never collide. File-
+    # like destinations have no path to anchor a sidecar, so skip them.
+    _cat_names = None
+    _cat_colors = None
+    _sym_data = None
+    _sym_stops = None
+    _sym_nodata = None
+    _sym_stream_stats = None
+    if isinstance(path, str) and isinstance(data, xr.DataArray):
+        _cat_names = data.attrs.get('category_names')
+        _cat_colors = data.attrs.get('category_colors')
+        # ``pack`` rewrites ``data`` to on-disk packed values below, so the
+        # symbology statistics (taken from the logical values here) would
+        # describe a different range than the stored pixels. Skip symbology
+        # when packing rather than emit a mismatched ramp.
+        if color_ramp and not _cat_names and not pack:
+            from .._symbology import resolve_ramp
+
+            # Validate the ramp name now so a typo fails before any bytes.
+            _sym_stops = resolve_ramp(color_ramp)
+            _sym_data = data
+            _sym_nodata = (nodata if nodata is not None
+                           else _resolve_nodata_attr(data.attrs))
+
+    def _write_sidecars():
+        if isinstance(path, str):
+            # A pre-existing PAM sidecar describes whatever file this write
+            # just replaced, and ``open_geotiff`` merges it back onto attrs,
+            # so leaving it behind hands the old file's categories /
+            # statistics to the new pixels (#3595). GDAL's GTiff driver
+            # removes the PAM sidecar when creating a dataset over an
+            # existing path (``GDALDriver::QuietDelete``); match that. The
+            # ``write_*_sidecar`` calls below re-create it when this write
+            # carries its own categories or statistics. The ``.qml`` style
+            # sidecar is deliberately left alone: QGIS treats it as user
+            # styling that persists across data updates, so only a new
+            # ``color_ramp=`` write replaces it.
+            from .._pam import sidecar_path
+            try:
+                os.remove(sidecar_path(path))
+            except OSError:
+                # Missing sidecar is the normal case; a locked one (e.g.
+                # PermissionError on Windows) is swallowed too, matching
+                # QuietDelete: the pixel write already succeeded, so a
+                # leftover sidecar beats failing the whole write.
+                pass
+        if _cat_names:
+            from .._pam import write_pam_sidecar
+            write_pam_sidecar(path, _cat_names, _cat_colors)
+            return
+        if _sym_stops is not None:
+            from .._symbology import write_symbology_sidecars
+            write_symbology_sidecars(
+                path, _sym_data, stops=_sym_stops,
+                nodata=_sym_nodata, ramp_range=color_ramp_range,
+                stats=_sym_stream_stats)
+
+    # Reject bool / np.bool_ nodata up front. ``bool`` is a subclass of
+    # ``int`` in Python, so a typo like ``nodata=True`` slips past every
+    # downstream ``isinstance(nodata, (int, float))`` guard. The geotag
+    # builder then writes ``str(True)`` -> ``"True"`` into GDAL_NODATA,
+    # which no reader parses as numeric, so the round-trip drops the
+    # sentinel without warning. Refuse rather than coerce ``True`` to 1:
+    # the caller almost certainly meant a real numeric sentinel.
+    if isinstance(nodata, (bool, np.bool_)):
+        raise TypeError(
+            f"nodata must be numeric (int or float), got {nodata!r}")
+
+    # Reject non-bool ``gpu`` before the truthiness dispatch below.
+    # ``use_gpu`` keys the GPU path off ``gpu`` directly, so a value
+    # like ``gpu="False"`` (truthy) would silently select the GPU
+    # writer. ``None`` stays valid here: it means "auto-detect from the
+    # data" on the write path.
+    _validate_gpu_arg(gpu, allow_none=True)
+
+    # tiled=False ignores tile_size for the strip-layout pixel data, so
+    # historically validation only ran when tiled=True. The COG path
+    # (cog=True) still reads tile_size to auto-generate overviews in
+    # ``_writer.py`` regardless of the strip-vs-tiled choice, so a
+    # non-positive tile_size with cog=True drove the overview loop
+    # into a hang once oh, ow halved to 0. Validate
+    # tile_size whenever either path will consume it: tiled output OR
+    # COG overview generation. Shared with _write_geotiff_gpu via
+    # _validate_tile_size_arg so both writers keep identical validation.
+    if tiled or cog:
+        _validate_tile_size_arg(tile_size)
+
+    _validate_nodata_arg(nodata)
+
+    # ``pack``: inverse of ``open_geotiff(unpack=True)``. Reverse
+    # the scale / offset, restore the recorded integer source dtype, and fill
+    # NaN back to the nodata sentinel. The SCALE / OFFSET tags are kept (see
+    # ``_pack``) so the re-packed file unpacks cleanly on the next
+    # ``unpack`` read. Run before any dispatch (GPU / VRT / streaming
+    # / eager) so every write path sees the re-packed array, and after the
+    # nodata kwarg validation above so the kwarg can be threaded into the
+    # fill step: ``nodata=`` overrides the attrs sentinel as the fill value,
+    # keeping the filled pixels and the GDAL_NODATA tag on the same
+    # precedence (#3168).
+    if pack:
+        if not isinstance(data, xr.DataArray):
+            raise ValueError(
+                "pack=True requires a DataArray carrying the attrs from an "
+                "open_geotiff(unpack=True) read; got a bare array with no "
+                "metadata to reverse.")
+        data = _pack(data, nodata=nodata)
+
+    # Refuse to silently drop the rotated 6-tuple that the reader
+    # surfaces on ``attrs['rotated_affine']`` when called with
+    # ``allow_rotated=True``. The writer has no ``ModelTransformationTag``
+    # emit path, so writing a rotated input produces an identity-affine
+    # file with no signal to the caller. Run the check
+    # at the entry point so the GPU dispatch path, the VRT path, and the
+    # eager path all hit the same gate.
+    _drop_rotation_attrs = getattr(data, 'attrs', None) or {}
+    _validate_no_rotated_affine(
+        _drop_rotation_attrs,
+        drop_rotation=drop_rotation,
+        entry_point="to_geotiff",
+    )
+
+    # ``attrs['transform']`` carrying a rasterio ``Affine`` with
+    # non-zero rotation/shear (``b != 0`` or ``d != 0``) silently
+    # slipped past ``transform_from_attr`` because ``Affine`` iterates
+    # as a 9-element augmented matrix and the 6-tuple gate there ran
+    # ``len(seq) != 6 -> return None``. Without the rejection the writer
+    # falls back to coord-derived or no-georef output and the rotation
+    # is lost on disk. Detect the Affine shape by duck-typing the (b, d)
+    # attrs and surface the same diagnostic the 6-tuple branch raises
+    # (wording kept verbatim so the existing match patterns still hit).
+    _attr_transform = _drop_rotation_attrs.get('transform')
+    if (_attr_transform is not None
+            and hasattr(_attr_transform, 'b')
+            and hasattr(_attr_transform, 'd')):
+        try:
+            _b = float(_attr_transform.b)
+            _d = float(_attr_transform.d)
+        except (TypeError, ValueError) as _exc:
+            # Fail-closed on a malformed ``.b`` / ``.d`` rather than
+            # zero-defaulting: an unconvertable value inside an attr
+            # claiming to be an affine transform is itself a writer
+            # input contract violation. Without the explicit raise the
+            # branch would bypass every downstream georef gate that
+            # would otherwise catch the bad value.
+            raise ValueError(
+                f"attrs['transform'] has unconvertable rotation/shear "
+                f"terms (b={_attr_transform.b!r}, "
+                f"d={_attr_transform.d!r}); expected numeric values on "
+                f"a rasterio Affine-like object."
+            ) from _exc
+        if abs(_b) > ROTATION_SHEAR_TOL or abs(_d) > ROTATION_SHEAR_TOL:
+            raise ValueError(
+                f"attrs['transform'] has non-zero rotation/shear "
+                f"(b={_b!r}, d={_d!r}); rotated or skewed affines are "
+                f"not supported by the GeoTIFF writers in this module "
+                f"because the on-disk GeoTIFF representation is "
+                f"axis-aligned and would be written at the wrong "
+                f"location. Reproject the raster to an axis-aligned "
+                f"grid before writing."
+            )
+
+    # Reject zero-height / zero-width inputs before any dispatch
+    # decision. Clip / window pipelines naturally produce empty
+    # rasters and the writers used to accept them, produce a TIFF whose
+    # IFD claimed shape ``(0, N)`` / ``(N, 0)``, and surface a generic
+    # "Invalid image dimensions" only at read time. Fail closed at the
+    # entry point with a message that names the offending dim.
+    _shape = getattr(data, 'shape', None)
+    _dims = getattr(data, 'dims', None)
+    _validate_writer_spatial_shape(_shape, _dims)
+
+    # Ambiguous-metadata checks. The hook is a no-op when no check is
+    # registered, so this call is safe even if every check is later
+    # unregistered for a specific entry point.
+    #
+    # Resolve documented spatial-dim aliases (lat/lon,
+    # latitude/longitude, row/col) here so the NonUniformCoordsError
+    # check fires consistently regardless of which alias the caller
+    # picked. Before this, only literal coords['y'] / coords['x']
+    # were passed in, and alias-named coords slipped past the
+    # validator entirely; the later transform-synthesis path caught
+    # them only as plain ValueError.
+    _attrs = getattr(data, 'attrs', None) or {}
+    _coord_y, _coord_x = _resolve_spatial_coords(data)
+    validate_write_metadata({
+        'crs_kwarg': crs,
+        'attrs_crs': _attrs.get('crs'),
+        'attrs_crs_wkt': _attrs.get('crs_wkt'),
+        'nodata_kwarg': nodata,
+        'attrs_nodata': _attrs.get('nodata'),
+        'attrs_nodatavals': _attrs.get('nodatavals'),
+        'coord_y': _coord_y,
+        'coord_x': _coord_x,
+        'no_georef_marker': _has_no_georef_marker(data),
+    })
+
+    # Up-front validation: catch bad compression names before they reach
+    # any of the deeper write paths (streaming, GPU, VRT, COG) where the
+    # error surfaces from _compression_tag with a less obvious traceback.
+    if not isinstance(compression, str):
+        # The string block below validates bad NAMES, but a non-string
+        # ``compression`` skips it entirely and later lands in
+        # ``compression.lower()`` during compression_level validation,
+        # surfacing as ``AttributeError`` instead of a typed error.
+        # ``None`` is included: the contract is ``compression: str`` (use
+        # the ``'none'`` string to disable compression), so ``None`` is
+        # rejected here rather than aliased (#2978). Reject the bad TYPE
+        # with the same shape as the low-level writer's guard in
+        # ``_writer.py``.
+        raise TypeError(
+            f"compression must be a str (in to_geotiff); "
+            f"got {type(compression).__name__}.")
+    if isinstance(compression, str):
+        if compression.lower() not in _VALID_COMPRESSIONS:
+            raise ValueError(
+                f"Unknown compression {compression!r}. "
+                f"Valid options: {list(_VALID_COMPRESSIONS)}.")
+        # JPEG-in-TIFF (compression=7) requires the JPEGTables tag (347)
+        # carrying the abbreviated quantization/Huffman tables. The
+        # current encoder writes a self-contained JFIF stream per
+        # tile/strip and omits JPEGTables, which makes the resulting
+        # files unreadable by libtiff / GDAL / rasterio: they reject the
+        # tile data with "TIFFReadEncodedStrip() failed". The internal
+        # reader round-trips because Pillow re-decodes the JFIF stream
+        # directly, masking the interop break. Refuse the write by
+        # default and surface the same ``allow_internal_only_jpeg=True``
+        # opt-in that ``_write_geotiff_gpu`` already accepts, so the
+        # auto-dispatch entry point can reach the experimental
+        # internal-reader-only path the explicit GPU entry point
+        # exposes.
+        if compression.lower() == 'jpeg' and not allow_internal_only_jpeg:
+            raise ValueError(
+                "compression='jpeg' is not supported: the encoder writes "
+                "self-contained JFIF streams without the required "
+                "JPEGTables tag (347), so other readers (libtiff, GDAL, "
+                "rasterio) reject the file. Use 'deflate', 'zstd', or "
+                "'lzw' instead. Pass allow_internal_only_jpeg=True to "
+                "opt in to the experimental internal-reader-only path "
+                "(issue #1845).")
+        # The JPEG opt-in warning is emitted below once we know the
+        # dispatch decision: ``_write_geotiff_gpu`` emits its own warning
+        # on the GPU path, so emitting here would double-warn callers
+        # of ``to_geotiff(gpu=True, compression='jpeg',
+        # allow_internal_only_jpeg=True)``.
+
+        # Tier 3 experimental-codec gate. Lerc, jpeg2000 /
+        # j2k, and lz4 sit in ``_VALID_COMPRESSIONS`` for wire-format
+        # reasons but their cross-backend numerical parity, reader
+        # support across GDAL versions, and (for lerc) bounded lossy
+        # behaviour all carry caveats the default writer should not
+        # silently accept. Mirror the ``allow_internal_only_jpeg`` shape
+        # so callers learn the opt-in name from the rejection message
+        # and can fix the call site in one line. The opt-in warning is
+        # emitted below once the GPU dispatch decision is known so the
+        # GPU path does not double-warn (``_write_geotiff_gpu`` emits its
+        # own warning on the GPU path).
+        if (compression.lower() in _EXPERIMENTAL_CODECS
+                and not allow_experimental_codecs):
+            raise ValueError(
+                f"compression={compression!r} is experimental: cross-backend "
+                "numerical parity is not claimed and reader support across "
+                "GDAL versions is uneven. Pass allow_experimental_codecs=True "
+                "to opt in, or use 'deflate', 'zstd', or 'lzw' for a "
+                "stable lossless codec (issue #2137).")
+
+    # max_z_error only applies to LERC; reject negative values and reject
+    # non-zero values paired with any other codec so the caller learns the
+    # parameter was ignored before bytes hit disk.
+    if max_z_error < 0:
+        raise ValueError(
+            f"max_z_error must be >= 0, got {max_z_error}")
+    if max_z_error != 0 and (
+            not isinstance(compression, str)
+            or compression.lower() != 'lerc'):
+        raise ValueError(
+            "max_z_error is only valid with compression='lerc'")
+
+    # Reject non-int / bool compression_level before the range check so
+    # ``compression_level=True`` is not coerced to level 1 and non-int
+    # junk gets a clear, parameter-named TypeError instead of a raw
+    # comparison error or a silent pass for codecs without a level range
+    # (#3321). Runs for every codec, ahead of backend dispatch.
+    _validate_compression_level_arg(compression_level)
+
+    # Validate compression_level against the codec-specific range before
+    # any backend dispatch (GPU, VRT, streaming, eager) so every path
+    # rejects out-of-range levels identically. This used to run only on
+    # the CPU branches, below the GPU dispatch, so
+    # ``to_geotiff(cupy_da, ..., compression_level=999)`` succeeded while
+    # the numpy call raised (#3167).
+    if compression_level is not None:
+        level_range = _LEVEL_RANGES.get(compression.lower())
+        if level_range is not None:
+            lo, hi = level_range
+            if not (lo <= compression_level <= hi):
+                raise ValueError(
+                    f"compression_level={compression_level} out of range "
+                    f"for {compression} (valid: {lo}-{hi})")
+
+    # File-like (BytesIO etc.) destinations: the streaming, GPU, COG, and
+    # VRT writers all need a real filesystem path (atomic rename, overview
+    # passes, sidecar writes). Reject those combos up front so the user
+    # gets a clear error instead of a deep traceback.
+    _path_is_file_like = (not isinstance(path, str)) and hasattr(path, 'write')
+    if _path_is_file_like:
+        if cog:
+            raise ValueError(
+                "cog=True is not supported for file-like destinations. "
+                "Pass a string path or write to BytesIO without cog=True.")
+    elif not isinstance(path, str):
+        raise TypeError(
+            f"path must be a str or a binary file-like with a write() "
+            f"method, got {type(path).__name__}")
+
+    _is_vrt_path = (
+        isinstance(path, str) and path.lower().endswith('.vrt'))
+
+    # Resolve GPU dispatch up front so the JPEG opt-in warning fires
+    # exactly once. ``_write_geotiff_gpu`` emits its own warning on the
+    # GPU path; emitting here as well would double-warn callers of
+    # ``to_geotiff(gpu=True, compression='jpeg',
+    # allow_internal_only_jpeg=True)``. VRT and CPU paths receive the
+    # warning here. On GPU-to-CPU fallback the GPU writer has already
+    # warned before raising, so the CPU fallback does not warn twice.
+    auto_detected_gpu = gpu is None
+    use_gpu = gpu if gpu is not None else _is_gpu_data(data)
+    if (isinstance(compression, str)
+            and compression.lower() == 'jpeg'
+            and allow_internal_only_jpeg
+            and not use_gpu):
+        warnings.warn(
+            "to_geotiff(compression='jpeg', "
+            "allow_internal_only_jpeg=True) writes JFIF tiles "
+            "without the TIFF JPEGTables tag (347); the file decodes "
+            "through xrspatial but may fail in libtiff, GDAL, or "
+            "rasterio. See issue #1845.",
+            GeoTIFFFallbackWarning,
+            stacklevel=2,
+        )
+    # Tier 3 experimental-codec opt-in warning. Mirrors the JPEG
+    # flag's "warn once, after dispatch is resolved" shape:
+    # ``_write_geotiff_gpu`` emits its own warning on the GPU path with
+    # a backend-specific caveat, so the CPU dispatcher only warns when
+    # the write is staying on CPU.
+    if (isinstance(compression, str)
+            and compression.lower() in _EXPERIMENTAL_CODECS
+            and allow_experimental_codecs
+            and not use_gpu):
+        warnings.warn(
+            f"to_geotiff(compression={compression!r}, "
+            "allow_experimental_codecs=True): experimental codec, "
+            "no cross-backend parity claim and uneven reader support "
+            "across GDAL versions. See issue #2137.",
+            GeoTIFFFallbackWarning,
+            stacklevel=2,
+        )
+
+    # Reject ``gdal_metadata_xml`` / ``extra_tags`` pass-through writes
+    # unless the caller opted in via ``allow_experimental_codecs=True``.
+    # Both surfaces ride the Experimental tier in ``SUPPORTED_FEATURES``
+    # because the on-disk bytes are written verbatim and downstream
+    # interop with rasterio / libtiff / GDAL depends on the payload.
+    _data_attrs_for_optin = (
+        data.attrs if isinstance(data, xr.DataArray) else {}
+    )
+    from .._attrs import _validate_write_rich_tag_optin
+    _validate_write_rich_tag_optin(
+        _data_attrs_for_optin,
+        allow_experimental_codecs=allow_experimental_codecs,
+        entry_point="to_geotiff",
+    )
+
+    # ``cog=True`` requires a tiled internal layout per the COG spec.
+    # The writer used to accept ``cog=True, tiled=False``, warn that
+    # ``tile_size`` was ignored, and then write strips via ``_write`` --
+    # silently producing a file that violates the stable COG contract.
+    # Reject the combination at the public boundary with the same
+    # actionable-error shape as the other COG input gates: the message
+    # names the violated constraint and lists both fixes the caller can
+    # apply in one line. The defense-in-depth gate in ``_writer._write``
+    # catches direct callers that bypass this wrapper.
+    if cog and not tiled:
+        raise ValueError(_COG_REQUIRES_TILED_MSG)
+
+    # tile_size only applies to tiled output; warn if the caller passed a
+    # non-default size alongside strip mode (it would otherwise be silently
+    # ignored). The VRT path always tiles, so the warning would be
+    # misleading there -- the VRT branch below rejects tiled=False up front
+    # instead. The ``cog=True, tiled=False`` arm of this warning is dead
+    # under the cog/tiled gate above (that combination raises before
+    # reaching this line), so the condition below only fires for ``cog=False,
+    # tiled=False, tile_size != 256``.
+    if not tiled and tile_size != 256 and not _is_vrt_path:
+        warnings.warn(
+            f"tile_size={tile_size} is ignored when tiled=False "
+            "(strip layout). Pass tiled=True to use tile_size, or drop "
+            "tile_size to silence this warning.",
+            stacklevel=2,
+        )
+
+    # VRT tiled output (string paths only -- VRT writes a real .vrt file
+    # plus per-tile GeoTIFFs to a directory)
+    if _is_vrt_path:
+        if not tiled:
+            raise ValueError(
+                "tiled=False is not compatible with VRT output. "
+                "VRT writes a directory of tiled GeoTIFFs; pass "
+                "tiled=True or omit it.")
+        # The early ``if tiled: _validate_tile_size_arg(tile_size)`` check
+        # above already validates tile_size when tiled=True, but call it
+        # here as well so the VRT path stays self-contained against future
+        # changes to the early-validation gate (no-op on re-entry; either
+        # raises or returns).
+        _validate_tile_size_arg(tile_size)
+        if cog:
+            raise ValueError(
+                "cog=True is not compatible with VRT output. "
+                "VRT writes tiled GeoTIFFs, not a single COG.")
+        if overview_levels is not None:
+            raise ValueError(
+                "overview_levels is not compatible with VRT output. "
+                "VRT tiles do not include overviews.")
+        _write_vrt_tiled(data, path,
+                         crs=crs, nodata=nodata,
+                         compression=compression,
+                         compression_level=compression_level,
+                         tile_size=tile_size,
+                         predictor=predictor,
+                         bigtiff=bigtiff,
+                         max_z_error=max_z_error,
+                         photometric=photometric,
+                         allow_unparseable_crs=allow_unparseable_crs,
+                         allow_internal_only_jpeg=allow_internal_only_jpeg,
+                         drop_rotation=drop_rotation)
+        _write_sidecars()
+        return path
+
+    # Dispatch to _write_geotiff_gpu when GPU was selected (explicit
+    # ``gpu=True`` or auto-detected CuPy data). ``auto_detected_gpu``
+    # and ``use_gpu`` were computed above to gate the JPEG opt-in
+    # warning; reuse them so the call sites stay in sync.
+    if use_gpu and _path_is_file_like:
+        # _write_geotiff_gpu's nvCOMP path materialises tile parts and then
+        # calls _write_bytes(path), which would write at the buffer's
+        # current cursor without truncating. More importantly, the GPU
+        # path was never tested with file-like destinations; refuse rather
+        # than silently produce something untested.
+        raise ValueError(
+            "gpu=True is not supported for file-like destinations. "
+            "Pass a string path (or set gpu=False).")
+    if use_gpu:
+        # GPU writer uses nvCOMP and does not support LERC; refuse rather
+        # than silently dropping the requested error budget.
+        if max_z_error != 0:
+            raise ValueError(
+                "max_z_error is not supported on the GPU writer "
+                "(nvCOMP has no LERC backend). Use the CPU path "
+                "(gpu=False) or omit max_z_error.")
+        # Strip output is not implemented on the GPU path; reject up
+        # front rather than silently producing a tiled file.
+        if not tiled:
+            raise ValueError(
+                "tiled=False is not supported on the GPU writer. "
+                "Pass gpu=False or omit tiled=False.")
+        try:
+            _write_geotiff_gpu(
+                data, path, crs=crs, nodata=nodata,
+                compression=compression,
+                compression_level=compression_level,
+                tiled=tiled,
+                tile_size=tile_size,
+                predictor=predictor,
+                cog=cog,
+                overview_levels=overview_levels,
+                overview_resampling=overview_resampling,
+                bigtiff=bigtiff,
+                streaming_buffer_bytes=streaming_buffer_bytes,
+                photometric=photometric,
+                allow_internal_only_jpeg=allow_internal_only_jpeg,
+                allow_experimental_codecs=allow_experimental_codecs,
+                allow_unparseable_crs=allow_unparseable_crs,
+                drop_rotation=drop_rotation,
+            )
+            _write_sidecars()
+            return path
+        except ImportError as e:
+            # ``_write_geotiff_gpu`` raises ImportError when cupy itself
+            # can't be imported. nvCOMP absence doesn't surface here:
+            # ``_try_nvcomp_from_device_bufs`` returns None when the
+            # library can't load, and the writer drops to CPU
+            # compression internally instead of re-raising. Fall back
+            # to the CPU writer with a typed warning so callers see
+            # that gpu=True (or auto-detected CuPy data) didn't go
+            # through. Strict mode re-raises so CI can fail loudly on
+            # missing GPU stacks.
+            if _geotiff_strict_mode():
+                raise
+            warnings.warn(
+                _gpu_fallback_warning_message(auto_detected_gpu, e),
+                GeoTIFFFallbackWarning,
+                stacklevel=2,
+            )
+        except RuntimeError as e:
+            # Only fall back when the message names a GPU-availability
+            # problem; any other RuntimeError is a real bug in the GPU
+            # writer and the broad ``except (ImportError, Exception)``
+            # used to hide it from the user. Keep the keyword list
+            # tight: nvCOMP / CUDA / no device / no GPU / cuInit cover
+            # the realistic "no GPU present" failure modes without
+            # masking, e.g., a CRS or compression error that happens to
+            # raise RuntimeError. Strict mode re-raises in either case.
+            _gpu_unavail_tokens = (
+                'nvcomp', 'cuda', 'no device', 'no gpu', 'cuinit',
+            )
+            msg = str(e).lower()
+            if not any(tok in msg for tok in _gpu_unavail_tokens):
+                raise
+            if _geotiff_strict_mode():
+                raise
+            warnings.warn(
+                _gpu_fallback_warning_message(auto_detected_gpu, e),
+                GeoTIFFFallbackWarning,
+                stacklevel=2,
+            )
+
+    geo_transform = None
+    epsg = None
+    wkt_fallback = None  # WKT string when EPSG is not available
+    raster_type = RASTER_PIXEL_IS_AREA
+    x_res = None
+    y_res = None
+    res_unit = None
+    gdal_meta_xml = None
+    extra_tags_list = None
+    # Default for the NaN-sentinel restore gate. Overwritten with the
+    # actual ``attrs['masked_nodata']`` value below when ``data`` is a
+    # DataArray; bare numpy / cupy positional inputs have no attrs
+    # so they keep the NaN->sentinel rewrite.
+    restore_sentinel = True
+
+    # Resolve crs argument: can be int (EPSG) or str (WKT/PROJ).
+    # ``numbers.Integral`` covers plain ``int`` and numpy integer scalars
+    # (``np.int32``, ``np.int64``); ``_validate_crs_arg`` already rejects
+    # bool. Coerce to plain ``int`` so downstream ``epsg`` is a real int.
+    _validate_crs_arg(crs)
+    if isinstance(crs, numbers.Integral):
+        epsg = int(crs)
+    elif isinstance(crs, str):
+        epsg = _wkt_to_epsg(crs)  # try to extract EPSG from WKT/PROJ
+        if epsg is None:
+            wkt_fallback = crs
+
+    if isinstance(data, xr.DataArray):
+        raw = data.data
+
+        # Extract metadata from DataArray attrs (no materialisation needed).
+        # Resolve the affine through the centralised resolver so this
+        # writer, the GPU writer, and the per-tile VRT path share
+        # the same precedence rule: prefer ``attrs['transform']`` (which
+        # round-trips bit-exactly) over a coord-derived transform (which
+        # drifts on fractional pixel sizes because ``x[1] - x[0]`` is
+        # computed in float64 from already-rounded coords).
+        if geo_transform is None:
+            geo_transform = _resolve_georef(data).transform
+        # Fail closed when coords are present but no transform could be
+        # derived (e.g. 1x1 without ``attrs['transform']``) instead of
+        # silently writing a non-georeferenced TIFF that round-trips back
+        # with integer pixel coords.
+        _require_transform_for_georeferenced(data, geo_transform)
+        if epsg is None and crs is None:
+            crs_attr = data.attrs.get('crs')
+            if isinstance(crs_attr, str):
+                epsg = _wkt_to_epsg(crs_attr)
+                if epsg is None and wkt_fallback is None:
+                    wkt_fallback = crs_attr
+            elif crs_attr is not None:
+                # Same gate as the kwarg path: reject bool / non-int
+                # types and confirm the EPSG resolves before writing it
+                # to disk. Without this, ``attrs={'crs': True}`` round-
+                # trips as EPSG=1.
+                _validate_crs_arg(crs_attr)
+                epsg = int(crs_attr)
+            if epsg is None:
+                wkt = data.attrs.get('crs_wkt')
+                if isinstance(wkt, str):
+                    epsg = _wkt_to_epsg(wkt)
+                    if epsg is None and wkt_fallback is None:
+                        wkt_fallback = wkt
+        if nodata is None:
+            nodata = _resolve_nodata_attr(data.attrs)
+        # ``attrs['masked_nodata']`` records whether the reader promoted
+        # the sentinel to NaN. Writers reverse that rewrite only when the
+        # read side did the forward step. Default (attr absent) is True,
+        # which preserves behaviour for external DataArrays.
+        restore_sentinel = _should_restore_nan_sentinel(data.attrs)
+        # Pull raster_type, gdal_metadata_xml, extra_tags (folded with
+        # the friendly image_description / extra_samples / colormap
+        # attrs), x/y_resolution, and resolution_unit via the shared
+        # helper so all three writers stay in lockstep.
+        _rich = _extract_rich_tags(data.attrs)
+        raster_type = _rich['raster_type']
+        gdal_meta_xml = _rich['gdal_metadata_xml']
+        extra_tags_list = _rich['extra_tags']
+        x_res = _rich['x_resolution']
+        y_res = _rich['y_resolution']
+        res_unit = _rich['resolution_unit']
+
+        # Dask-backed: stream tiles to avoid materialising the full array.
+        # COG requires overviews from the full array, so it falls through
+        # to the eager path. Streaming write needs a real filesystem path
+        # (it builds a temp file then atomic-renames); for file-like
+        # destinations we materialise eagerly and assemble in-memory.
+        if hasattr(raw, 'dask') and not cog and not _path_is_file_like:
+            dask_arr = raw
+            # Reject ambiguous 3D layouts at the entry point so a leading
+            # non-band dim like ``('time', 'y', 'x')`` cannot silently
+            # round-trip as a TIFF whose ``y`` axis carries the time
+            # values.
+            if raw.ndim == 3:
+                _validate_3d_writer_dims(data.dims)
+            # Handle band-first dimension order (band, y, x) -> (y, x, band)
+            if raw.ndim == 3 and data.dims[0] in _BAND_DIM_NAMES:
+                import dask.array as da
+                dask_arr = da.moveaxis(raw, 0, -1)
+            if dask_arr.ndim not in (2, 3):
+                raise ValueError(
+                    f"Expected 2D or 3D array, got {dask_arr.ndim}D")
+            # compression_level was validated up front, before backend
+            # dispatch (#3167).
+            from .._writer import write_streaming
+
+            # Refuse to write an unvalidatable CRS string into
+            # GTCitationGeoKey unless the caller opts in. ``epsg`` is
+            # set when ``_wkt_to_epsg`` succeeded; only the fallback
+            # branch needs the guard.
+            if epsg is None:
+                _validate_crs_fallback(wkt_fallback, allow_unparseable_crs)
+            # ``color_ramp`` statistics: rather than re-executing the
+            # source graph after the write (a second full read of the
+            # data, issue #3597), accumulate them from the buffers the
+            # streaming write materialises anyway. ``color_ramp_range``
+            # already skips statistics, and multiband data never gets
+            # symbology, so neither pays the accumulation cost.
+            _stream_chunk_observer = None
+            if _sym_stops is not None and color_ramp_range is None:
+                from .._symbology import StreamingStats, _is_single_band
+                if _is_single_band(data):
+                    _sym_stream_stats = StreamingStats(nodata=_sym_nodata)
+                    _stream_chunk_observer = _sym_stream_stats.update
+            write_streaming(
+                dask_arr, path,
+                geo_transform=geo_transform,
+                crs_epsg=epsg,
+                crs_wkt=wkt_fallback if epsg is None else None,
+                nodata=nodata,
+                compression=compression,
+                compression_level=compression_level,
+                tiled=tiled,
+                tile_size=tile_size,
+                predictor=predictor,
+                raster_type=raster_type,
+                x_resolution=x_res,
+                y_resolution=y_res,
+                resolution_unit=res_unit,
+                gdal_metadata_xml=gdal_meta_xml,
+                extra_tags=extra_tags_list,
+                bigtiff=bigtiff,
+                streaming_buffer_bytes=streaming_buffer_bytes,
+                max_z_error=max_z_error,
+                photometric=photometric,
+                restore_sentinel=restore_sentinel,
+                # ``to_geotiff`` ran the JPEG opt-in and the CRS
+                # fallback gates upstream; forwarding the kwargs lets
+                # ``_write_streaming``'s push-down check stay aligned
+                # rather than rejecting input the wrapper accepted.
+                allow_internal_only_jpeg=allow_internal_only_jpeg,
+                allow_unparseable_crs=allow_unparseable_crs,
+                chunk_observer=_stream_chunk_observer,
+            )
+            _write_sidecars()
+            return path
+
+        # Eager compute (numpy, CuPy, or dask+COG)
+        if hasattr(raw, 'get'):
+            arr = raw.get()  # CuPy -> numpy
+        elif hasattr(raw, 'compute'):
+            arr = raw.compute()  # Dask -> numpy
+            if hasattr(arr, 'get'):
+                arr = arr.get()  # Dask+CuPy -> numpy
+        else:
+            arr = np.asarray(raw)
+        # Reject ambiguous 3D layouts. The validator runs
+        # on ``data.dims`` (the original DataArray's dim names) rather
+        # than on ``arr`` so the error fires before the move-axis even
+        # for COG and file-like destinations that fall through here.
+        if arr.ndim == 3:
+            _validate_3d_writer_dims(data.dims)
+        # Handle band-first dimension order (band, y, x) -> (y, x, band)
+        if arr.ndim == 3 and data.dims[0] in _BAND_DIM_NAMES:
+            arr = np.moveaxis(arr, 0, -1)
+    else:
+        if hasattr(data, 'get'):
+            arr = data.get()  # CuPy -> numpy
+        else:
+            arr = np.asarray(data)
+
+    if arr.ndim not in (2, 3):
+        raise ValueError(f"Expected 2D or 3D array, got {arr.ndim}D")
+
+    # Auto-promote unsupported dtypes
+    if arr.dtype == np.float16:
+        arr = arr.astype(np.float32)
+    elif arr.dtype == np.bool_:
+        arr = arr.astype(np.uint8)
+
+    # Restore NaN pixels to the nodata sentinel value so the written file
+    # has sentinel values matching the GDAL_NODATA tag.
+    #
+    # The defensive ``arr.copy()`` here is intentional: ``arr`` may be
+    # ``np.asarray(raw)`` of a caller-owned numpy DataArray (a view,
+    # not a copy) or ``np.moveaxis(arr, 0, -1)`` of one (also a view).
+    # Mutating without a copy would corrupt the user's input buffer.
+    #
+    # ``NodataLifecycle.writer_restore_sentinel`` owns the "should we
+    # restore?" decision (no declared sentinel, non-float buffer, NaN
+    # sentinel all collapse to False there). The ``restore_sentinel``
+    # local was resolved upstream from ``attrs['masked_nodata']`` and
+    # is passed through the helper's ``restore_sentinel=`` kwarg as a
+    # single bool.
+    if _NL(declared=nodata, dtype_in=arr.dtype).writer_restore_sentinel(
+            buffer_dtype=arr.dtype,
+            restore_sentinel=restore_sentinel,
+    ):
+        nan_mask = np.isnan(arr)
+        if nan_mask.any():
+            arr = arr.copy()
+            arr[nan_mask] = arr.dtype.type(nodata)
+
+    # compression_level was validated up front, before backend dispatch
+    # (#3167).
+
+    # Refuse to write an unvalidatable CRS string into GTCitationGeoKey
+    # unless the caller opts in.
+    if epsg is None:
+        _validate_crs_fallback(wkt_fallback, allow_unparseable_crs)
+    write(
+        arr, path,
+        geo_transform=geo_transform,
+        crs_epsg=epsg,
+        crs_wkt=wkt_fallback if epsg is None else None,
+        nodata=nodata,
+        compression=compression,
+        compression_level=compression_level,
+        tiled=tiled,
+        tile_size=tile_size,
+        predictor=predictor,
+        cog=cog,
+        overview_levels=overview_levels,
+        overview_resampling=overview_resampling,
+        raster_type=raster_type,
+        x_resolution=x_res,
+        y_resolution=y_res,
+        resolution_unit=res_unit,
+        gdal_metadata_xml=gdal_meta_xml,
+        extra_tags=extra_tags_list,
+        bigtiff=bigtiff,
+        max_z_error=max_z_error,
+        photometric=photometric,
+        restore_sentinel=restore_sentinel,
+        # ``to_geotiff`` ran the JPEG opt-in and the CRS fallback
+        # gates upstream; forwarding the kwargs keeps ``_write``'s
+        # push-down check from rejecting input the wrapper accepted.
+        allow_internal_only_jpeg=allow_internal_only_jpeg,
+        allow_unparseable_crs=allow_unparseable_crs,
+    )
+    _write_sidecars()
+    return path
+
+
+def _write_single_tile(chunk_data, path, geo_transform, epsg, wkt,
+                       nodata, compression, compression_level,
+                       tile_size, predictor, bigtiff,
+                       max_z_error: float = 0.0,
+                       raster_type: int = RASTER_PIXEL_IS_AREA,
+                       x_resolution=None,
+                       y_resolution=None,
+                       resolution_unit=None,
+                       gdal_metadata_xml=None,
+                       extra_tags=None,
+                       photometric: str | int = 'auto',
+                       restore_sentinel: bool = True,
+                       allow_internal_only_jpeg: bool = False,
+                       allow_unparseable_crs: bool = False):
+    """Write a single tile GeoTIFF. Used by _write_vrt_tiled.
+
+    Forwards the same rich-tag set that ``to_geotiff`` passes through to
+    ``write`` (raster_type, x/y resolution, GDAL metadata, extra tags) so
+    every per-tile file under a VRT carries the same metadata it would
+    have received from a single-file ``to_geotiff(..., out.tif)`` write.
+    Without this, ``to_geotiff(da, "out.vrt")`` silently drops everything
+    except the per-tile geo_transform / crs / nodata.
+    """
+    if hasattr(chunk_data, 'compute'):
+        chunk_data = chunk_data.compute()
+    if hasattr(chunk_data, 'get'):
+        chunk_data = chunk_data.get()  # CuPy -> numpy
+
+    arr = np.asarray(chunk_data)
+
+    # Auto-promote unsupported dtypes
+    if arr.dtype == np.float16:
+        arr = arr.astype(np.float32)
+    elif arr.dtype == np.bool_:
+        arr = arr.astype(np.uint8)
+
+    # Restore NaN to nodata sentinel.
+    #
+    # The defensive ``arr.copy()`` here is intentional: ``arr`` came
+    # from ``np.asarray(chunk_data)`` where ``chunk_data`` may be a
+    # caller-owned numpy buffer. Mutating without a copy would corrupt
+    # the user's input.
+    #
+    # ``NodataLifecycle.writer_restore_sentinel`` owns the gate; see
+    # the matching block in ``to_geotiff`` above.
+    if _NL(declared=nodata, dtype_in=arr.dtype).writer_restore_sentinel(
+            buffer_dtype=arr.dtype,
+            restore_sentinel=restore_sentinel,
+    ):
+        nan_mask = np.isnan(arr)
+        if nan_mask.any():
+            arr = arr.copy()
+            arr[nan_mask] = arr.dtype.type(nodata)
+
+    write(arr, path,
+          geo_transform=geo_transform,
+          crs_epsg=epsg,
+          crs_wkt=wkt if epsg is None else None,
+          nodata=nodata,
+          compression=compression,
+          tiled=True,
+          tile_size=tile_size,
+          predictor=predictor,
+          compression_level=compression_level,
+          raster_type=raster_type,
+          x_resolution=x_resolution,
+          y_resolution=y_resolution,
+          resolution_unit=resolution_unit,
+          gdal_metadata_xml=gdal_metadata_xml,
+          extra_tags=extra_tags,
+          bigtiff=bigtiff,
+          max_z_error=max_z_error,
+          photometric=photometric,
+          restore_sentinel=restore_sentinel,
+          # Forward the JPEG / CRS-fallback opt-ins so the per-tile
+          # write does not re-trip the push-down gate ``to_geotiff``
+          # / ``_write_vrt_tiled`` already cleared upstream.
+          allow_internal_only_jpeg=allow_internal_only_jpeg,
+          allow_unparseable_crs=allow_unparseable_crs)
+
+
+def _write_vrt_tiled(data, vrt_path, *, crs=None, nodata=None,
+                     compression='zstd', compression_level=None,
+                     tile_size=256, predictor: bool | int = False,
+                     bigtiff=None, max_z_error: float = 0.0,
+                     photometric: str | int = 'auto',
+                     allow_unparseable_crs: bool = False,
+                     allow_internal_only_jpeg: bool = False,
+                     drop_rotation: bool = False):
+    """Write a DataArray as a directory of tiled GeoTIFFs with a VRT index.
+
+    This enables streaming dask arrays to disk without materializing the
+    full array in RAM.
+    """
+    _validate_nodata_arg(nodata)
+
+    # Mirror to_geotiff's rotated_affine gate so the VRT path rejects
+    # rotated inputs at the same boundary. ``to_geotiff`` already ran
+    # the check upstream when the caller reached this branch through
+    # the dispatcher, but a direct call to ``_write_vrt_tiled`` would
+    # otherwise bypass the gate. ``entry_point`` names the private helper
+    # so a direct caller sees the function actually running the check;
+    # the public ``to_geotiff`` dispatch path raised at its own gate
+    # before reaching this point so the helper-name surface is only
+    # visible to direct callers.
+    _drop_rotation_attrs = getattr(data, 'attrs', None) or {}
+    _validate_no_rotated_affine(
+        _drop_rotation_attrs,
+        drop_rotation=drop_rotation,
+        entry_point="_write_vrt_tiled",
+    )
+
+    # Ambiguous-metadata checks; mirrors the call in ``to_geotiff`` so
+    # the dask-VRT write path enforces the same crs/crs_wkt / nodata /
+    # coord rules. Alias resolution keeps the validator consistent
+    # across both entry points.
+    _attrs = getattr(data, 'attrs', None) or {}
+    _coord_y, _coord_x = _resolve_spatial_coords(data)
+    validate_write_metadata({
+        'crs_kwarg': crs,
+        'attrs_crs': _attrs.get('crs'),
+        'attrs_crs_wkt': _attrs.get('crs_wkt'),
+        'nodata_kwarg': nodata,
+        'attrs_nodata': _attrs.get('nodata'),
+        'attrs_nodatavals': _attrs.get('nodatavals'),
+        'coord_y': _coord_y,
+        'coord_x': _coord_x,
+        'no_georef_marker': _has_no_georef_marker(data),
+    })
+
+    # Validate compression_level against codec-specific range. Reached
+    # only via to_geotiff, which already rejects non-int / bool
+    # compression_level upstream (#3321), so the range comparison here is
+    # safe on the type.
+    if compression_level is not None:
+        level_range = _LEVEL_RANGES.get(compression.lower())
+        if level_range is not None:
+            lo, hi = level_range
+            if not (lo <= compression_level <= hi):
+                raise ValueError(
+                    f"compression_level={compression_level} out of range "
+                    f"for {compression} (valid: {lo}-{hi})")
+
+    # Derive tiles directory from VRT path stem
+    vrt_dir = os.path.dirname(os.path.abspath(vrt_path))
+    stem = os.path.splitext(os.path.basename(vrt_path))[0]
+    tiles_dir_name = stem + '_tiles'
+    tiles_dir = os.path.join(vrt_dir, tiles_dir_name)
+
+    # Validate tiles directory. A non-empty ``tiles_dir`` is treated as a
+    # prior completed write and refused. Partial output from a *failed*
+    # write never reaches this name -- tiles are staged in a temp dir and
+    # only renamed into place once every tile is written (see below), so a
+    # retry after a failure starts from a clean slate.
+    if os.path.isdir(tiles_dir) and os.listdir(tiles_dir):
+        raise FileExistsError(
+            f"Tiles directory already contains files: {tiles_dir}")
+
+    # Stage tiles in a temp directory next to the final one. Same parent
+    # filesystem keeps the final ``os.replace`` atomic. The unique suffix
+    # avoids collisions between concurrent writers targeting the same VRT.
+    staging_dir = os.path.join(
+        vrt_dir, f'{tiles_dir_name}.tmp-{uuid.uuid4().hex}')
+    os.makedirs(staging_dir, exist_ok=True)
+
+    def _cleanup_staging():
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+    # The validation below (CRS, georef transform, the 2D-only
+    # check) and the per-tile write can all raise after the staging
+    # dir exists. Guard everything so a failed write removes the
+    # ``*.tmp-*`` staging dir and leaves no partial output, matching
+    # the contract documented at the leftover-state guard above.
+    try:
+        # Resolve CRS. ``numbers.Integral`` covers numpy integer scalars
+        # (``np.int32``, ``np.int64``) so ``crs=np.int64(4326)`` does not
+        # silently fall through to ``epsg=None``. Validator already
+        # rejects bool.
+        _validate_crs_arg(crs)
+        epsg = None
+        wkt_fallback = None
+        if isinstance(crs, numbers.Integral):
+            epsg = int(crs)
+        elif isinstance(crs, str):
+            epsg = _wkt_to_epsg(crs)
+            if epsg is None:
+                wkt_fallback = crs
+
+        geo_transform = None
+        raster_type = RASTER_PIXEL_IS_AREA
+        x_res = None
+        y_res = None
+        res_unit = None
+        gdal_meta_xml = None
+        extra_tags_list = None
+        # Default to the kwarg default so a plain-ndarray write (which
+        # skips the DataArray branch below) still has a defined value
+        # when it reaches the per-tile ``restore_sentinel=`` pass-through.
+        restore_sentinel = True
+
+        if isinstance(data, xr.DataArray):
+            raw = data.data
+            if epsg is None and crs is None:
+                crs_attr = data.attrs.get('crs')
+                if isinstance(crs_attr, str):
+                    epsg = _wkt_to_epsg(crs_attr)
+                    if epsg is None and wkt_fallback is None:
+                        wkt_fallback = crs_attr
+                elif crs_attr is not None:
+                    # Same gate as the kwarg path: reject bool / non-int
+                    # types and confirm the EPSG resolves before writing it
+                    # to disk. Without this, ``attrs={'crs': True}`` round-
+                    # trips as EPSG=1.
+                    _validate_crs_arg(crs_attr)
+                    epsg = int(crs_attr)
+                if epsg is None:
+                    wkt = data.attrs.get('crs_wkt')
+                    if isinstance(wkt, str):
+                        epsg = _wkt_to_epsg(wkt)
+                        if epsg is None and wkt_fallback is None:
+                            wkt_fallback = wkt
+            if nodata is None:
+                # Use the same alias-aware resolver that to_geotiff /
+                # _write_geotiff_gpu apply so a rioxarray-style DataArray
+                # (``attrs['nodatavals']``) or a CF-style one
+                # (``attrs['_FillValue']``) round-trips through ``.vrt``
+                # the same way it does through ``.tif``. Using
+                # ``attrs.get('nodata')`` directly would silently drop both
+                # aliases.
+                nodata = _resolve_nodata_attr(data.attrs)
+            # Mirror the ``to_geotiff`` gate so per-tile writes only
+            # NaN-rewrite when the read side promoted the sentinel. See
+            # ``_should_restore_nan_sentinel`` for the semantics; default
+            # True keeps existing behaviour.
+            restore_sentinel = _should_restore_nan_sentinel(data.attrs)
+            # Resolve via the centralised resolver. Same precedence as
+            # ``to_geotiff``: attrs['transform'] wins over coord-derived.
+            geo_transform = _resolve_georef(data).transform
+            # Match the to_geotiff fail-closed guard so VRT writes don't
+            # silently produce non-georeferenced tiles either.
+            _require_transform_for_georeferenced(data, geo_transform)
+            # Pull the same rich-tag set that to_geotiff forwards to
+            # ``write`` so per-tile files under the VRT carry it too.
+            _rich = _extract_rich_tags(data.attrs)
+            raster_type = _rich['raster_type']
+            gdal_meta_xml = _rich['gdal_metadata_xml']
+            extra_tags_list = _rich['extra_tags']
+            x_res = _rich['x_resolution']
+            y_res = _rich['y_resolution']
+            res_unit = _rich['resolution_unit']
+        else:
+            raw = data
+
+        # Refuse to write an unvalidatable CRS string into the per-tile
+        # GTCitationGeoKey fields unless the caller opts in.
+        # ``_write_single_tile`` forwards ``wkt_fallback`` to the geokey
+        # builder once per tile, so validate once up front rather than
+        # per-tile.
+        if epsg is None:
+            _validate_crs_fallback(wkt_fallback, allow_unparseable_crs)
+
+        # Check for dask backing
+        is_dask = hasattr(raw, 'dask')
+
+        if is_dask:
+            if raw.ndim != 2:
+                raise ValueError(
+                    "VRT tiled output currently supports 2D arrays only, "
+                    f"got {raw.ndim}D. Squeeze or select a band first.")
+            # Use dask chunk grid
+            import dask
+            row_chunks = raw.chunks[0]  # tuple of chunk sizes along y
+            col_chunks = raw.chunks[1]  # tuple of chunk sizes along x
+            n_row_tiles = len(row_chunks)
+            n_col_tiles = len(col_chunks)
+        else:
+            # Numpy: tile using tile_size
+            if hasattr(raw, 'get'):
+                np_arr = raw.get()  # CuPy
+            elif hasattr(raw, 'compute'):
+                np_arr = raw.compute()
+            else:
+                np_arr = np.asarray(raw)
+            if np_arr.ndim != 2:
+                raise ValueError(
+                    "VRT tiled output currently supports 2D arrays only, "
+                    f"got {np_arr.ndim}D. Squeeze or select a band first.")
+            height, width = np_arr.shape[:2]
+            n_row_tiles = (height + tile_size - 1) // tile_size
+            n_col_tiles = (width + tile_size - 1) // tile_size
+
+        # Zero-padding width for tile names
+        pad_width = max(2, len(str(max(n_row_tiles, n_col_tiles) - 1)))
+
+        # Tiles are written into ``staging_dir``; ``tile_names`` records the
+        # bare filenames so the final tile paths (under ``tiles_dir``) can be
+        # rebuilt for the VRT index after the atomic rename below.
+        # ``tile_offsets`` records each tile's (x_off, y_off) pixel
+        # placement in lockstep: non-georeferenced tiles carry no
+        # transform, so the VRT index needs the placement passed
+        # explicitly or every tile lands at the origin (issue #3116).
+        tile_names = []
+        tile_offsets = []
+        delayed_tasks = []
+
+        def _safe_write_tile(*args, **kwargs):
+            # Return the exception instead of raising so a failure in one
+            # threaded dask task does not abort ``dask.compute`` while sibling
+            # threads are still writing into the staging dir. The caller raises
+            # the first captured failure after every task has settled.
+            try:
+                _write_single_tile(*args, **kwargs)
+            except BaseException as exc:  # noqa: BLE001 - re-raised by caller
+                return exc
+            return None
+
+        row_offset = 0
+        for ri in range(n_row_tiles):
+            if is_dask:
+                chunk_h = row_chunks[ri]
+            else:
+                chunk_h = min(tile_size, height - row_offset)
+
+            col_offset = 0
+            for ci in range(n_col_tiles):
+                if is_dask:
+                    chunk_w = col_chunks[ci]
+                else:
+                    chunk_w = min(tile_size, width - col_offset)
+
+                tile_name = f'tile_{ri:0{pad_width}d}_{ci:0{pad_width}d}.tif'
+                tile_path = os.path.join(staging_dir, tile_name)
+                tile_names.append(tile_name)
+                tile_offsets.append((col_offset, row_offset))
+
+                # Compute per-tile geo_transform
+                tile_gt = None
+                if geo_transform is not None:
+                    tile_gt = GeoTransform(
+                        origin_x=geo_transform.origin_x + col_offset * geo_transform.pixel_width,
+                        origin_y=geo_transform.origin_y + row_offset * geo_transform.pixel_height,
+                        pixel_width=geo_transform.pixel_width,
+                        pixel_height=geo_transform.pixel_height,
+                    )
+
+                if is_dask:
+                    # Slice the dask array for this chunk
+                    r_end = row_offset + chunk_h
+                    c_end = col_offset + chunk_w
+                    chunk_data = raw[row_offset:r_end, col_offset:c_end]
+
+                    task = dask.delayed(_safe_write_tile)(
+                        chunk_data, tile_path, tile_gt, epsg, wkt_fallback,
+                        nodata, compression, compression_level,
+                        tile_size, predictor, bigtiff, max_z_error,
+                        raster_type=raster_type,
+                        x_resolution=x_res,
+                        y_resolution=y_res,
+                        resolution_unit=res_unit,
+                        gdal_metadata_xml=gdal_meta_xml,
+                        extra_tags=extra_tags_list,
+                        photometric=photometric,
+                        restore_sentinel=restore_sentinel,
+                        allow_internal_only_jpeg=allow_internal_only_jpeg,
+                        allow_unparseable_crs=allow_unparseable_crs)
+                    delayed_tasks.append(task)
+                else:
+                    # Numpy: slice and write directly
+                    chunk_data = np_arr[row_offset:row_offset + chunk_h,
+                                        col_offset:col_offset + chunk_w]
+                    _write_single_tile(
+                        chunk_data, tile_path, tile_gt, epsg, wkt_fallback,
+                        nodata, compression, compression_level,
+                        tile_size, predictor, bigtiff, max_z_error,
+                        raster_type=raster_type,
+                        x_resolution=x_res,
+                        y_resolution=y_res,
+                        resolution_unit=res_unit,
+                        gdal_metadata_xml=gdal_meta_xml,
+                        extra_tags=extra_tags_list,
+                        photometric=photometric,
+                        restore_sentinel=restore_sentinel,
+                        allow_internal_only_jpeg=allow_internal_only_jpeg,
+                        allow_unparseable_crs=allow_unparseable_crs)
+
+                col_offset += chunk_w
+            row_offset += chunk_h
+
+        # Execute all dask tasks.
+        #
+        # Each delayed task is an independent ``_write_single_tile`` call on
+        # a distinct output path, with no shared mutable Python state, so
+        # the writes are embarrassingly parallel. Using ``scheduler='threads'``
+        # lets zlib / zstd / LZW release the GIL during compression and the
+        # OS coalesce concurrent writes; in a 256-tile zstd write on a
+        # 4096x4096 dask DataArray the wall time drops ~33% versus the
+        # ``synchronous`` scheduler this used to call.
+        #
+        # ``dask.compute`` raises as soon as one task errors, while sibling
+        # worker threads may still be writing tiles into the staging dir.
+        # Cleaning up at that point races those threads and can leave a
+        # partial staging dir behind. Capture each task's outcome instead
+        # so every worker reaches a barrier before we inspect results, then
+        # re-raise the first failure once no thread is still writing.
+        if delayed_tasks:
+            import dask
+            results = dask.compute(*delayed_tasks, scheduler='threads')
+            for r in results:
+                if isinstance(r, BaseException):
+                    raise r
+    except BaseException:
+        # Any tile failure leaves no partial output: drop the staging dir
+        # so the final ``tiles_dir`` name is never created and a retry
+        # starts clean.
+        _cleanup_staging()
+        raise
+
+    # Every tile is written. Promote the staging dir to its final name in
+    # one atomic rename so the VRT only ever references a complete tile set.
+    # A pre-existing *empty* ``tiles_dir`` passes the leftover-state guard
+    # above (the old code reused it via ``makedirs(exist_ok=True)``), but
+    # ``os.replace`` onto an existing directory raises on Windows even when
+    # the target is empty. Drop the empty target first so the rename has a
+    # clear slot on every platform.
+    try:
+        if os.path.isdir(tiles_dir):
+            os.rmdir(tiles_dir)  # only succeeds if empty; guard ensured that
+        os.replace(staging_dir, tiles_dir)
+    except BaseException:
+        _cleanup_staging()
+        raise
+
+    # Write VRT index with relative paths. The VRT lives at ``vrt_path``;
+    # tile paths now resolve under the final ``tiles_dir``.
+    tile_paths = [os.path.join(tiles_dir, name) for name in tile_names]
+    # Route through the internal ``_build_vrt`` helper so it is the single
+    # entry point for VRT-index emission (it wraps ``_vrt.write_vrt`` with
+    # the shared nodata/crs normalisation). ``nodata`` was already resolved
+    # and validated above; passing it again is idempotent.
+    from .vrt import _build_vrt
+    try:
+        # ``dst_offsets`` carries the tile placement only for
+        # non-georeferenced input: georeferenced tiles place via their
+        # per-tile GeoTransform (computed above), and write_vrt rejects
+        # the kwarg alongside georeferenced sources (issue #3116).
+        _build_vrt(vrt_path, tile_paths, relative=True, nodata=nodata,
+                   dst_offsets=(
+                       tile_offsets if geo_transform is None else None))
+    except BaseException:
+        # The index step failed after the rename. Remove the now-renamed
+        # tile dir too so a retry is not blocked by the leftover-state
+        # guard above.
+        shutil.rmtree(tiles_dir, ignore_errors=True)
+        raise
