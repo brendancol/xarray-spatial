@@ -4,12 +4,24 @@
 Zonal
 *****
 
+.. note::
+
+   NaN values are excluded from all zonal aggregations.  A zone where
+   every cell is NaN returns NaN (not zero) for sum, mean, etc.
+
 Apply
 =====
 .. autosummary::
     :toctree: _autosummary
 
     xrspatial.zonal.apply
+
+Clip Polygon
+============
+.. autosummary::
+    :toctree: _autosummary
+
+    xrspatial.polygon_clip.clip_polygon
 
 Crop
 ====
@@ -24,6 +36,13 @@ Regions
     :toctree: _autosummary
 
     xrspatial.zonal.regions
+
+Sieve
+=====
+.. autosummary::
+    :toctree: _autosummary
+
+    xrspatial.sieve.sieve
 
 Trim
 ====

@@ -32,7 +32,7 @@ def create_test_raster(
         backend='numpy',
         name='myraster',
         dims=['y', 'x'],
-        attrs={'res': (0.5, 0.5), 'crs': 'EPSG: 4326'},
+        attrs={'res': (0.5, 0.5), 'crs': 'EPSG: 5070'},
         chunks=(3, 3)
 ):
     raster = xr.DataArray(data, name=name, dims=dims, attrs=attrs)
@@ -42,12 +42,14 @@ def create_test_raster(
     if attrs is not None:
         if 'res' in attrs:
             res = attrs['res']
+
     # set coords for test raster, 2D coords only
     raster[dims[0]] = np.linspace((data.shape[0] - 1) * res[0], 0, data.shape[0])
     raster[dims[1]] = np.linspace(0, (data.shape[1] - 1) * res[1], data.shape[1])
 
-    raster[dims[0]] = np.linspace((data.shape[0] - 1)/2, 0, data.shape[0])
-    raster[dims[1]] = np.linspace(0, (data.shape[1] - 1)/2, data.shape[1])
+    # assign units to coords
+    raster[dims[0]].attrs["units"] = "m"
+    raster[dims[1]].attrs["units"] = "m"
 
     if has_cuda_and_cupy() and 'cupy' in backend:
         import cupy
@@ -119,34 +121,89 @@ def assert_nan_edges_effect(result_agg):
         np.testing.assert_array_equal(edge, np.nan)
 
 
-def assert_numpy_equals_dask_numpy(numpy_agg, dask_agg, func, nan_edges=True):
+def assert_boundary_mode_correctness(numpy_agg, dask_agg, func, depth=1, rtol=1e-5,
+                                     nan_edges=True):
+    """Verify that all boundary modes produce correct output.
+
+    Checks:
+    - 'nan' mode: edges are NaN (preserves existing behaviour) if nan_edges=True.
+    - 'nearest', 'reflect', 'wrap': shape matches input and
+      numpy matches dask result. When source data has no NaN,
+      edge cells should also have no NaN.
+
+    Parameters
+    ----------
+    nan_edges : bool
+        If True, verify that boundary='nan' produces NaN at edges.
+        Set to False for functions like mean/apply/hotspots that don't
+        produce NaN edges even with boundary='nan'.
+    """
+    from xrspatial.utils import VALID_BOUNDARY_MODES
+    from functools import partial as _partial
+
+    source_has_nan = np.any(np.isnan(numpy_agg.data))
+
+    for mode in VALID_BOUNDARY_MODES:
+        _func = _partial(func, boundary=mode)
+        result_np = _func(numpy_agg)
+
+        assert result_np.shape == numpy_agg.shape, (
+            f"boundary={mode!r}: shape mismatch "
+            f"{result_np.shape} vs {numpy_agg.shape}"
+        )
+
+        if mode == 'nan' and nan_edges:
+            assert_nan_edges_effect(result_np)
+        elif mode != 'nan' and not source_has_nan:
+            result_data = result_np.data
+            if has_dask_array() and isinstance(result_data, da.Array):
+                result_data = result_data.compute()
+            assert not np.any(np.isnan(result_data)), (
+                f"boundary={mode!r}: output should have no NaN values "
+                f"when source data has none"
+            )
+
+        if dask_agg is not None and has_dask_array():
+            result_da = _func(dask_agg)
+            da_data = result_da.data
+            if isinstance(da_data, da.Array):
+                da_data = da_data.compute()
+            np.testing.assert_allclose(
+                result_np.data, da_data,
+                equal_nan=True, rtol=rtol,
+            )
+
+
+def assert_numpy_equals_dask_numpy(numpy_agg, dask_agg, func, nan_edges=True,
+                                   verify_attrs=True):
     numpy_result = func(numpy_agg)
     if nan_edges:
         assert_nan_edges_effect(numpy_result)
 
     dask_result = func(dask_agg)
-    general_output_checks(dask_agg, dask_result)
+    general_output_checks(dask_agg, dask_result, verify_attrs=verify_attrs)
     np.testing.assert_allclose(numpy_result.data, dask_result.data.compute(), equal_nan=True)
 
 
-def assert_numpy_equals_cupy(numpy_agg, cupy_agg, func, nan_edges=True, atol=0, rtol=1e-7):
+def assert_numpy_equals_cupy(numpy_agg, cupy_agg, func, nan_edges=True, atol=0, rtol=1e-7,
+                             verify_attrs=True):
     numpy_result = func(numpy_agg)
     if nan_edges:
         assert_nan_edges_effect(numpy_result)
 
     cupy_result = func(cupy_agg)
-    general_output_checks(cupy_agg, cupy_result)
+    general_output_checks(cupy_agg, cupy_result, verify_attrs=verify_attrs)
     np.testing.assert_allclose(
         numpy_result.data, cupy_result.data.get(), equal_nan=True, atol=atol, rtol=rtol)
 
 
 def assert_numpy_equals_dask_cupy(numpy_agg, dask_cupy_agg, func,
-                                  nan_edges=True, atol=0, rtol=1e-7):
+                                  nan_edges=True, atol=0, rtol=1e-7, verify_attrs=True):
     numpy_result = func(numpy_agg)
     if nan_edges:
         assert_nan_edges_effect(numpy_result)
 
     dask_cupy_result = func(dask_cupy_agg)
-    general_output_checks(dask_cupy_agg, dask_cupy_result)
+    general_output_checks(dask_cupy_agg, dask_cupy_result, verify_attrs=verify_attrs)
     np.testing.assert_allclose(numpy_result.data, dask_cupy_result.data.compute().get(),
                                equal_nan=True, atol=atol, rtol=rtol)

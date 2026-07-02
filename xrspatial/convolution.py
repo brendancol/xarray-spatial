@@ -5,8 +5,10 @@ import numpy as np
 import xarray as xr
 from numba import cuda, jit, prange
 
-from xrspatial.utils import (ArrayTypeFunctionMapping, cuda_args, get_dataarray_resolution,
-                             not_implemented_func)
+from xrspatial.utils import (ArrayTypeFunctionMapping, _boundary_to_dask, _pad_array,
+                             _validate_boundary, _validate_raster, cuda_args,
+                             get_dataarray_resolution, not_implemented_func)
+from xrspatial.utils import _dask_task_name_kwargs
 
 # 3rd-party
 try:
@@ -14,6 +16,13 @@ try:
 except ImportError:
     class cupy(object):
         ndarray = False
+
+
+def _promote_float(dtype):
+    """Return at least float32; preserve float64."""
+    if np.issubdtype(dtype, np.floating):
+        return dtype
+    return np.float32
 
 
 DEFAULT_UNIT = 'meter'
@@ -134,6 +143,47 @@ def calc_cellsize(raster):
     return cellsize_x, np.abs(cellsize_y)
 
 
+def _available_memory_bytes():
+    """Best-effort estimate of available memory in bytes."""
+    # Try /proc/meminfo (Linux)
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    # Try psutil
+    try:
+        import psutil
+        return psutil.virtual_memory().available
+    except (ImportError, AttributeError):
+        pass
+    # Fallback: 2 GB
+    return 2 * 1024 ** 3
+
+
+def _check_kernel_memory(half_w, half_h, radius):
+    """Raise MemoryError if the kernel would exceed half of available RAM.
+
+    ``_ellipse_kernel`` allocates a float64 array of shape
+    ``(2*half_h + 1, 2*half_w + 1)``, plus temporaries of the same size
+    for the ellipse mask and the linspace grids.  Budget ~32 bytes per
+    cell to cover the output plus the intermediate arrays.
+    """
+    cells = (2 * half_w + 1) * (2 * half_h + 1)
+    required = cells * 32
+    available = _available_memory_bytes()
+    if required > 0.5 * available:
+        raise MemoryError(
+            f"kernel radius={radius} with cellsize implies a "
+            f"{2 * half_h + 1}x{2 * half_w + 1} kernel that needs "
+            f"~{required / 1e9:.1f} GB, but only "
+            f"{available / 1e9:.1f} GB is available. "
+            f"Use a smaller radius or a larger cellsize."
+        )
+
+
 def _ellipse_kernel(half_w, half_h):
     # x values of interest
     x = np.linspace(-half_w, half_w, 2 * half_w + 1)
@@ -191,6 +241,12 @@ def circle_kernel(cellsize_x, cellsize_y, radius):
 
     kernel_half_w = int(r / cellsize_x)
     kernel_half_h = int(r / cellsize_y)
+
+    # Guard against runaway allocation: the ellipse kernel grows
+    # quadratically with the radius, so a user-supplied radius with no
+    # cap can OOM the host (e.g. cellsize=1, radius=100000 gives a
+    # 200001x200001 float64 kernel ~ 320 GB).
+    _check_kernel_memory(kernel_half_w, kernel_half_h, radius)
 
     kernel = _ellipse_kernel(kernel_half_w, kernel_half_h)
     return kernel
@@ -270,6 +326,12 @@ def custom_kernel(kernel):
             "The kernel received was of type {} and needs to be "
             "of type `ndarray`".format(type(kernel))
         )
+    elif kernel.ndim != 2:
+        raise ValueError(
+            "Received a custom kernel that is not a 2D array.",
+            "A custom kernel needs to be a 2D array, the supplied kernel "
+            "has shape {}.".format(kernel.shape)
+        )
     else:
         rows, cols = kernel.shape
 
@@ -285,8 +347,7 @@ def custom_kernel(kernel):
 @jit(nopython=True, nogil=True)
 def _convolve_2d_numpy(data, kernel):
     # apply kernel to data image.
-    # TODO: handle nan
-    data = data.astype(np.float32)
+    # Caller must ensure data is a float type (float32 or float64).
     nx = data.shape[0]
     ny = data.shape[1]
     nkx = kernel.shape[0]
@@ -294,7 +355,7 @@ def _convolve_2d_numpy(data, kernel):
     wkx = nkx // 2
     wky = nky // 2
 
-    out = np.zeros(data.shape, dtype=np.float32)
+    out = np.empty_like(data)
     out[:] = np.nan
     for i in prange(wkx, nx-wkx):
         iimin = max(i - wkx, 0)
@@ -313,15 +374,31 @@ def _convolve_2d_numpy(data, kernel):
     return out
 
 
-def _convolve_2d_dask_numpy(data, kernel):
-    data = data.astype(np.float32)
+def _convolve_2d_numpy_boundary(data, kernel, boundary='nan'):
+    data = data.astype(_promote_float(data.dtype))
+    if boundary == 'nan':
+        return _convolve_2d_numpy(data, kernel)
+    pad_h = kernel.shape[0] // 2
+    pad_w = kernel.shape[1] // 2
+    padded = _pad_array(data, (pad_h, pad_w), boundary)
+    result = _convolve_2d_numpy(padded, kernel)
+    r0 = pad_h if pad_h else None
+    r1 = -pad_h if pad_h else None
+    c0 = pad_w if pad_w else None
+    c1 = -pad_w if pad_w else None
+    return result[r0:r1, c0:c1]
+
+
+def _convolve_2d_dask_numpy(data, kernel, boundary='nan'):
+    data = data.astype(_promote_float(data.dtype))
     pad_h = kernel.shape[0] // 2
     pad_w = kernel.shape[1] // 2
     _func = partial(_convolve_2d_numpy, kernel=kernel)
     out = data.map_overlap(_func,
                            depth=(pad_h, pad_w),
-                           boundary=np.nan,
-                           meta=np.array(()))
+                           boundary=_boundary_to_dask(boundary),
+                           meta=np.array(()),
+                           **_dask_task_name_kwargs('xrspatial.convolve_2d'))
     return out
 
 
@@ -365,39 +442,58 @@ def _convolve_2d_cuda(data, kernel, out):
     out[i, j] = s
 
 
-def _convolve_2d_cupy(data, kernel):
-    data = data.astype(cupy.float32)
-    out = cupy.empty(data.shape, dtype='f4')
+def _convolve_2d_cupy(data, kernel, boundary='nan'):
+    kernel = cupy.asarray(kernel)
+    if boundary != 'nan':
+        pad_h = kernel.shape[0] // 2
+        pad_w = kernel.shape[1] // 2
+        padded = _pad_array(data, (pad_h, pad_w), boundary)
+        result = _convolve_2d_cupy(padded, kernel)
+        r0 = pad_h if pad_h else None
+        r1 = -pad_h if pad_h else None
+        c0 = pad_w if pad_w else None
+        c1 = -pad_w if pad_w else None
+        return result[r0:r1, c0:c1]
+
+    fdtype = _promote_float(data.dtype)
+    data = data.astype(fdtype)
+    out = cupy.empty(data.shape, dtype=fdtype)
     out[:, :] = cupy.nan
     griddim, blockdim = cuda_args(data.shape)
     _convolve_2d_cuda[griddim, blockdim](data, kernel, cupy.asarray(out))
     return out
 
 
-def _convolve_2d_dask_cupy(data, kernel):
-    data = data.astype(cupy.float32)
+def _convolve_2d_dask_cupy(data, kernel, boundary='nan'):
+    data = data.astype(_promote_float(data.dtype))
     pad_h = kernel.shape[0] // 2
     pad_w = kernel.shape[1] // 2
     _func = partial(_convolve_2d_cupy, kernel=kernel)
     out = data.map_overlap(_func,
                            depth=(pad_h, pad_w),
-                           boundary=cupy.nan,
-                           meta=cupy.array(()))
+                           boundary=_boundary_to_dask(boundary, is_cupy=True),
+                           meta=cupy.array(()),
+                           **_dask_task_name_kwargs('xrspatial.convolve_2d'))
     return out
 
 
-def convolve_2d(data, kernel):
+def convolve_2d(data, kernel, boundary='nan'):
+    # Wrap raw arrays so _validate_raster can check dtype/ndim consistently
+    # across numpy, cupy, and dask backends before the kernel runs.
+    agg = xr.DataArray(data)
+    _validate_raster(agg, func_name='convolve_2d', ndim=2)
+    _validate_boundary(boundary)
     mapper = ArrayTypeFunctionMapping(
-        numpy_func=_convolve_2d_numpy,
+        numpy_func=_convolve_2d_numpy_boundary,
         cupy_func=_convolve_2d_cupy,
         dask_func=_convolve_2d_dask_numpy,
         dask_cupy_func=_convolve_2d_dask_cupy
     )
-    out = mapper(xr.DataArray(data))(data, kernel)
+    out = mapper(agg)(data, kernel, boundary)
     return out
 
 
-def convolution_2d(agg, kernel, name='convolution_2d'):
+def convolution_2d(agg, kernel, name='convolution_2d', boundary='nan'):
     """
     Calculates, for all inner cells of an array, the 2D convolution of
     each cell. Convolution is frequently used for image
@@ -413,6 +509,12 @@ def convolution_2d(agg, kernel, name='convolution_2d'):
     kernel : array-like object
         Impulse kernel, determines area to apply impulse function for
         each cell.
+    boundary : str, default='nan'
+        How to handle edges where the kernel extends beyond the raster.
+        ``'nan'``     -- fill missing neighbours with NaN (default).
+        ``'nearest'`` -- repeat edge values.
+        ``'reflect'`` -- mirror at boundary.
+        ``'wrap'``    -- periodic / toroidal.
 
     Returns
     -------
@@ -513,7 +615,7 @@ def convolution_2d(agg, kernel, name='convolution_2d'):
     """
 
     # wrapper of convolve_2d
-    out = convolve_2d(agg.data, kernel)
+    out = convolve_2d(agg.data, kernel, boundary)
     return xr.DataArray(out,
                         name=name,
                         coords=agg.coords,

@@ -3,20 +3,92 @@ import numba as nb
 import numpy as np
 
 
-def create_triangulation(raster, optix):
-    datahash = np.uint64(hash(str(raster.data.get())) % (1 << 64))
-    optixhash = np.uint64(optix.getHash())
+def _axis_resolution(index, n):
+    """Cell size along one axis, or 1.0 when it cannot be determined.
 
+    Falls back to unit spacing (the old integer-grid behaviour) when the
+    raster has no coordinate index on that axis or the axis is a single
+    cell, so a coordinate-less raster still builds a sensible mesh.
+    """
+    if index is None or n <= 1:
+        return 1.0
+    coords = index.values
+    return abs(float((coords[-1] - coords[0]) / (n - 1)))
+
+
+def _cell_resolution(raster):
+    """Return the (ew_res, ns_res) cell sizes from the raster x/y coords."""
+    H, W = raster.shape
+    ew_res = _axis_resolution(raster.indexes.get('x'), W)
+    ns_res = _axis_resolution(raster.indexes.get('y'), H)
+    return ew_res, ns_res
+
+
+def create_triangulation(raster, optix):
+    """Build a triangulated mesh on the GPU from a 2D elevation raster.
+
+    Mesh vertex x/y coordinates use the real cell resolution
+    (``ew_res``, ``ns_res``) read from the raster's x/y coordinates instead
+    of integer grid indices, so the mesh has the same shape the CPU sweep
+    works on (issue #2861).  The z-coordinate is scaled by the
+    resolution-independent factor ``max(H, W) / maxH`` so the terrain ratio
+    stays suitable for ray tracing; this factor must NOT depend on
+    ``ew_res``/``ns_res`` (a resolution-dependent z-scale would cancel the
+    x/y stretch).
+
+    Note on viewshed parity: ray-triangle occlusion is invariant under a
+    per-axis (linear) scaling of the mesh, and the viewshed output angle is
+    computed from the real ``ew_res``/``ns_res`` downstream, so this change
+    does not by itself alter the viewshed result -- it keeps the GPU mesh
+    geometry consistent with the CPU coordinate convention rather than
+    fixing a result divergence.  See the PR for issue #2861.
+
+    A positive, finite maximum elevation is required: an all-zero or
+    all-NaN raster has no elevation variance and yields ``inf`` or ``NaN``
+    mesh vertices that the OptiX raytracer cannot use sensibly.
+
+    Returns
+    -------
+    (scale, ew_res, ns_res)
+        The z scale factor and the cell resolution used to place the mesh
+        vertices.  Callers need the resolution to cast camera rays at the
+        matching real-world x/y positions.
+
+    Raises
+    ------
+    ValueError
+        If ``cupy.amax(raster.data)`` is non-positive or non-finite, i.e.
+        the raster has no positive elevation variance to scale by.
+    """
     # Calculate a scale factor for the height that maintains the ratio
     # width/height
     H, W = raster.shape
 
+    ew_res, ns_res = _cell_resolution(raster)
+
     # Scale the terrain so that the width is proportional to the height
     # Thus the terrain would be neither too flat nor too steep and
-    # raytracing will give best accuracy
+    # raytracing will give best accuracy.  maxDim stays in grid cells so the
+    # z-scale is a single constant, independent of the anisotropic x/y
+    # resolution applied to the mesh vertices below (see docstring).
     maxH = float(cupy.amax(raster.data))
     maxDim = max(H, W)
+
+    # Guard against a divide-by-zero / divide-by-NaN that would propagate
+    # inf or NaN into every vertex z-coordinate (issue #1378).  An all-zero
+    # raster gives maxH == 0.0, an all-NaN raster gives maxH == nan, and a
+    # raster with only non-positive values would invert the mesh.  All of
+    # these cases produce garbage geometry downstream, so fail fast before
+    # any hash or device-buffer work.
+    if not np.isfinite(maxH) or maxH <= 0.0:
+        raise ValueError(
+            "raster has no positive elevation variance "
+            f"(max={maxH}); cannot build mesh for hillshade/viewshed"
+        )
     scale = maxDim / maxH
+
+    datahash = np.uint64(hash(str(raster.data.get())) % (1 << 64))
+    optixhash = np.uint64(optix.getHash())
 
     if optixhash != datahash:
         num_tris = (H - 1) * (W - 1) * 2
@@ -24,7 +96,8 @@ def create_triangulation(raster, optix):
         triangles = cupy.empty(num_tris * 3, np.int32)
         # Generate a mesh from the terrain (buffers are on the GPU, so
         # generation happens also on GPU)
-        res = _triangulate_terrain(verts, triangles, raster, scale)
+        res = _triangulate_terrain(verts, triangles, raster, scale,
+                                   ew_res, ns_res)
         if res:
             raise RuntimeError(
                 f"Failed to generate mesh from terrain, error code: {res}")
@@ -41,11 +114,12 @@ def create_triangulation(raster, optix):
         verts = None
         triangles = None
         cupy.get_default_memory_pool().free_all_blocks()
-    return scale
+    return scale, ew_res, ns_res
 
 
 @nb.cuda.jit
-def _triangulate_terrain_kernel(verts, triangles, data, H, W, scale, stride):
+def _triangulate_terrain_kernel(verts, triangles, data, H, W, scale,
+                                ew_res, ns_res, stride):
     global_id = stride + nb.cuda.grid(1)
     if global_id < W*H:
         h = global_id // W
@@ -55,8 +129,8 @@ def _triangulate_terrain_kernel(verts, triangles, data, H, W, scale, stride):
         val = data[h, w]
 
         offset = 3*mesh_map_index
-        verts[offset] = w
-        verts[offset+1] = h
+        verts[offset] = w * ew_res
+        verts[offset+1] = h * ns_res
         verts[offset+2] = val * scale
 
         if w != W - 1 and h != H - 1:
@@ -70,7 +144,7 @@ def _triangulate_terrain_kernel(verts, triangles, data, H, W, scale, stride):
 
 
 @nb.njit(parallel=True)
-def _triangulate_cpu(verts, triangles, data, H, W, scale):
+def _triangulate_cpu(verts, triangles, data, H, W, scale, ew_res, ns_res):
     for h in nb.prange(H):
         for w in range(W):
             mesh_map_index = h * W + w
@@ -78,8 +152,8 @@ def _triangulate_cpu(verts, triangles, data, H, W, scale):
             val = data[h, w]
 
             offset = 3*mesh_map_index
-            verts[offset] = w
-            verts[offset+1] = h
+            verts[offset] = w * ew_res
+            verts[offset+1] = h * ns_res
             verts[offset+2] = val * scale
 
             if w != W - 1 and h != H - 1:
@@ -92,10 +166,12 @@ def _triangulate_cpu(verts, triangles, data, H, W, scale):
                 triangles[offset+5] = np.int32(mesh_map_index)
 
 
-def _triangulate_terrain(verts, triangles, terrain, scale=1):
+def _triangulate_terrain(verts, triangles, terrain, scale=1,
+                         ew_res=1.0, ns_res=1.0):
     H, W = terrain.shape
     if isinstance(terrain.data, np.ndarray):
-        _triangulate_cpu(verts, triangles, terrain.data, H, W, scale)
+        _triangulate_cpu(verts, triangles, terrain.data, H, W, scale,
+                         ew_res, ns_res)
     if isinstance(terrain.data, cupy.ndarray):
         job_size = H*W
         blockdim = 1024
@@ -105,7 +181,8 @@ def _triangulate_terrain(verts, triangles, terrain, scale=1):
         while job_size > 0:
             batch = min(d, griddim)
             _triangulate_terrain_kernel[batch, blockdim](
-                verts, triangles, terrain.data, H, W, scale, offset)
+                verts, triangles, terrain.data, H, W, scale,
+                ew_res, ns_res, offset)
             offset += batch*blockdim
             job_size -= batch*blockdim
     return 0
